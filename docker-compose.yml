@@ -1,0 +1,21 @@
+services:
+  support:
+    build: .
+    restart: unless-stopped
+    init: true
+    read_only: true
+    environment:
+      HOST: 0.0.0.0
+      CONTAINER_BIND: "true"
+      PORT: 3210
+      DATA_DIR: /app/data
+      LOG_LEVEL: info
+    ports:
+      - "127.0.0.1:3210:3210"
+    volumes:
+      - support-data:/app/data
+    tmpfs:
+      - /tmp
+
+volumes:
+  support-data:

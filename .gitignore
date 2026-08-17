@@ -1,0 +1,11 @@
+.worktrees/
+.DS_Store
+.idea/
+.worktrees/
+node_modules/
+dist/
+coverage/
+data/
+.env
+*.session
+*.session-journal

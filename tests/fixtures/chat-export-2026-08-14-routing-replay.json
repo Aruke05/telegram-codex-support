@@ -1,0 +1,31 @@
+{
+  "cases": [
+    {
+      "name": "账号名补充不进入其他发送人的 PopPay 事项",
+      "steps": [
+        { "id": "r101", "sender": "30001", "text": "创建 kakaxi 账号", "action": "new_thread", "threadKey": "account" },
+        { "id": "r102", "sender": "30002", "text": "PopPay 订单延迟", "action": "new_thread", "threadKey": "poppay-other" },
+        { "id": "r103", "sender": "30001", "text": "kakaxi", "action": "follow_up", "threadKey": "account" }
+      ]
+    },
+    {
+      "name": "PopPay 短追问保持当前事项",
+      "steps": [
+        { "id": "r201", "sender": "31001", "text": "PopPay 这笔不能查一下吗", "action": "new_thread", "threadKey": "poppay" },
+        { "id": "r202", "sender": "31001", "text": "你不能查一下吗", "action": "follow_up", "threadKey": "poppay" },
+        { "id": "r203", "sender": "31001", "text": "人呢", "action": "follow_up", "threadKey": "poppay" }
+      ]
+    },
+    {
+      "name": "群内插话不改变发送人的承接焦点",
+      "steps": [
+        { "id": "r301", "sender": "32001", "text": "订单 S20260814001 处理一下", "action": "new_thread", "threadKey": "order" },
+        { "id": "r302", "sender": "32002", "text": "另一个账号要重置", "action": "new_thread", "threadKey": "other" },
+        { "id": "r303", "sender": "32001", "text": "加急一下", "action": "follow_up", "threadKey": "order" },
+        { "id": "r304", "sender": "32001", "text": "这个好了没", "action": "follow_up", "threadKey": "order" },
+        { "id": "r305", "sender": "32001", "text": "这个呢", "action": "follow_up", "threadKey": "order" },
+        { "id": "r306", "sender": "32001", "text": "1", "action": "follow_up", "threadKey": "order" }
+      ]
+    }
+  ]
+}

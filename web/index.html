@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#f5f5f7" />
+    <title>AI 客服控制台</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">跳到主要内容</a>
+    <div class="app-shell" id="app">
+      <aside class="sidebar" id="sidebar" aria-label="主导航">
+        <div class="brand">
+          <span class="brand__mark" aria-hidden="true">M</span>
+          <div class="brand__copy">
+            <strong>Mercury Claw</strong>
+            <span>AI 客服控制台</span>
+          </div>
+        </div>
+        <nav class="navigation" id="navigation"></nav>
+        <div class="sidebar__footer">
+          <div class="device-status">
+            <span class="device-status__dot" aria-hidden="true"></span>
+            <div>
+              <strong>专用电脑</strong>
+              <span>本机安全运行</span>
+            </div>
+          </div>
+          <span class="version-label">本地管理台 · v2.1.0</span>
+        </div>
+      </aside>
+      <button class="sidebar-scrim" id="sidebar-scrim" type="button" aria-label="关闭导航"></button>
+      <section class="workspace">
+        <header class="topbar">
+          <div class="topbar__leading">
+            <button class="icon-button mobile-menu" id="mobile-menu" type="button" aria-label="打开导航"></button>
+            <div>
+              <span class="topbar__context">MercuryClaw</span>
+              <strong class="topbar__title" id="topbar-title">运行概览</strong>
+            </div>
+          </div>
+          <div class="topbar__actions">
+            <span class="last-updated" id="last-updated">等待加载</span>
+            <label class="theme-picker">
+              <span>外观</span>
+              <select id="theme-select" aria-label="选择页面外观">
+                <option value="system">跟随系统</option>
+                <option value="light">浅色</option>
+                <option value="dark">深色</option>
+              </select>
+            </label>
+            <button class="button button--secondary refresh-button" id="refresh-button" type="button">
+              <span class="refresh-button__icon" aria-hidden="true"></span>
+              <span>刷新</span>
+            </button>
+          </div>
+        </header>
+        <main class="main-content" id="main-content" tabindex="-1">
+          <div class="initial-loader" aria-label="正在加载">
+            <span></span><span></span><span></span>
+          </div>
+        </main>
+      </section>
+    </div>
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <noscript>需要开启 JavaScript 才能使用管理后台。</noscript>
+    <script type="module" src="/assets/app.js"></script>
+  </body>
+</html>

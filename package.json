@@ -1,0 +1,38 @@
+{
+  "name": "telegram-codex-support",
+  "version": "2.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.16.0"
+  },
+  "scripts": {
+    "build": "pnpm build:server && pnpm build:web",
+    "build:server": "tsc -p tsconfig.build.json",
+    "build:web": "node scripts/copy-web-assets.mjs && tsc -p tsconfig.web.json",
+    "dev": "pnpm build:web && tsx watch src/server.ts",
+    "service:install": "zsh scripts/install-macos-launch-agent.zsh",
+    "service:status": "zsh scripts/status-macos-launch-agent.zsh",
+    "service:uninstall": "zsh scripts/uninstall-macos-launch-agent.zsh",
+    "publish:remotes": "zsh scripts/publish-remotes.zsh",
+    "start": "node dist/server.js",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.web.json --noEmit"
+  },
+  "dependencies": {
+    "@fastify/multipart": "^10.1.0",
+    "@fastify/static": "^10.1.3",
+    "fastify": "^5.6.2",
+    "mysql2": "^3.23.2",
+    "pino": "^9.9.5",
+    "teleproto": "^1.228.5",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.7",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  },
+  "packageManager": "pnpm@10.26.2"
+}

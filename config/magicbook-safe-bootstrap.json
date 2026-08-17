@@ -1,0 +1,84 @@
+{
+  "sourceVersion": "manual-safe-bootstrap-2026-08-09",
+  "syncedAt": "2026-08-09T00:00:00.000Z",
+  "parameters": [
+    {
+      "key": "sourceService",
+      "label": "服务",
+      "kind": "select",
+      "sourceParameterKey": null,
+      "options": [
+        { "label": "NexaPay", "value": "nexapay" },
+        { "label": "LakPay", "value": "lakpay" },
+        { "label": "DevaPay", "value": "devapay" },
+        { "label": "NinePay", "value": "nine" },
+        { "label": "PopPay", "value": "poppay" },
+        { "label": "MCBPay", "value": "mcbpay" },
+        { "label": "6GPay", "value": "6g" },
+        { "label": "TataPay", "value": "tata" },
+        { "label": "VNSPay", "value": "vns" },
+        { "label": "NupaPay", "value": "nupa" },
+        { "label": "MKPay", "value": "mkpay" },
+        { "label": "DAPay", "value": "DApay" },
+        { "label": "EZPay", "value": "ezpay" }
+      ],
+      "mappingRules": []
+    },
+    {
+      "key": "targetRegion",
+      "label": "地区",
+      "kind": "mapping",
+      "sourceParameterKey": "sourceService",
+      "options": [],
+      "mappingRules": [
+        { "sourceValues": ["nexapay", "lakpay", "devapay", "nine", "poppay"], "values": [{ "value": "印度", "label": "印度" }] },
+        { "sourceValues": ["mcbpay", "ezpay"], "values": [{ "value": "巴基斯坦", "label": "巴基斯坦" }] },
+        { "sourceValues": ["6g"], "values": [{ "value": "巴西", "label": "巴西" }] },
+        { "sourceValues": ["tata"], "values": [{ "value": "泰国", "label": "泰国" }] },
+        { "sourceValues": ["vns", "DApay"], "values": [{ "value": "越南", "label": "越南" }] },
+        { "sourceValues": ["nupa"], "values": [{ "value": "印尼", "label": "印尼" }] },
+        { "sourceValues": ["mkpay"], "values": [{ "value": "菲律宾", "label": "菲律宾" }] }
+      ]
+    },
+    {
+      "key": "branch",
+      "label": "分支",
+      "kind": "mapping",
+      "sourceParameterKey": "sourceService",
+      "options": [],
+      "mappingRules": [
+        { "sourceValues": ["nexapay"], "values": [{ "value": "nexapay", "label": "nexapay" }] },
+        { "sourceValues": ["lakpay"], "values": [{ "value": "lakpay", "label": "lakpay" }] },
+        { "sourceValues": ["devapay"], "values": [{ "value": "devapay", "label": "devapay" }] },
+        { "sourceValues": ["nine", "poppay"], "values": [{ "value": "uat", "label": "uat" }] },
+        { "sourceValues": ["mcbpay", "6g", "tata", "vns", "nupa", "mkpay", "DApay", "ezpay"], "values": [{ "value": "prod-pkr", "label": "prod-pkr" }] }
+      ]
+    },
+    {
+      "key": "transactionType",
+      "label": "交易类型",
+      "kind": "mapping",
+      "sourceParameterKey": "targetRegion",
+      "options": [],
+      "mappingRules": [
+        { "sourceValues": ["印度"], "values": [] },
+        { "sourceValues": ["巴基斯坦"], "values": [{ "value": "0001", "label": "JAZZ" }, { "value": "0002", "label": "EP" }, { "value": "0003", "label": "BANK" }] },
+        { "sourceValues": ["巴西"], "values": [{ "value": "0501", "label": "PIX出款" }, { "value": "0502", "label": "PIXN出款" }, { "value": "0503", "label": "TED出款" }, { "value": "0504", "label": "PICPAY出款" }] },
+        { "sourceValues": ["泰国"], "values": [{ "value": "0104", "label": "网银" }, { "value": "0105", "label": "Promtpay/扫码" }, { "value": "0106", "label": "TrueMoney" }, { "value": "0108", "label": "网关" }, { "value": "0109", "label": "LinePay" }, { "value": "0110", "label": "GrabPay" }] },
+        { "sourceValues": ["越南"], "values": [{ "value": "0301", "label": "网银扫码" }, { "value": "0302", "label": "银行网关" }, { "value": "0304", "label": "MoMoPay" }, { "value": "0306", "label": "ZaloPay" }] },
+        { "sourceValues": ["印尼"], "values": [{ "value": "0401", "label": "OVO" }, { "value": "0402", "label": "网银" }, { "value": "0403", "label": "DANA" }, { "value": "0404", "label": "LINKAJA" }, { "value": "0405", "label": "SHOPEEPAY" }, { "value": "0406", "label": "GOPAY" }, { "value": "0407", "label": "QRIS" }, { "value": "0408", "label": "数字货币" }] },
+        { "sourceValues": ["菲律宾"], "values": [{ "value": "0201", "label": "GCash 原生" }, { "value": "0202", "label": "Maya 原生" }, { "value": "0204", "label": "GCash 非原生" }, { "value": "0205", "label": "Maya 非原生" }, { "value": "0206", "label": "GrabPay 原生" }] }
+      ]
+    },
+    {
+      "key": "bankCode",
+      "label": "银行编码",
+      "kind": "mapping",
+      "sourceParameterKey": "targetRegion",
+      "options": [],
+      "mappingRules": [
+        { "sourceValues": ["印度"], "values": [] }
+      ]
+    }
+  ]
+}
