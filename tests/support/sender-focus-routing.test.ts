@@ -476,6 +476,74 @@ describe("bounded sender route model contract", () => {
 })
 
 describe("sender-focused coordinator routing", () => {
+  it("路由模型失败时安全建立独立问题而不丢弃运营消息", async () => {
+    const harness = await createHarness()
+    const coordinator = new SupportThreadCoordinator({
+      database: harness.database,
+      store: harness.store,
+      router: { route: async () => { throw new Error("route unavailable") } },
+      batchWindowMs: 0,
+      wake: () => undefined,
+    })
+    const event = coordinator.accept({
+      groupId: harness.group.id,
+      messageId: "590",
+      senderId: "30001",
+      senderUsername: null,
+      senderDisplayName: "运营",
+      fromBot: false,
+      replyToMessageId: null,
+      messageThreadId: null,
+      replyTargetIsBot: false,
+      text: "提交通道失败是你原因吗",
+      attachments: [],
+      createdAt: new Date().toISOString(),
+    })!
+
+    await coordinator.drain()
+
+    expect(harness.store.findThreadByEvent(event.id)).not.toBeNull()
+    expect(harness.store.getEvent(event.id)).toMatchObject({ routeStatus: "routed", skipReason: null })
+  })
+
+  it("分类阶段意外返回候选动作时也建立独立问题而不标记忽略", async () => {
+    const harness = await createHarness()
+    const coordinator = new SupportThreadCoordinator({
+      database: harness.database,
+      store: harness.store,
+      router: {
+        route: async () => ({
+          action: "candidate_1",
+          questionFragment: "这笔谁的问题",
+          reason: "模拟旧模型非法结果",
+          confidence: 1,
+          clarificationReply: null,
+        }),
+      },
+      batchWindowMs: 0,
+      wake: () => undefined,
+    })
+    const event = coordinator.accept({
+      groupId: harness.group.id,
+      messageId: "591",
+      senderId: "30001",
+      senderUsername: null,
+      senderDisplayName: "运营",
+      fromBot: false,
+      replyToMessageId: null,
+      messageThreadId: null,
+      replyTargetIsBot: false,
+      text: "这笔谁的问题",
+      attachments: [],
+      createdAt: new Date().toISOString(),
+    })!
+
+    await coordinator.drain()
+
+    expect(harness.store.findThreadByEvent(event.id)).not.toBeNull()
+    expect(harness.store.getEvent(event.id).routeStatus).toBe("routed")
+  })
+
   it("keeps a short follow-up on the same sender focus across interleaved senders", async () => {
     const harness = await createHarness()
     const decisions: ThreadRouteResult[] = [

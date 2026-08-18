@@ -1685,6 +1685,38 @@ export class SupportThreadStore {
     }
   }
 
+  listThreadForwardMessageIds(id: string): string[] {
+    const direct = this.getThreadDetail(id).messages.map((message) => message.event)
+    const included = new Map<string, SupportMessageEvent>()
+    const pending = [...direct]
+    const traversed = new Set<string>()
+    while (pending.length > 0 && traversed.size < 200) {
+      const event = pending.shift()!
+      if (traversed.has(event.id)) continue
+      traversed.add(event.id)
+      if (event.senderRole === null) included.set(event.id, event)
+
+      if (event.replyToMessageId) {
+        const referenced = this.getEventByTelegramMessage(event.groupId, event.replyToMessageId)
+        if (referenced && !traversed.has(referenced.id)) pending.push(referenced)
+      }
+      if (event.mediaGroupId) {
+        const siblings = this.database.prepare(`SELECT * FROM support_message_events
+          WHERE group_id=? AND media_group_id=? ORDER BY created_at,telegram_message_id,id`).all(
+          event.groupId, event.mediaGroupId,
+        ) as SqlRow[]
+        for (const sibling of siblings.map(eventFromRow)) {
+          if (!traversed.has(sibling.id)) pending.push(sibling)
+        }
+      }
+    }
+    return [...included.values()]
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt)
+        || Number(left.telegramMessageId) - Number(right.telegramMessageId)
+        || left.id.localeCompare(right.id))
+      .map((event) => event.telegramMessageId)
+  }
+
   getEvent(id: string): SupportMessageEvent {
     const row = this.database.prepare("SELECT * FROM support_message_events WHERE id=?").get(id) as SqlRow | undefined
     if (!row) throw new Error("客服消息事件不存在")

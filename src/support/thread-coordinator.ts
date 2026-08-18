@@ -673,7 +673,7 @@ export class SupportThreadCoordinator {
       const decision = await this.routeDecision(batch, routeEvents, null, {
         latestQuestion: combined,
         candidateLabels: pending.candidateLabels,
-      }, "resolve_clarification")
+      }, null, "resolve_clarification")
       if (!decision) return
       if (decision.action === "candidate_1" || decision.action === "candidate_2") {
         const selectedCandidate = decision.action === "candidate_1" ? 1 : 2
@@ -743,7 +743,7 @@ export class SupportThreadCoordinator {
       latestQuestion: combined,
       candidateLabels: senderCandidates.map((candidate) => candidate.label),
     } : null
-    const decision = await this.routeDecision(batch, routeEvents, focusContext, ambiguityContext, "classify")
+    const decision = await this.routeDecision(batch, routeEvents, focusContext, null, ambiguityContext, "classify")
     if (!decision) return
     const question = decision.questionFragment || combined
     if (decision.action === "idle" && !anomalyPattern.test(combined)) {
@@ -793,7 +793,8 @@ export class SupportThreadCoordinator {
       return
     }
     if (decision.action === "candidate_1" || decision.action === "candidate_2") {
-      batch.events.forEach((event) => this.deps.store.updateEventRoute(event.id, "ignored", "分类模式返回了非法候选选择"))
+      this.createThread(batch.group, batch.service, batch.events, question, settleAt, batch.id)
+      this.deps.wake()
       return
     }
     this.deps.store.cancelPendingRouteClarification(
@@ -880,6 +881,7 @@ export class SupportThreadCoordinator {
     messages: SupportMessageEvent[],
     focus: SenderRouteFocusContext | null,
     pending: SenderRoutePendingContext | null,
+    ambiguity: SenderRoutePendingContext | null,
     mode: "classify" | "resolve_clarification",
   ): Promise<ThreadRouteResult | null> {
     let decision: ThreadRouteResult
@@ -891,10 +893,16 @@ export class SupportThreadCoordinator {
         messages,
         focus,
         pending,
+        ambiguity,
       })
     } catch {
-      batch.events.forEach((event) => this.deps.store.updateEventRoute(event.id, "ignored", "路由模型失败"))
-      return null
+      return {
+        action: "new_thread",
+        questionFragment: messages.map((message) => originalQuestionFragment(message, message.safeText)).join("\n").trim(),
+        reason: "路由模型失败，按独立问题安全接收，避免消息丢失或误归到其他线程",
+        confidence: 0,
+        clarificationReply: null,
+      }
     }
     const materializedDuringRoute = this.deps.store.findThreadByBatch(batch.id)
     if (materializedDuringRoute) {

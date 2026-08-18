@@ -87,9 +87,10 @@ describe("技术升级证据门禁", () => {
       },
     })
 
-    expect(hasVerifiedTechnicalEscalation(decision, snapshot)).toBe(true)
-    expect(hasVerifiedTechnicalEscalation({ ...decision, answer: "已经通知技术了" }, snapshot)).toBe(false)
-    expect(hasVerifiedTechnicalEscalation({ ...decision, answer: "技术上线后会解决" }, snapshot)).toBe(false)
+    const latestMessage = "这个可以不可以加个功能"
+    expect(hasVerifiedTechnicalEscalation(decision, snapshot, latestMessage, latestMessage)).toBe(true)
+    expect(hasVerifiedTechnicalEscalation({ ...decision, answer: "已经通知技术了" }, snapshot, latestMessage, latestMessage)).toBe(false)
+    expect(hasVerifiedTechnicalEscalation({ ...decision, answer: "技术上线后会解决" }, snapshot, latestMessage, latestMessage)).toBe(false)
   })
 
   it("跨服务首问不能直接升级 后续坚持由同一团队接手才允许升级", () => {

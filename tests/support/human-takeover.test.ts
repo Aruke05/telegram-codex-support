@@ -1494,9 +1494,25 @@ describe("人工接管与发送边界", () => {
     expect(sendMessage).not.toHaveBeenCalled()
   })
 
-  it("问题升级和产品需求只按顺序成组转发线程原消息且不发送说明话术", async () => {
+  it("问题升级和产品需求补齐被引用原消息并逐条确认转发且不发送说明话术", async () => {
     const harness = await createBaseHarness()
+    harness.store.recordEvent({
+      groupId: harness.group.id,
+      accountId: harness.group.accountId,
+      telegramMessageId: "3550",
+      replyToMessageId: null,
+      messageThreadId: null,
+      senderUserId: "303550",
+      senderUsername: null,
+      senderDisplayName: "运营",
+      senderRole: null,
+      text: "这是需要一起看的原始文件",
+      attachmentSummary: "orders.xlsx",
+      routeStatus: "ignored",
+      skipReason: "此前未建立问题线程",
+    })
     const { thread } = createQuestion(harness, "3551", "poppay这笔失败了 帮忙查下")
+    harness.database.prepare("UPDATE support_message_events SET reply_to_message_id='3550' WHERE telegram_message_id='3551'").run()
     const followup = harness.store.recordEvent({
       groupId: harness.group.id,
       accountId: harness.group.accountId,
@@ -1551,7 +1567,7 @@ describe("人工接管与发送边界", () => {
       _sourceChatId: string,
       _messageIds: string[],
       _ownership?: TelegramOutputOwnership,
-    ) => ["501", "502"])
+    ) => [`5${_messageIds[0]}`])
     const alerts = new TechnicalAlertService(
       harness.database,
       harness.store,
@@ -1566,19 +1582,19 @@ describe("人工接管与发送边界", () => {
       "内部分类器原因不应出现在技术群",
       "运营回复不应出现在技术群",
       "escalation",
-    )).resolves.toEqual({ status: "sent", summary: "已转发 2 条", errorType: null })
+    )).resolves.toEqual({ status: "sent", summary: "已转发 3 条", errorType: null })
     await expect(alerts.sendTransientFeatureRequest(
       harness.group,
       reply.id,
       "产品改动分析不应出现在技术群",
       "已通知技术",
-    )).resolves.toEqual({ status: "sent", summary: "已转发 2 条", errorType: null })
+    )).resolves.toEqual({ status: "sent", summary: "已转发 3 条", errorType: null })
 
     expect(sendMessage).not.toHaveBeenCalled()
-    expect(forwardMessages).toHaveBeenCalledTimes(2)
-    for (const call of forwardMessages.mock.calls) {
-      expect(call.slice(0, 4)).toEqual([accountId, "-10005", harness.group.telegramChatId, ["3551", "3552"]])
-    }
+    expect(forwardMessages).toHaveBeenCalledTimes(6)
+    expect(forwardMessages.mock.calls.map((call) => call[3])).toEqual([
+      ["3550"], ["3551"], ["3552"], ["3550"], ["3551"], ["3552"],
+    ])
     expect(forwardMessages.mock.calls[0]?.[4]).toEqual({
       groupId: targetGroupId,
       threadId: currentThread.id,
@@ -1586,7 +1602,7 @@ describe("人工接管与发送边界", () => {
       replyId: reply.id,
       kind: "technical_alert:escalation",
     })
-    expect(forwardMessages.mock.calls[1]?.[4]).toEqual(expect.objectContaining({
+    expect(forwardMessages.mock.calls[3]?.[4]).toEqual(expect.objectContaining({
       kind: "technical_alert:feature_request",
     }))
   })

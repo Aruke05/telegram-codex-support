@@ -91,6 +91,22 @@ export function conversationHistory(turns: AdminChatTurn[], current: AdminChatTu
 const bracketedTelegramHeader = /^\[(?:19|20)\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?\]\s*[^:\r\n]{1,160}:\s*(.*)$/u
 const exportedTelegramHeader = /^.{1,160},\s*\[(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},\s+(?:19|20)\d{2}\s+at\s+\d{1,2}:\d{2}(?::\d{2})?\]:\s*(.*)$/iu
 const adminChatUiTimestamp = /^\d{2}\/\d{2}\s+\d{2}:\d{2}\s*$/u
+const adminChatUiOnlyLine = /^(?:AI\s*客服|真人口吻|复制|纠正|已回复|正在生成|关闭问题|起始问题|后续补充|处理依据)$/u
+
+function latestPastedAdminUiMessage(question: string): string | null {
+  if (!/(?:起始问题|问题版本\s*v\d+)[\s\S]{0,20000}AI\s*处理结果/u.test(question)) return null
+  const normalized = question.replace(/\r\n?/gu, "\n")
+  const markerAt = normalized.lastIndexOf("AI 处理结果")
+  if (markerAt < 0) return null
+  const afterMarker = normalized.slice(markerAt + "AI 处理结果".length)
+  const blocks = afterMarker.split(/\n\s*\n+/u)
+    .map((block) => block.split("\n")
+      .filter((line) => !adminChatUiTimestamp.test(line.trim()) && !adminChatUiOnlyLine.test(line.trim()))
+      .join("\n").trim())
+    .filter(Boolean)
+  if (blocks.length < 2) return null
+  return blocks.at(-1) ?? null
+}
 
 export function latestAdminChatMessage(question: string): string {
   const lines = question.replace(/\r\n?/gu, "\n").split("\n")
@@ -102,7 +118,7 @@ export function latestAdminChatMessage(question: string): string {
     latestStart = index
     firstLine = matched[1] ?? ""
   }
-  if (latestStart < 0) return question.trim()
+  if (latestStart < 0) return latestPastedAdminUiMessage(question) ?? question.trim()
 
   const content = [firstLine]
   for (let index = latestStart + 1; index < lines.length; index += 1) {

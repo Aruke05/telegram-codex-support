@@ -1,6 +1,9 @@
 import type { CodexExecutor } from "../codex/executor.js"
 import {
-  threadRouteResultJsonSchema,
+  classifyThreadRouteResultJsonSchema,
+  classifyThreadRouteResultSchema,
+  resolveThreadRouteResultJsonSchema,
+  resolveThreadRouteResultSchema,
   threadRouteResultSchema,
   type ThreadRouteResult,
 } from "../codex/schemas.js"
@@ -35,6 +38,7 @@ export type ThreadRouteInput = {
   messages: SupportMessageEvent[]
   focus: SenderRouteFocusContext | null
   pending: SenderRoutePendingContext | null
+  ambiguity: SenderRoutePendingContext | null
 }
 
 export type SupportThreadRouterPort = {
@@ -86,20 +90,23 @@ export class CodexSupportThreadRouter implements SupportThreadRouterPort {
     const timeout = setTimeout(() => controller.abort(), 300_000)
     timeout.unref()
     try {
-      const result = await this.codex.execute("answer", {
+      const result = await this.codex.execute<ThreadRouteResult>("answer", {
         cwd: process.cwd(),
         prompt: [
           "你负责判断同一位 Telegram 运营的新消息如何承接当前对话，只输出结构化 JSON。",
           "系统已经处理 reply_to 等强关系。你不能选择线程 ID，也不能把消息归到其他发送人的事项。",
-          "action 只能是：follow_up 承接当前焦点；new_thread 独立新问题；idle 纯闲聊或无需客服介入；uncertain 两个具体事项确实无法区分；candidate_1/candidate_2 回答了待确认候选。",
+          input.mode === "classify"
+            ? "分类模式 action 只能是 follow_up、new_thread、idle、uncertain，绝不能输出 candidate_1 或 candidate_2。"
+            : "待确认回答模式 action 只能是 candidate_1、candidate_2、new_thread、idle、uncertain，绝不能输出 follow_up。",
           "延迟、失败、不到账、未回调、报错、异常等陈述属于求助，不能判为 idle。‘人呢’‘这个好了没’‘加急一下’‘这个呢’‘1’等短追问只要语境连续就判为 follow_up。",
-          "存在待确认候选时，只能选择 candidate_1/candidate_2、new_thread、idle 或 uncertain；禁止扩展候选。",
+          "只有待确认回答模式中的 pending 才允许选择 candidate_1/candidate_2。分类模式中的 ambiguity 只用于决定 follow_up、new_thread 或发起 uncertain 确认，不能直接选择候选。",
           "uncertain 且存在两个候选时，clarificationReply 必须用当班客服自然口吻在一句话里点出两个具体事项。禁止提 AI、机器人、模型、程序、线程、上下文，也禁止空泛问‘你问的是哪项’。其他 action 的 clarificationReply 必须为 null。",
           "questionFragment 保留本次排查所需原文，URL、订单号、金额、百分比、时间和错误标识逐字保留。",
           `群绑定：${JSON.stringify({ group: input.group.name, service: input.service.key, branch: input.service.branch })}`,
           `当前模式：${input.mode}`,
           `当前发送人的焦点：${JSON.stringify(input.focus)}`,
           `当前发送人的待确认事项：${JSON.stringify(input.pending)}`,
+          `分类模式中的歧义参考：${JSON.stringify(input.ambiguity)}`,
           `最新消息：${JSON.stringify(input.messages.map((message) => ({
             eventId: message.id,
             messageId: message.telegramMessageId,
@@ -108,19 +115,24 @@ export class CodexSupportThreadRouter implements SupportThreadRouterPort {
             time: message.createdAt,
           })))}`,
         ].join("\n\n"),
-        outputSchema: threadRouteResultJsonSchema as unknown as Record<string, unknown>,
-        validator: threadRouteResultSchema,
+        outputSchema: (input.mode === "classify"
+          ? classifyThreadRouteResultJsonSchema
+          : resolveThreadRouteResultJsonSchema) as unknown as Record<string, unknown>,
+        validator: (input.mode === "classify"
+          ? classifyThreadRouteResultSchema
+          : resolveThreadRouteResultSchema) as unknown as typeof threadRouteResultSchema,
         executionTimeoutMs: 300_000,
         concurrencyGroup: "support_route",
         maxConcurrency: 2,
         signal: controller.signal,
       })
-      if (result.action === "uncertain" && input.pending?.candidateLabels.length === 2) {
+      const candidates = input.mode === "classify" ? input.ambiguity : input.pending
+      if (result.action === "uncertain" && candidates?.candidateLabels.length === 2) {
         return {
           ...result,
           clarificationReply: validateRouteClarificationReply(
             result.clarificationReply ?? "",
-            input.pending.candidateLabels,
+            candidates.candidateLabels,
           ),
         }
       }

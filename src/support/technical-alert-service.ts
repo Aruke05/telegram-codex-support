@@ -142,21 +142,18 @@ export class TechnicalAlertService {
     const sourceChatId = sourceGroup.telegramChatId
     const record = this.replies.getDetail(replyId)
     const messageIds = record.threadId
-      ? this.store.getThreadDetail(record.threadId).messages
-        .map((message) => message.event.telegramMessageId)
-        .filter((messageId): messageId is string => Boolean(messageId))
+      ? this.store.listThreadForwardMessageIds(record.threadId)
       : record.telegramMessageId ? [record.telegramMessageId] : []
     if (messageIds.length === 0) return { status: "failed", summary: "没有可转发的原消息", errorType: "unknown" }
 
     let forwarded = 0
-    for (let offset = 0; offset < messageIds.length; offset += 100) {
-      const batch = messageIds.slice(offset, offset + 100)
+    for (const messageId of messageIds) {
       try {
-        await this.transport.forwardMessages(
+        const delivered = await this.transport.forwardMessages(
           targetAccountId,
           targetChatId,
           sourceChatId,
-          batch,
+          [messageId],
           {
             groupId: target.id,
             threadId: record.threadId,
@@ -165,14 +162,17 @@ export class TechnicalAlertService {
             kind: outputKind,
           },
         )
-        forwarded += batch.length
+        if (delivered.length !== 1) throw new TelegramDeliveryError("unknown", "uncertain")
+        forwarded += 1
       } catch (error) {
         const deliveryError = error instanceof TelegramDeliveryError
           ? error
           : new TelegramDeliveryError("unknown", "uncertain")
         if (forwarded > 0 || deliveryError.state === "uncertain") return {
           status: "uncertain",
-          summary: `转发中断：已送达 ${forwarded} 条，后续结果未知`,
+          summary: deliveryError.state === "uncertain"
+            ? `转发中断：已确认送达 ${forwarded} 条，当前消息结果未知`
+            : `转发中断：已确认送达 ${forwarded} 条，当前消息明确未送达`,
           errorType: deliveryError.type,
         }
         return {

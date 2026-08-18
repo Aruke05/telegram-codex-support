@@ -36,6 +36,22 @@ export const answerClaimSchema = z.object({
 
 export type AnswerClaim = z.infer<typeof answerClaimSchema>
 
+export const responsibilityAssessmentSchema = z.object({
+  party: z.enum(["our_side", "merchant", "upstream", "bank", "third_party", "shared", "unknown", "not_applicable"]),
+  certainty: z.enum(["confirmed", "inference", "unknown", "not_applicable"]),
+  evidenceSources: z.array(investigationStepSchema.shape.source).max(8),
+}).strict().superRefine((value, context) => {
+  if ((value.party === "unknown" || value.party === "not_applicable")
+    && !["unknown", "not_applicable"].includes(value.certainty)) {
+    context.addIssue({ code: "custom", path: ["certainty"], message: "未知或不适用责任不能标为已确认或推断" })
+  }
+  if (value.certainty === "confirmed" && value.evidenceSources.length === 0) {
+    context.addIssue({ code: "custom", path: ["evidenceSources"], message: "已确认责任必须声明证据来源" })
+  }
+})
+
+export type ResponsibilityAssessment = z.infer<typeof responsibilityAssessmentSchema>
+
 const humanOperationSchema = z.object({
   action: z.string().trim().min(1).max(300),
   identifiers: z.array(z.string().trim().min(1).max(300)).min(1).max(20),
@@ -52,6 +68,8 @@ export const answerDecisionSchema = z.object({
   usedMemoryVersionIds: z.array(z.string().uuid()).max(30),
   // 兼容升级前的测试夹具；正式回答模型 JSON Schema 始终要求提供。
   answerClaims: z.array(answerClaimSchema).max(24).optional(),
+  // 兼容升级前的持久记录和测试夹具；正式回答模型 JSON Schema 始终要求提供。
+  responsibility: responsibilityAssessmentSchema.optional(),
   // 兼容升级前的持久记录和测试夹具；正式模型 JSON Schema 始终要求提供。
   interaction: customerInteractionSchema.optional(),
   investigation: investigationTraceSchema,
@@ -142,12 +160,26 @@ export const threadRouteActionSchema = z.enum([
   "candidate_2",
 ])
 
-export const threadRouteResultSchema = z.object({
-  action: threadRouteActionSchema,
+const threadRouteResultShape = {
   questionFragment: z.string().trim().max(12000),
   reason: z.string().trim().min(1).max(1000),
   confidence: z.number().min(0).max(1),
   clarificationReply: z.string().trim().min(1).max(240).nullable(),
+} as const
+
+export const classifyThreadRouteResultSchema = z.object({
+  action: z.enum(["follow_up", "new_thread", "idle", "uncertain"]),
+  ...threadRouteResultShape,
+}).strict()
+
+export const resolveThreadRouteResultSchema = z.object({
+  action: z.enum(["candidate_1", "candidate_2", "new_thread", "idle", "uncertain"]),
+  ...threadRouteResultShape,
+}).strict()
+
+export const threadRouteResultSchema = z.object({
+  action: threadRouteActionSchema,
+  ...threadRouteResultShape,
 }).strict()
 
 export type ThreadRouteAction = z.infer<typeof threadRouteActionSchema>
@@ -156,7 +188,7 @@ export type ThreadRouteResult = z.infer<typeof threadRouteResultSchema>
 export const answerDecisionJsonSchema = {
   type: "object",
   additionalProperties: false,
-  required: ["decision", "escalationType", "humanOperation", "answer", "quote", "reason", "confidence", "usedMemoryVersionIds", "answerClaims", "interaction", "investigation"],
+  required: ["decision", "escalationType", "humanOperation", "answer", "quote", "reason", "confidence", "usedMemoryVersionIds", "answerClaims", "responsibility", "interaction", "investigation"],
   properties: {
     decision: { type: "string", enum: ["reply", "ignore", "escalate"] },
     escalationType: { type: "string", enum: ["none", "code_defect", "technical_change", "feature_request", "service_handoff", "human_operation"] },
@@ -196,6 +228,23 @@ export const answerDecisionJsonSchema = {
           },
           evidenceSource: { type: "string", enum: ["message", "document", "code", "server", "log", "database", "redis", "inference"] },
           evidence: { type: "string", maxLength: 1000 },
+        },
+      },
+    },
+    responsibility: {
+      type: "object",
+      additionalProperties: false,
+      required: ["party", "certainty", "evidenceSources"],
+      properties: {
+        party: {
+          type: "string",
+          enum: ["our_side", "merchant", "upstream", "bank", "third_party", "shared", "unknown", "not_applicable"],
+        },
+        certainty: { type: "string", enum: ["confirmed", "inference", "unknown", "not_applicable"] },
+        evidenceSources: {
+          type: "array",
+          maxItems: 8,
+          items: { type: "string", enum: ["message", "document", "code", "server", "log", "database", "redis", "inference"] },
         },
       },
     },
@@ -322,3 +371,21 @@ export const threadRouteResultJsonSchema = {
     clarificationReply: { anyOf: [{ type: "string", minLength: 1, maxLength: 240 }, { type: "null" }] },
   },
 } as const
+
+function threadRouteJsonSchema(actions: readonly string[]) {
+  return {
+    ...threadRouteResultJsonSchema,
+    properties: {
+      ...threadRouteResultJsonSchema.properties,
+      action: { type: "string", enum: actions },
+    },
+  } as const
+}
+
+export const classifyThreadRouteResultJsonSchema = threadRouteJsonSchema([
+  "follow_up", "new_thread", "idle", "uncertain",
+] as const)
+
+export const resolveThreadRouteResultJsonSchema = threadRouteJsonSchema([
+  "candidate_1", "candidate_2", "new_thread", "idle", "uncertain",
+] as const)

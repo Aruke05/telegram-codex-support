@@ -185,6 +185,98 @@ export function hasVerifiedExternalCauseEvidence(decision: AnswerDecision): bool
   return codeConfirmed && runtimeSources.size >= 2
 }
 
+function trustedResponsibilityCodeEvidence(decision: AnswerDecision): boolean {
+  return decision.investigation.steps.some((step) => (
+    step.source === "code"
+    && step.title === "执行代码只读检查"
+    && step.status === "confirmed"
+    && /^实际命令=[^\n]+\n退出码=0\n输出=\S/iu.test(step.evidence)
+  ))
+}
+
+function trustedResponsibilityRuntimeEvidence(decision: AnswerDecision): boolean {
+  return decision.investigation.steps.some((step) => {
+    if (step.status !== "confirmed") return false
+    if (step.source === "database") {
+      return step.title === "父进程复核数据库只读查询"
+        && /^父进程经绑定服务器重新执行 只读SQL=/u.test(step.evidence)
+    }
+    if (step.source === "server") {
+      return step.title === "执行服务器只读检查"
+        && /^实际命令=[^\n]+\n退出码=0\n输出=\S/iu.test(step.evidence)
+    }
+    if (step.source === "log") {
+      return step.title === "执行限量日志检查"
+        && /^实际命令=[^\n]+\n退出码=0\n输出=\S/iu.test(step.evidence)
+    }
+    return step.source === "redis"
+      && step.title === "执行 Redis 只读检查"
+      && /^实际命令=[^\n]+\n退出码=0\n输出=\S/iu.test(step.evidence)
+  })
+}
+
+export function answerAssignsOurResponsibility(answer: string): boolean {
+  return answer.split(/[，,。！？；;\n]+/u).some((clause) => {
+    if (/(?:(?:不是|并非|不能|无法|不足以).{0,20}(?:我方|我们)|(?:我方|我们).{0,12}(?:没有|没|不存在|不属于).{0,10}(?:问题|责任|异常|故障|导致))/u.test(clause)) {
+      return false
+    }
+    return /(?:(?:算|是|属于|归为|归因于).{0,8}(?:我方|我们).{0,12}(?:问题|责任|原因|处理异常|故障)|(?:我方|我们)(?:这边|系统|平台|内部|处理链路)?.{0,16}(?:的问题|有问题|责任|导致|造成|处理异常|系统故障|代码缺陷|没有自动恢复|未自动恢复))/u.test(clause)
+  })
+}
+
+function answerAssignsExternalResponsibility(answer: string): boolean {
+  return answer.split(/[，,。！？；;\n]+/u).some((clause) => {
+    if (/(?:银行|通道).{0,8}(?:映射|编码|配置|字段)/u.test(clause)) return false
+    if (/(?:(?:不是|并非).{0,10}(?:商户|上游|通道|银行|第三方)|(?:不能|无法|不足以|尚不能|还不能).{0,16}(?:判断|确认|认定).{0,12}(?:责任|问题)|(?:初步|暂时|可能|推测))/u.test(clause)) {
+      return false
+    }
+    return /(?:(?:是|属于|归因于|责任在|问题在|原因在).{0,10}(?:商户|上游|通道|银行|第三方)|(?:商户|上游|通道|银行|第三方).{0,16}(?:的问题|有问题|责任|导致|造成|漏发|未发送|没发送|填错|传错))/u.test(clause)
+  })
+}
+
+export function responsibilityGroundingReasons(decision: AnswerDecision): string[] {
+  if (decision.decision === "ignore") return []
+  const reasons: string[] = []
+  const responsibility = decision.responsibility
+  const answerAssignsOurs = answerAssignsOurResponsibility(decision.answer)
+  const answerAssignsExternal = answerAssignsExternalResponsibility(decision.answer)
+  const hasInternalEvidence = trustedResponsibilityCodeEvidence(decision)
+    && trustedResponsibilityRuntimeEvidence(decision)
+
+  if (answerAssignsOurs && !hasInternalEvidence) {
+    reasons.push("answer 将问题归为我方责任 但没有实际代码检查和生产只读运行证据共同确认")
+  }
+  if (!responsibility) return reasons
+
+  const internalParty = responsibility.party === "our_side" || responsibility.party === "shared"
+  if (internalParty && !hasInternalEvidence) {
+    reasons.push("responsibility 声明我方承担责任 但缺少实际代码检查与生产只读运行证据")
+  }
+  if (internalParty) {
+    const declared = new Set(responsibility.evidenceSources)
+    if (!declared.has("code") || !["server", "log", "database", "redis"].some((source) => declared.has(source as InvestigationStep["source"]))) {
+      reasons.push("responsibility 的证据来源没有同时声明代码层和运行层")
+    }
+  }
+  if (responsibility.certainty === "confirmed"
+    && ["merchant", "upstream", "bank", "third_party"].includes(responsibility.party)
+    && (!hasVerifiedExternalCauseEvidence(decision) || !trustedResponsibilityCodeEvidence(decision))) {
+    reasons.push("responsibility 确认外部方责任 但没有代码与多项生产只读证据排除我方异常")
+  }
+  const externalParty = ["merchant", "upstream", "bank", "third_party"].includes(responsibility.party)
+  if (externalParty && responsibility.certainty === "inference"
+    && answerAssignsExternal) {
+    reasons.push("answer 将外部方责任写成确定结论 但 responsibility 仅标为推断")
+  }
+  if (answerAssignsOurs && !internalParty) {
+    reasons.push("answer 的我方责任结论与 responsibility.party 不一致")
+  }
+  if (answerAssignsExternal && !externalParty && responsibility.party !== "shared") {
+    reasons.push("answer 的外部责任结论与 responsibility.party 不一致")
+  }
+  return [...new Set(reasons)]
+}
+
 export function upstreamReturnedErrorInferenceNeedsQualification(
   question: string,
   conversationContext: string | undefined,
@@ -439,7 +531,14 @@ export function questionRequestsFeatureChange(value: string): boolean {
   const hasActionAndObject = featureChangeActionPattern.test(focus) && featureObjectPattern.test(focus)
   const explicitChange = /(?:加(?:个|一个)?|新增|增加|添加|修改|改成|调整|优化|开发|补充|开放)/u.test(focus)
   const explicitlyUnsupported = /(?:没有|暂无|不支持|做不到|不能做).{0,24}(?:功能|能力|页面|接口|字段|展示|流程|按钮|菜单|筛选|导出|通知|回调|权限|开关|批量|自动)/u.test(focus)
+  const incidentAsksWhyRecoveryDidNotRun = /(?:订单|这笔|这单|多单|几十单|代付|代收|结果|状态|回调|失败|超时|异常|卡住|处理中)/u.test(focus)
+    && /(?:(?:为什么|为何|怎么|怎么会).{0,24}(?:没有|没|未).{0,8}(?:自动恢复|自动重试|自动补偿)|(?:订单|这笔|这单|多单|几十单|代付|代收|结果|状态|回调|失败|超时).{0,32}(?:没有|没|未).{0,8}(?:自动恢复|自动重试|自动补偿))/u.test(focus)
+  const explicitlyRequestsRecoveryFeature = capabilityRequestPattern.test(focus)
+    || /(?:请|麻烦|希望|需要|要求|想要).{0,24}(?:增加|新增|添加|支持|优化|开发|补充|开放|自动恢复|自动重试|自动补偿)/u.test(focus)
+  const directFeatureRequest = /(?:请|麻烦|希望|需要|要求|想要)/u.test(focus) && hasActionAndObject
+  if (incidentAsksWhyRecoveryDidNotRun && !explicitlyRequestsRecoveryFeature && !explicitChange) return false
   return (capabilityRequestPattern.test(focus) && hasActionAndObject)
+    || directFeatureRequest
     || (explicitChange && featureObjectPattern.test(focus))
     || explicitlyUnsupported
 }
@@ -777,10 +876,12 @@ export function hasVerifiedTechnicalEscalation(
   decision: AnswerDecision,
   snapshot: ProjectCodeSnapshot,
   question = "",
+  latestMessage = question,
 ): boolean {
   if (decision.decision !== "escalate") return false
   if (decision.escalationType === "feature_request") {
-    if (!verifiedFeatureRequestPattern.test(decision.reason)
+    if (!questionRequestsFeatureChange(latestMessage)
+      || !verifiedFeatureRequestPattern.test(decision.reason)
       || !featureRequestAnswerConfirmsDeployment(decision.answer)) return false
     return decision.investigation.steps.some((step) => (
       step.source === "message" && step.status === "confirmed" && step.evidence.trim().length > 0
@@ -1120,7 +1221,7 @@ export class SupportInvestigationService {
         await this.publishProgress(input, snapshot, decision.investigation)
         const verifiedEscalation = decision.escalationType === "service_handoff"
           ? hasVerifiedServiceHandoff(decision, service.key, projectServices, input.question, input.responseDepth)
-          : hasVerifiedTechnicalEscalation(decision, snapshot, input.question)
+          : hasVerifiedTechnicalEscalation(decision, snapshot, input.question, input.latestMessage)
         const unverifiedEscalation = decision.decision === "escalate" && !verifiedEscalation
         const missedFeatureRequest = questionRequestsFeatureChange(input.latestMessage)
           && !(decision.decision === "escalate" && decision.escalationType === "feature_request")
@@ -1164,6 +1265,7 @@ export class SupportInvestigationService {
           input.conversationContext,
           decision,
         )
+        const responsibilityReasons = responsibilityGroundingReasons(decision)
         const misattributedUpstreamBalanceError = input.replyStyle === "human"
           && decision.decision !== "ignore"
           && upstreamBalanceErrorMisattributesResponsibility(
@@ -1213,6 +1315,10 @@ export class SupportInvestigationService {
           ...(misattributedUpstreamBalanceError
             ? ["上游返回余额不足描述的是我方运营在该上游的账户可用余额 answer 必须明确写成我方在上游的账户余额不足 不得写成上游自身余额不足或不是我方问题"]
             : []),
+          ...responsibilityReasons,
+          ...(unqualifiedUpstreamReturnedInference
+            ? ["上游返回仅是响应现象 责任结论必须明确标为初步判断 不能写成已确认事实或据此认定任何一方责任"]
+            : []),
           ...(disclosedAutomationIdentity ? ["回复暴露了 AI、机器人或自动客服身份"] : []),
           ...(missingTechnicalNotification ? ["升级回复没有明确说明已经通知技术接手"] : []),
           ...(unsafeOutbound ? ["回复为空、乱码或触发敏感信息出站拦截"] : []),
@@ -1226,9 +1332,6 @@ export class SupportInvestigationService {
           ...(upstreamCallbackRejection ? [upstreamCallbackRejection] : []),
           ...(omittedVerifiedExternalResponsibility
             ? ["代码与实际只读证据已经确认唯一根源在商户 上游 银行或其他外部方 并排除我方处理异常 回复必须说清外部方的实际动作并明确说不是我方问题"]
-            : []),
-          ...(unqualifiedUpstreamReturnedInference
-            ? ["本轮原因依据来自上游返回的报错信息 answer 必须先说明上游返回提示的原文含义 再明确说当前只是根据该返回初步判断 不得写成已确认事实或仅凭此排除我方问题"]
             : []),
           ...answerGroundingReasons,
           ...(unsolicitedDerivedStatistics
@@ -1417,7 +1520,9 @@ export class SupportInvestigationService {
         source: "inference",
         title: "模型判断（推断）",
         status: "skipped",
-        evidence: `仅允许概括前述 ${trustedCount} 个可信步骤 模型自报的其他排查步骤未采信`,
+        evidence: `仅允许概括前述 ${trustedCount} 个可信步骤 模型自报的其他排查步骤未采信${modelDecision.responsibility
+          ? ` responsibility.party=${modelDecision.responsibility.party} responsibility.certainty=${modelDecision.responsibility.certainty} responsibility.evidenceSources=${modelDecision.responsibility.evidenceSources.join(",")}`
+          : " responsibility=legacy_missing"}`,
         conclusion: `模型依据上述可信步骤给出 ${modelDecision.decision} 决策 置信度=${modelDecision.confidence}`,
       })
     }
