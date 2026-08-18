@@ -5,6 +5,7 @@ import path from "node:path"
 import { z } from "zod"
 import { afterEach, describe, expect, it } from "vitest"
 
+import { CodexCliAdapter } from "../../src/models/codex-cli-adapter.js"
 import { ModelGateway } from "../../src/models/model-gateway.js"
 import type { ModelAdapter } from "../../src/models/types.js"
 import { RuntimeDatabase } from "../../src/runtime/database.js"
@@ -17,6 +18,24 @@ afterEach(async () => {
 })
 
 describe("模型任务快照", () => {
+  it("Codex 原始 ZodError 转换成可重试的结构输出错误并保留字段路径", async () => {
+    const adapter = new CodexCliAdapter({
+      invoke: async () => ({ output: JSON.stringify({ answer: 1 }), observations: [] }),
+    } as never)
+
+    await expect(adapter.execute({ modelId: "test-model" } as ModelInstanceSnapshot, {
+      prompt: "test",
+      outputSchema: { type: "object" },
+      validator: z.object({ answer: z.string() }),
+      timeoutMs: 1_000,
+      toolScope: { cwd: process.cwd(), codeRoots: [] },
+    })).rejects.toMatchObject({
+      name: "ModelExecutionError",
+      code: "structured_output_invalid",
+      message: expect.stringContaining("answer"),
+    })
+  })
+
   it("同一任务多次执行不受模型别名或回答绑定运行中变更影响", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "model-gateway-snapshot-"))
     temporaryDirectories.push(directory)

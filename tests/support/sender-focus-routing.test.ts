@@ -502,6 +502,9 @@ describe("bounded sender route model contract", () => {
     expect(prompt).toContain("真实的当班客服")
     expect(prompt).toContain("数据库、服务器记录和应用后端日志")
     expect(prompt).toContain("不要照抄固定模板")
+    expect(prompt).toContain("不得仅因为它出现在排查期间就臆测成催促进度")
+    expect(prompt).toContain("无法确认对方意图时也不得使用 status_only")
+    expect(prompt).not.toContain("‘1’等短追问")
   })
 
   it("accepts only bounded classifications without a target thread id", () => {

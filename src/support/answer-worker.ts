@@ -327,13 +327,22 @@ export class SupportAnswerWorker {
           || (error instanceof Error && error.name === "CodexExecutionTimeoutError")
           || (error instanceof ModelExecutionError && error.code === "provider_timeout")
         const limit = configuredAnswerTimeoutSeconds
-        const errorCode = timeout ? "answer_model_timeout" : "answer_model_failed"
+        const structuredOutputInvalid = error instanceof ModelExecutionError
+          && error.code === "structured_output_invalid"
+        const errorCode = timeout
+          ? "answer_model_timeout"
+          : structuredOutputInvalid
+            ? "structured_output_invalid"
+            : "answer_model_failed"
         const rejectedOutputReason = error instanceof SupportModelOutputRejectedError
           ? `${error.name}：${this.deps.redactor.redact(error.message).text}`.slice(0, 1_800)
           : null
         const failureReason = timeout
           ? `回答模型达到当前配置上限（${limit} 秒）`
-          : rejectedOutputReason ?? `回答模型执行失败：${error instanceof Error ? error.name : "unknown"}`
+          : rejectedOutputReason
+            ?? (error instanceof ModelExecutionError
+              ? `${error.name}(${error.code})：${this.deps.redactor.redact(error.message).text}`
+              : `回答模型执行失败：${error instanceof Error ? error.name : "unknown"}`)
         if (await this.handoffClaimedHumanPriority(
           reply.id, thread, inputRevision, group, failureReason, errorCode,
         )) return
@@ -343,10 +352,16 @@ export class SupportAnswerWorker {
             ? `回答模型达到当前配置上限（${limit} 秒），未向运营群发送代码兜底文案。`
             : rejectedOutputReason
               ? `${rejectedOutputReason}，未向运营群发送代码兜底文案。`
-              : `回答模型执行失败，未向运营群发送代码兜底文案：${error instanceof Error ? error.name : "unknown"}`,
+              : structuredOutputInvalid
+                ? `${failureReason}；本次未向运营群发送代码兜底文案。`
+                : `回答模型执行失败，未向运营群发送代码兜底文案：${error instanceof Error ? error.name : "unknown"}`,
           decisionConfidence: 0,
         })
-        this.deps.store.finishGeneration(thread.id, inputRevision, "closed")
+        if (structuredOutputInvalid && this.structuredOutputFailureCount(thread.id, inputRevision) < 2) {
+          if (this.deps.store.retryGeneration(thread.id, inputRevision)) this.wake()
+          return
+        }
+        this.deps.store.finishGeneration(thread.id, inputRevision, "answered")
         return
       }
       if (current.status === "sending") {
@@ -871,7 +886,7 @@ export class SupportAnswerWorker {
       errorCode: "code_snapshot_unavailable",
       decisionReason: `${error.message}\n运营群未发送代码兜底文案\n技术告警：${alertSummary}`.slice(0, 2000),
     })
-    this.deps.store.finishGeneration(thread.id, inputRevision, "closed")
+    this.deps.store.finishGeneration(thread.id, inputRevision, "answered")
   }
 
   private async failInvestigationRuntime(
@@ -907,7 +922,7 @@ export class SupportAnswerWorker {
       errorCode: "investigation_runtime_failed",
       decisionReason: `${reason}\n运营群未发送代码兜底文案\n运行告警：${alertSummary}`.slice(0, 2000),
     })
-    this.deps.store.finishGeneration(thread.id, inputRevision, "closed")
+    this.deps.store.finishGeneration(thread.id, inputRevision, "answered")
   }
 
   private async handoffClaimedHumanPriority(
@@ -980,6 +995,12 @@ export class SupportAnswerWorker {
     } catch {
       return false
     }
+  }
+
+  private structuredOutputFailureCount(threadId: string, revision: number): number {
+    return Number((this.deps.database.prepare(`SELECT COUNT(*) AS count FROM support_replies
+      WHERE thread_id=? AND input_revision=? AND status='failed' AND error_code='structured_output_invalid'`)
+      .get(threadId, revision) as { count: number }).count)
   }
 
   private retryForCodeConfiguration(replyId: string, thread: SupportThread, inputRevision: number): void {

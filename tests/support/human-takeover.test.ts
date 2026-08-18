@@ -12,6 +12,7 @@ import { ReplyEventBus } from "../../src/replies/reply-event-bus.js"
 import { ReplyService } from "../../src/replies/reply-service.js"
 import { RuntimeDatabase } from "../../src/runtime/database.js"
 import { RuntimeKnowledgeService } from "../../src/runtime/knowledge-service.js"
+import { ModelExecutionError } from "../../src/models/errors.js"
 import { ModelConfigService } from "../../src/runtime/model-config-service.js"
 import type { ProjectServiceRecord, RuntimeGroup, SupportMessageEvent, SupportThread } from "../../src/runtime/types.js"
 import { ConfiguredSecretRedactor } from "../../src/security/dlp.js"
@@ -890,13 +891,42 @@ describe("人工接管与发送边界", () => {
     await worker.runDueOnce(new Date())
 
     expect(sendMessage).not.toHaveBeenCalled()
-    expect(harness.store.getThread(thread.id).status).toBe("closed")
+    expect(harness.store.getThread(thread.id).status).toBe("answered")
     expect(harness.database.readReplies("WHERE r.thread_id=?", [thread.id])).toEqual([
       expect.objectContaining({
         status: "failed",
         errorCode: "answer_model_failed",
         answer: "",
       }),
+    ])
+  })
+
+  it("回答模型结构错误时自动重试一次并保留首轮真实失败记录", async () => {
+    const harness = await createBaseHarness()
+    const { thread } = createQuestion(harness, "3214-structured", "帮我查这笔初始化订单")
+    const snapshot = seedCodeSnapshot(harness)
+    const sendMessage = vi.fn(async () => "robot-3214-structured")
+    let attempts = 0
+    const worker = createWorker(harness, {
+      readCurrentSnapshot: () => snapshot,
+      decision: async () => {
+        attempts += 1
+        if (attempts === 1) throw new ModelExecutionError("structured_output_invalid", "answerClaims 字段无效")
+        return answerDecision()
+      },
+      sendMessage,
+    })
+
+    await worker.runDueOnce(new Date())
+    expect(harness.store.getThread(thread.id).status).toBe("collecting")
+    await worker.runDueOnce(new Date(Date.now() + 1_000))
+
+    expect(attempts).toBe(2)
+    expect(sendMessage).toHaveBeenCalledTimes(1)
+    expect(harness.store.getThread(thread.id).status).toBe("answered")
+    expect(harness.database.readReplies("WHERE r.thread_id=? ORDER BY r.created_at,r.id", [thread.id])).toEqual([
+      expect.objectContaining({ status: "failed", errorCode: "structured_output_invalid" }),
+      expect.objectContaining({ status: "replied", errorCode: null }),
     ])
   })
 

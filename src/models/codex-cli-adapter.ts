@@ -4,6 +4,7 @@ import type {
   CodexStatus,
 } from "../codex/executor.js"
 import type { ModelInstanceSnapshot } from "../runtime/model-config-service.js"
+import { ModelExecutionError } from "./errors.js"
 import type { AdapterExecutionInput, AdapterExecutionResult, ModelAdapter } from "./types.js"
 
 function resultOutput(value: string | CodexRunnerResult): { output: string; observations: CodexRunnerResult["observations"] } {
@@ -38,7 +39,20 @@ export class CodexCliAdapter implements ModelAdapter {
     if (invoked.observations.length > 0) await input.onCommandObservations?.(invoked.observations)
     let parsed: unknown
     try { parsed = JSON.parse(invoked.output) }
-    catch { throw new Error("Codex 返回格式错误") }
-    return { value: input.validator.parse(parsed), toolCallCount: invoked.observations.length }
+    catch { throw new ModelExecutionError("structured_output_invalid", "回答模型返回的 JSON 格式无效") }
+    try {
+      return { value: input.validator.parse(parsed), toolCallCount: invoked.observations.length }
+    } catch (error) {
+      if (!(error instanceof Error) || error.name !== "ZodError") throw error
+      const issues = (error as Error & { issues?: Array<{ path?: PropertyKey[]; message?: string }> }).issues ?? []
+      const detail = issues.slice(0, 20).map((issue) => {
+        const path = issue.path?.map(String).join(".") || "root"
+        return `${path}: ${issue.message || "字段不符合结构要求"}`
+      }).join("；")
+      throw new ModelExecutionError(
+        "structured_output_invalid",
+        `回答模型结果未通过结构校验${detail ? `：${detail}` : ""}`.slice(0, 1_500),
+      )
+    }
   }
 }

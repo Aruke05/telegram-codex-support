@@ -27,7 +27,9 @@ type AppliedThreadFilters = {
   limit: number
 }
 
-type TimingThread = Pick<SupportThreadListItem, "status" | "settleAt" | "updatedAt">
+type TimingThread = Pick<SupportThreadListItem, "status" | "settleAt" | "updatedAt"> & {
+  latestReplyStatus?: ReplyRecord["status"] | null
+}
 
 let liveEvents: EventSource | null = null
 let renderGeneration = 0
@@ -45,7 +47,8 @@ export function stopReplyEvents(): void {
   document.querySelectorAll(".support-overlay-root").forEach((node) => node.remove())
 }
 
-export function threadStatusLabel(status: SupportThreadStatus): string {
+export function threadStatusLabel(status: SupportThreadStatus, latestReplyStatus?: ReplyRecord["status"] | null): string {
+  if (status !== "closed" && latestReplyStatus === "failed") return "处理失败"
   return {
     collecting: "等待补充",
     generating: "生成中",
@@ -64,7 +67,7 @@ export function threadTimingText(thread: TimingThread, now = Date.now()): string
     const seconds = Math.max(0, Math.floor((now - Date.parse(thread.updatedAt)) / 1000))
     return `已处理 ${seconds} 秒`
   }
-  return threadStatusLabel(thread.status)
+  return threadStatusLabel(thread.status, thread.latestReplyStatus)
 }
 
 function group(className: string, ...children: Node[]): HTMLElement {
@@ -77,9 +80,10 @@ function senderName(thread: Pick<SupportThreadListItem, "senderDisplayName" | "s
   return thread.senderDisplayName || (thread.senderUsername ? `@${thread.senderUsername}` : thread.senderUserId) || "发送人未采集"
 }
 
-function supportStatusBadge(status: SupportThreadStatus): HTMLSpanElement {
-  const tone = status === "answered" ? "success" : status === "escalated" ? "danger" : status === "generating" ? "accent" : status === "collecting" ? "warning" : "neutral"
-  return badge(threadStatusLabel(status), tone)
+function supportStatusBadge(status: SupportThreadStatus, latestReplyStatus?: ReplyRecord["status"] | null): HTMLSpanElement {
+  const failed = status !== "closed" && latestReplyStatus === "failed"
+  const tone = failed ? "danger" : status === "answered" ? "success" : status === "escalated" ? "danger" : status === "generating" ? "accent" : status === "collecting" ? "warning" : "neutral"
+  return badge(threadStatusLabel(status, latestReplyStatus), tone)
 }
 
 function replyStatusLabel(status: ReplyRecord["status"]): string {
@@ -131,7 +135,7 @@ function threadRow(thread: SupportThreadListItem, active: boolean, onOpen: () =>
   button.addEventListener("click", onOpen)
 
   const head = element("div", "support-thread-row__head")
-  const identity = group("support-thread-row__identity", element("span", "support-thread-row__service", thread.serviceName || thread.service), supportStatusBadge(thread.status))
+  const identity = group("support-thread-row__identity", element("span", "support-thread-row__service", thread.serviceName || thread.service), supportStatusBadge(thread.status, thread.latestReplyStatus))
   head.append(identity, element("time", "support-thread-row__time", shortDate(thread.latestMessageAt)))
 
   const question = element("strong", "support-thread-row__question", thread.summary || "未提取到文字内容")
@@ -334,7 +338,7 @@ function renderDetailPane(
   const styleBadge = badge(detail.thread.operatorStyleVersionId ? "风格快照已固定" : "基线风格", detail.thread.operatorStyleVersionId ? "accent" : "neutral")
   if (detail.thread.operatorStyleVersionId) styleBadge.title = `风格版本 ID ${detail.thread.operatorStyleVersionId}`
   identity.append(
-    supportStatusBadge(detail.thread.status),
+    supportStatusBadge(detail.thread.status, detail.replies.at(-1)?.status),
     styleBadge,
     element("span", "", `${detail.context.projectName} · ${detail.context.groupName}`),
   )
