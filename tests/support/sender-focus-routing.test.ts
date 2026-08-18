@@ -7,13 +7,15 @@ import { afterEach, describe, expect, it } from "vitest"
 
 import routingReplayJson from "../fixtures/chat-export-2026-08-14-routing-replay.json" with { type: "json" }
 import { threadRouteResultSchema, type ThreadRouteResult } from "../../src/codex/schemas.js"
+import { ReplyEventBus } from "../../src/replies/reply-event-bus.js"
+import { ReplyService } from "../../src/replies/reply-service.js"
 import { BackupService } from "../../src/runtime/backup-service.js"
 import { RuntimeDatabase } from "../../src/runtime/database.js"
 import type { ProjectServiceRecord, RuntimeGroup } from "../../src/runtime/types.js"
 import { ConfiguredSecretRedactor } from "../../src/security/dlp.js"
 import { SupportThreadCoordinator } from "../../src/support/thread-coordinator.js"
 import { SupportThreadStore } from "../../src/support/thread-store.js"
-import { validateRouteClarificationReply, type ThreadRouteInput } from "../../src/support/thread-router.js"
+import { CodexSupportThreadRouter, type ThreadRouteInput } from "../../src/support/thread-router.js"
 
 const openDatabases: RuntimeDatabase[] = []
 const temporaryDirectories: string[] = []
@@ -66,8 +68,10 @@ async function createHarness() {
   const database = await RuntimeDatabase.open(path.join(directory, "runtime.sqlite"))
   openDatabases.push(database)
   const { group, service } = seedCatalog(database)
-  const store = new SupportThreadStore(database, new ConfiguredSecretRedactor(database))
-  return { database, group, service, store }
+  const redactor = new ConfiguredSecretRedactor(database)
+  const store = new SupportThreadStore(database, redactor)
+  const replies = new ReplyService(database, new ReplyEventBus(), redactor)
+  return { database, group, service, store, replies }
 }
 
 function recordQuestion(
@@ -117,6 +121,31 @@ function createFocusedQuestion(
     operatorMessageId: input.messageId,
   }).thread
   return { ...recorded, thread }
+}
+
+function startGenerating(
+  harness: Awaited<ReturnType<typeof createHarness>>,
+  question: ReturnType<typeof createFocusedQuestion>,
+) {
+  const claimed = harness.store.claimDue(new Date(Date.parse(question.event.createdAt) + 31_000).toISOString())!
+  const pending = harness.replies.createPending({
+    threadId: claimed.thread.id,
+    inputRevision: claimed.inputRevision,
+    groupId: harness.group.id,
+    accountId: harness.group.accountId,
+    projectId: harness.service.projectId,
+    serviceId: harness.service.id,
+    telegramMessageId: question.event.telegramMessageId,
+    senderUserId: question.event.senderUserId,
+    senderUsername: question.event.senderUsername,
+    senderDisplayName: question.event.senderDisplayName,
+    senderRole: question.event.senderRole,
+    service: harness.service.key,
+    serviceSource: "group_binding",
+    question: question.event.safeText,
+  })
+  const reply = harness.replies.transition(pending.id, "generating")
+  return { claim: claimed, reply }
 }
 
 describe("sender conversation focus store", () => {
@@ -437,6 +466,44 @@ describe("sender conversation focus store", () => {
 })
 
 describe("bounded sender route model contract", () => {
+  it("催促路由提示要求模型生成真人客服进度解释而不是固定模板", async () => {
+    const harness = await createHarness()
+    const { event } = recordQuestion(harness, {
+      messageId: "570", senderUserId: "30001", text: "现在查得怎么样了",
+    })
+    let prompt = ""
+    const router = new CodexSupportThreadRouter({
+      execute: async (_purpose: unknown, input: { prompt: string }) => {
+        prompt = input.prompt
+        return {
+          action: "follow_up",
+          questionFragment: event.safeText,
+          issues: null,
+          investigationEffect: "status_only",
+          progressReply: "稍等一下，这笔还要把数据库、服务器记录和应用后端日志一起核对完。",
+          reason: "只询问进度",
+          confidence: 1,
+          clarificationReply: null,
+        }
+      },
+    } as never)
+
+    await router.route({
+      mode: "classify",
+      group: harness.group,
+      service: harness.service,
+      messages: [event],
+      focus: { summary: "查询订单", recentMessages: [] },
+      pending: null,
+      ambiguity: null,
+    })
+
+    expect(prompt).toContain("最高优先级身份要求")
+    expect(prompt).toContain("真实的当班客服")
+    expect(prompt).toContain("数据库、服务器记录和应用后端日志")
+    expect(prompt).toContain("不要照抄固定模板")
+  })
+
   it("accepts only bounded classifications without a target thread id", () => {
     expect(threadRouteResultSchema.parse({
       action: "follow_up",
@@ -462,20 +529,155 @@ describe("bounded sender route model contract", () => {
     })).toThrow()
   })
 
-  it("rejects automation identity and generic lost-context clarification copy", () => {
-    expect(validateRouteClarificationReply("你问的是 Aropay 新账号，还是密码重置？", [
-      "Aropay 新账号", "Aropay 密码重置",
-    ])).toBe("你问的是 Aropay 新账号，还是密码重置？")
-    expect(validateRouteClarificationReply("Aropay 是要开账号，还是重置密码？", [
-      "创建 Aropay 新账号", "重置 Aropay 登录密码",
-    ])).toBe("Aropay 是要开账号，还是重置密码？")
-    expect(() => validateRouteClarificationReply("你问的是哪项", ["新账号", "密码重置"])).toThrow(/自然确认/u)
-    expect(() => validateRouteClarificationReply("我是 AI 客服，请说具体事项", ["新账号", "密码重置"])).toThrow(/自然确认/u)
-    expect(() => validateRouteClarificationReply("这个还是那个？", ["新账号", "密码重置"])).toThrow(/候选/u)
+  it("只允许后续追问声明为不改变排查输入", () => {
+    expect(threadRouteResultSchema.safeParse({
+      action: "follow_up",
+      questionFragment: "现在查得怎么样了",
+      investigationEffect: "status_only",
+      progressReply: "稍等一下，我还要把数据库、服务器记录和应用后端日志一起核对完，确认准确后马上回复你。",
+      reason: "只询问当前进度",
+      confidence: 1,
+      clarificationReply: null,
+    }).success).toBe(true)
+    expect(threadRouteResultSchema.safeParse({
+      action: "new_thread",
+      questionFragment: "现在查得怎么样了",
+      investigationEffect: "status_only",
+      progressReply: "稍等一下，我还在逐项核对。",
+      reason: "非法组合",
+      confidence: 1,
+      clarificationReply: null,
+    }).success).toBe(false)
+  })
+
+  it("待归属文案只校验结构 不按句式做业务门禁", () => {
+    expect(threadRouteResultSchema.safeParse({
+      action: "uncertain",
+      questionFragment: "这个呢",
+      reason: "当前存在两个可能事项",
+      confidence: 0.5,
+      clarificationReply: "Aropay 是要开账号，还是重置密码？",
+    }).success).toBe(true)
   })
 })
 
 describe("sender-focused coordinator routing", () => {
+  it("纯进度催促不重启正在进行的排查并把最终回复目标更新到最新消息", async () => {
+    const harness = await createHarness()
+    const question = createFocusedQuestion(harness, {
+      messageId: "580", senderUserId: "30001", text: "帮我查这笔订单为什么一直处理中",
+    })
+    const running = startGenerating(harness, question)
+    const before = harness.store.getThread(question.thread.id)
+    const progressReplies: string[] = []
+    const coordinator = new SupportThreadCoordinator({
+      database: harness.database,
+      store: harness.store,
+      router: { route: async () => ({
+        action: "follow_up",
+        questionFragment: "这个问题现在排查得怎么样了",
+        investigationEffect: "status_only",
+        progressReply: "稍等一下，这笔除了系统本身，还要一起核对数据库、服务器记录和应用后端日志，确认准确需要一点时间。",
+        reason: "只询问当前排查进度，没有新增排查事实",
+        confidence: 1,
+        clarificationReply: null,
+      }) },
+      batchWindowMs: 0,
+      wake: () => undefined,
+      sendStatusUpdate: async ({ text }) => {
+        progressReplies.push(text)
+        return { replyId: null }
+      },
+    })
+    const reminder = coordinator.accept({
+      groupId: harness.group.id,
+      messageId: "581",
+      senderId: "30001",
+      senderUsername: null,
+      senderDisplayName: "运营",
+      fromBot: false,
+      replyToMessageId: null,
+      messageThreadId: null,
+      replyTargetIsBot: false,
+      text: "这个问题现在排查得怎么样了？",
+      attachments: [],
+      createdAt: new Date(Date.parse(question.event.createdAt) + 32_000).toISOString(),
+    })!
+
+    await coordinator.drain()
+
+    const after = harness.store.getThread(question.thread.id)
+    expect(harness.store.findThreadByEvent(reminder.id)?.id).toBe(question.thread.id)
+    expect(after).toMatchObject({
+      status: "generating",
+      revision: before.revision,
+      generationStartedAt: before.generationStartedAt,
+      progressDueAt: before.progressDueAt,
+      hardDeadlineAt: before.hardDeadlineAt,
+    })
+    expect(harness.replies.getDetail(running.reply.id)).toMatchObject({
+      status: "generating",
+      inputRevision: before.revision,
+      telegramMessageId: "581",
+    })
+    expect(harness.store.getEvent(reminder.id)).toMatchObject({
+      routeStatus: "routed",
+      skipReason: "仅询问当前排查进度，已由当班客服回复且不改变排查输入",
+    })
+    expect(progressReplies).toEqual([
+      "稍等一下，这笔除了系统本身，还要一起核对数据库、服务器记录和应用后端日志，确认准确需要一点时间。",
+    ])
+  })
+
+  it("催促中带补充证据时仍使旧版本失效并按新证据重新排查", async () => {
+    const harness = await createHarness()
+    const question = createFocusedQuestion(harness, {
+      messageId: "585", senderUserId: "30001", text: "帮我查这笔订单为什么一直处理中",
+    })
+    startGenerating(harness, question)
+    const before = harness.store.getThread(question.thread.id)
+    const coordinator = new SupportThreadCoordinator({
+      database: harness.database,
+      store: harness.store,
+      router: { route: async () => ({
+        action: "follow_up",
+        questionFragment: "怎么还没查完，上游后台刚刚已经显示成功",
+        investigationEffect: "changes_input",
+        progressReply: null,
+        reason: "催促同时补充了会改变排查结论的新状态证据",
+        confidence: 1,
+        clarificationReply: null,
+      }) },
+      batchWindowMs: 0,
+      wake: () => undefined,
+    })
+    const evidenceFollowup = coordinator.accept({
+      groupId: harness.group.id,
+      messageId: "586",
+      senderId: "30001",
+      senderUsername: null,
+      senderDisplayName: "运营",
+      fromBot: false,
+      replyToMessageId: null,
+      messageThreadId: null,
+      replyTargetIsBot: false,
+      text: "怎么还没查完，上游后台刚刚已经显示成功",
+      attachments: [],
+      createdAt: new Date(Date.parse(question.event.createdAt) + 32_000).toISOString(),
+    })!
+
+    await coordinator.drain()
+
+    expect(harness.store.findThreadByEvent(evidenceFollowup.id)?.id).toBe(question.thread.id)
+    expect(harness.store.getThread(question.thread.id)).toMatchObject({
+      status: "collecting",
+      revision: before.revision + 1,
+      generationStartedAt: null,
+      progressDueAt: null,
+      hardDeadlineAt: null,
+    })
+  })
+
   it("路由模型失败时安全建立独立问题而不丢弃运营消息", async () => {
     const harness = await createHarness()
     const coordinator = new SupportThreadCoordinator({

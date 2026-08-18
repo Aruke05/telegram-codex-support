@@ -146,43 +146,39 @@ export class TechnicalAlertService {
       : record.telegramMessageId ? [record.telegramMessageId] : []
     if (messageIds.length === 0) return { status: "failed", summary: "没有可转发的原消息", errorType: "unknown" }
 
-    let forwarded = 0
-    for (const messageId of messageIds) {
-      try {
-        const delivered = await this.transport.forwardMessages(
-          targetAccountId,
-          targetChatId,
-          sourceChatId,
-          [messageId],
-          {
-            groupId: target.id,
-            threadId: record.threadId,
-            serviceId: record.serviceId,
-            replyId,
-            kind: outputKind,
-          },
-        )
-        if (delivered.length !== 1) throw new TelegramDeliveryError("unknown", "uncertain")
-        forwarded += 1
-      } catch (error) {
-        const deliveryError = error instanceof TelegramDeliveryError
-          ? error
-          : new TelegramDeliveryError("unknown", "uncertain")
-        if (forwarded > 0 || deliveryError.state === "uncertain") return {
-          status: "uncertain",
-          summary: deliveryError.state === "uncertain"
-            ? `转发中断：已确认送达 ${forwarded} 条，当前消息结果未知`
-            : `转发中断：已确认送达 ${forwarded} 条，当前消息明确未送达`,
-          errorType: deliveryError.type,
-        }
-        return {
-          status: "failed",
-          summary: deliverySummaries[deliveryError.type],
-          errorType: deliveryError.type,
-        }
+    try {
+      // Telegram 原生支持一次按顺序转发整组消息。整批调用可以保留相册和上下文顺序，
+      // 也避免逐条发送在中途失败后只把线程前半段交给技术群。
+      const delivered = await this.transport.forwardMessages(
+        targetAccountId,
+        targetChatId,
+        sourceChatId,
+        messageIds,
+        {
+          groupId: target.id,
+          threadId: record.threadId,
+          serviceId: record.serviceId,
+          replyId,
+          kind: outputKind,
+        },
+      )
+      if (delivered.length !== messageIds.length) throw new TelegramDeliveryError("unknown", "uncertain")
+      return { status: "sent", summary: `已转发 ${delivered.length} 条`, errorType: null }
+    } catch (error) {
+      const deliveryError = error instanceof TelegramDeliveryError
+        ? error
+        : new TelegramDeliveryError("unknown", "uncertain")
+      if (deliveryError.state === "uncertain") return {
+        status: "uncertain",
+        summary: "整组原消息转发结果未知",
+        errorType: deliveryError.type,
+      }
+      return {
+        status: "failed",
+        summary: deliverySummaries[deliveryError.type],
+        errorType: deliveryError.type,
       }
     }
-    return { status: "sent", summary: `已转发 ${forwarded} 条`, errorType: null }
   }
 
   private suppressed(): TechnicalAlertDelivery {

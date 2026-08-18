@@ -154,33 +154,86 @@ export type ReferenceProposalResult = z.infer<typeof referenceProposalResultSche
 export const threadRouteActionSchema = z.enum([
   "follow_up",
   "new_thread",
+  "split",
   "idle",
   "uncertain",
   "candidate_1",
   "candidate_2",
 ])
 
+export const threadRouteIssueSchema = z.object({
+  eventIds: z.array(z.string().uuid()).min(1).max(32),
+  questionFragment: z.string().trim().min(1).max(12000),
+}).strict()
+
+export const threadInvestigationEffectSchema = z.enum(["changes_input", "status_only"])
+
 const threadRouteResultShape = {
   questionFragment: z.string().trim().max(12000),
+  issues: z.array(threadRouteIssueSchema).min(2).max(8).nullable().optional(),
+  investigationEffect: threadInvestigationEffectSchema.optional(),
+  progressReply: z.string().trim().min(1).max(500).nullable().optional(),
   reason: z.string().trim().min(1).max(1000),
   confidence: z.number().min(0).max(1),
   clarificationReply: z.string().trim().min(1).max(240).nullable(),
 } as const
 
 export const classifyThreadRouteResultSchema = z.object({
-  action: z.enum(["follow_up", "new_thread", "idle", "uncertain"]),
+  action: z.enum(["follow_up", "new_thread", "split", "idle", "uncertain"]),
   ...threadRouteResultShape,
-}).strict()
+}).strict().superRefine((value, context) => {
+  if (value.action === "split" && !value.issues) {
+    context.addIssue({ code: "custom", path: ["issues"], message: "拆分路由必须提供至少两个问题单元" })
+  }
+  if (value.action !== "split" && value.issues != null) {
+    context.addIssue({ code: "custom", path: ["issues"], message: "非拆分路由不能提供问题单元" })
+  }
+  if (value.investigationEffect === "status_only" && value.action !== "follow_up") {
+    context.addIssue({ code: "custom", path: ["investigationEffect"], message: "只有后续追问可以是不改变排查输入的进度询问" })
+  }
+  if (value.investigationEffect === "status_only" && !value.progressReply) {
+    context.addIssue({ code: "custom", path: ["progressReply"], message: "进度询问必须生成当班客服的进度回复" })
+  }
+  if (value.investigationEffect !== "status_only" && value.progressReply != null) {
+    context.addIssue({ code: "custom", path: ["progressReply"], message: "非进度询问不能生成进度回复" })
+  }
+})
 
 export const resolveThreadRouteResultSchema = z.object({
   action: z.enum(["candidate_1", "candidate_2", "new_thread", "idle", "uncertain"]),
   ...threadRouteResultShape,
-}).strict()
+}).strict().superRefine((value, context) => {
+  if (value.issues != null) {
+    context.addIssue({ code: "custom", path: ["issues"], message: "待归属回答不能拆分为新问题" })
+  }
+  if (value.investigationEffect === "status_only") {
+    context.addIssue({ code: "custom", path: ["investigationEffect"], message: "待归属回答不能声明为进度询问" })
+  }
+  if (value.progressReply != null) {
+    context.addIssue({ code: "custom", path: ["progressReply"], message: "待归属回答不能生成进度回复" })
+  }
+})
 
 export const threadRouteResultSchema = z.object({
   action: threadRouteActionSchema,
   ...threadRouteResultShape,
-}).strict()
+}).strict().superRefine((value, context) => {
+  if (value.action === "split" && !value.issues) {
+    context.addIssue({ code: "custom", path: ["issues"], message: "拆分路由必须提供至少两个问题单元" })
+  }
+  if (value.action !== "split" && value.issues != null) {
+    context.addIssue({ code: "custom", path: ["issues"], message: "非拆分路由不能提供问题单元" })
+  }
+  if (value.investigationEffect === "status_only" && value.action !== "follow_up") {
+    context.addIssue({ code: "custom", path: ["investigationEffect"], message: "只有后续追问可以是不改变排查输入的进度询问" })
+  }
+  if (value.investigationEffect === "status_only" && !value.progressReply) {
+    context.addIssue({ code: "custom", path: ["progressReply"], message: "进度询问必须生成当班客服的进度回复" })
+  }
+  if (value.investigationEffect !== "status_only" && value.progressReply != null) {
+    context.addIssue({ code: "custom", path: ["progressReply"], message: "非进度询问不能生成进度回复" })
+  }
+})
 
 export type ThreadRouteAction = z.infer<typeof threadRouteActionSchema>
 export type ThreadRouteResult = z.infer<typeof threadRouteResultSchema>
@@ -362,10 +415,28 @@ export const referenceProposalResultJsonSchema = {
 export const threadRouteResultJsonSchema = {
   type: "object",
   additionalProperties: false,
-  required: ["action", "questionFragment", "reason", "confidence", "clarificationReply"],
+  required: ["action", "questionFragment", "issues", "investigationEffect", "progressReply", "reason", "confidence", "clarificationReply"],
   properties: {
-    action: { type: "string", enum: ["follow_up", "new_thread", "idle", "uncertain", "candidate_1", "candidate_2"] },
+    action: { type: "string", enum: ["follow_up", "new_thread", "split", "idle", "uncertain", "candidate_1", "candidate_2"] },
     questionFragment: { type: "string", maxLength: 12000 },
+    issues: {
+      anyOf: [{
+        type: "array",
+        minItems: 2,
+        maxItems: 8,
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["eventIds", "questionFragment"],
+          properties: {
+            eventIds: { type: "array", minItems: 1, maxItems: 32, items: { type: "string" } },
+            questionFragment: { type: "string", minLength: 1, maxLength: 12000 },
+          },
+        },
+      }, { type: "null" }],
+    },
+    investigationEffect: { type: "string", enum: ["changes_input", "status_only"] },
+    progressReply: { anyOf: [{ type: "string", minLength: 1, maxLength: 500 }, { type: "null" }] },
     reason: { type: "string", minLength: 1, maxLength: 1000 },
     confidence: { type: "number", minimum: 0, maximum: 1 },
     clarificationReply: { anyOf: [{ type: "string", minLength: 1, maxLength: 240 }, { type: "null" }] },
@@ -383,7 +454,7 @@ function threadRouteJsonSchema(actions: readonly string[]) {
 }
 
 export const classifyThreadRouteResultJsonSchema = threadRouteJsonSchema([
-  "follow_up", "new_thread", "idle", "uncertain",
+  "follow_up", "new_thread", "split", "idle", "uncertain",
 ] as const)
 
 export const resolveThreadRouteResultJsonSchema = threadRouteJsonSchema([

@@ -27,6 +27,7 @@ import type { ResourceWorkspace } from "./resource-workspace.js"
 import { routeSupportMessage } from "./routing.js"
 import type { TechnicalAlertDelivery, TechnicalAlertService } from "./technical-alert-service.js"
 import type { SupportThreadStore } from "./thread-store.js"
+import type { TrustedDatabaseQueryRequest } from "./trusted-command-observation.js"
 
 type CodeSyncPort = {
   readCurrentSnapshot(serviceId: string): ProjectCodeSnapshot
@@ -46,6 +47,11 @@ type TransportPort = {
 type LearningPort = { enqueue(replyId: string): void }
 type ResourceBrokerPort = {
   runServerCheck(resourceId: string, check: "nginx_routes" | "system_resources"): Promise<{ exitCode: number; stdout: string; stderr: string }>
+  verifyDatabaseQuery?(serviceId: string, request: TrustedDatabaseQueryRequest, signal?: AbortSignal): Promise<{
+    columns: string[]
+    rows: unknown[]
+    truncated: boolean
+  }>
 }
 export type SupportAnswerWorkerDependencies = {
   database: RuntimeDatabase
@@ -78,13 +84,6 @@ function fitQuestion(value: string): string {
   if (value.length <= 12_000) return value
   return `${value.slice(0, 5_800)}\n\n[中间较早内容已省略]\n\n${value.slice(-5_800)}`
 }
-
-export {
-  hasVerifiedCodeDefect,
-  hasVerifiedTechnicalEscalation,
-  operatorAnswerIsTooTechnical,
-  operatorAnswerNeedsTechnicalOnly,
-} from "./investigation-service.js"
 
 function deliveryState(error: unknown): "failed" | "uncertain" {
   return error instanceof TelegramDeliveryError ? error.state : "uncertain"
@@ -271,6 +270,7 @@ export class SupportAnswerWorker {
           },
         }, controller.signal)
         service = result.service
+        await this.waitForPendingRouting(thread.id, inputRevision, controller.signal)
         if (this.hardDeadlineReached(thread.id, inputRevision)) return
         if (!this.current(thread.id, inputRevision)) return this.supersede(reply.id)
         await this.applyDecision(
@@ -284,7 +284,11 @@ export class SupportAnswerWorker {
           replyTarget?.safeText ?? "",
         )
       } catch (error) {
-        if (controller.signal.aborted || this.hardDeadlineReached(thread.id, inputRevision)) return
+        if (controller.signal.aborted) {
+          if (!this.current(thread.id, inputRevision)) this.supersede(reply.id)
+          return
+        }
+        if (this.hardDeadlineReached(thread.id, inputRevision)) return
         if (error instanceof SupportCodeConfigurationChangedError) {
           return this.retryForCodeConfiguration(reply.id, thread, inputRevision)
         }
@@ -936,6 +940,32 @@ export class SupportAnswerWorker {
 
   private current(threadId: string, revision: number): boolean {
     return this.deps.store.isCurrentRevision(threadId, revision)
+  }
+
+  private async waitForPendingRouting(
+    threadId: string,
+    inputRevision: number,
+    signal: AbortSignal,
+  ): Promise<void> {
+    while (this.current(threadId, inputRevision) && this.deps.store.hasPendingRoutingEventForThread(threadId)) {
+      await new Promise<void>((resolve, reject) => {
+        if (signal.aborted) {
+          reject(new Error("问题版本已变化"))
+          return
+        }
+        const timer = setTimeout(() => {
+          signal.removeEventListener("abort", abort)
+          resolve()
+        }, 100)
+        timer.unref()
+        const abort = () => {
+          clearTimeout(timer)
+          signal.removeEventListener("abort", abort)
+          reject(new Error("问题版本已变化"))
+        }
+        signal.addEventListener("abort", abort, { once: true })
+      })
+    }
   }
 
   private replyTargetMessageId(replyId: string, thread: SupportThread): string {

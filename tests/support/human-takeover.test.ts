@@ -349,6 +349,118 @@ function createWorker(harness: BaseHarness, input: {
 }
 
 describe("人工接管与发送边界", () => {
+  it("收集期催促进度回复独立持久化且不改变原线程版本和计时", async () => {
+    const harness = await createBaseHarness()
+    const { event, thread } = createQuestion(harness, "9001", "帮我查这笔订单")
+    const before = harness.store.getThread(thread.id)
+    const pending = harness.replies.createPending({
+      threadId: thread.id,
+      inputRevision: thread.revision,
+      groupId: harness.group.id,
+      accountId: harness.group.accountId,
+      projectId: harness.service.projectId,
+      serviceId: harness.service.id,
+      telegramMessageId: event.telegramMessageId,
+      senderUserId: event.senderUserId,
+      senderUsername: event.senderUsername,
+      senderDisplayName: event.senderDisplayName,
+      senderRole: event.senderRole,
+      service: harness.service.key,
+      serviceSource: "group_binding",
+      question: "现在查得怎么样了",
+    })
+    harness.replies.transition(pending.id, "generating")
+
+    expect(harness.replies.claimSideMessageSending(pending.id, {
+      answer: "稍等一下，这笔还要把数据库、服务器记录和应用后端日志一起核对完。",
+    })?.status).toBe("sending")
+    harness.replies.transition(pending.id, "replied", { telegramReplyMessageId: "9002" })
+
+    expect(harness.replies.getDetail(pending.id)).toMatchObject({
+      status: "replied",
+      threadId: thread.id,
+      inputRevision: thread.revision,
+    })
+    expect(harness.store.getThread(thread.id)).toMatchObject({
+      status: before.status,
+      revision: before.revision,
+      settleAt: before.settleAt,
+      generationStartedAt: before.generationStartedAt,
+      progressDueAt: before.progressDueAt,
+      hardDeadlineAt: before.hardDeadlineAt,
+    })
+  })
+
+  it("回答完成时先等同线程催促路由落定并把最终回答回复到最新催促消息", async () => {
+    const harness = await createBaseHarness()
+    const { event, thread } = createQuestion(harness, "9011", "帮我查这笔订单为什么一直处理中")
+    const snapshot = seedCodeSnapshot(harness)
+    const sendMessage = vi.fn(async () => "robot-9013")
+    const deliveryOrder: string[] = []
+    let coordinator: SupportThreadCoordinator
+    const worker = createWorker(harness, {
+      readCurrentSnapshot: () => snapshot,
+      decision: async () => {
+        coordinator.accept({
+          groupId: harness.group.id,
+          messageId: "9012",
+          senderId: event.senderUserId,
+          senderUsername: null,
+          senderDisplayName: "运营",
+          fromBot: false,
+          replyToMessageId: event.telegramMessageId,
+          messageThreadId: null,
+          replyTargetIsBot: false,
+          text: "这个问题现在排查得怎么样了？",
+          attachments: [],
+          createdAt: new Date().toISOString(),
+        })
+        return answerDecision()
+      },
+      sendMessage,
+    })
+    coordinator = new SupportThreadCoordinator({
+      database: harness.database,
+      store: harness.store,
+      router: { route: async () => ({
+        action: "follow_up",
+        questionFragment: "这个问题现在排查得怎么样了",
+        investigationEffect: "status_only",
+        progressReply: "稍等一下，这笔还要把数据库、服务器记录和应用后端日志一起核对完，确认准确需要一点时间。",
+        reason: "只询问当前排查进度，没有新增排查事实",
+        confidence: 1,
+        clarificationReply: null,
+      }) },
+      batchWindowMs: 20,
+      wake: () => undefined,
+      cancelStale: () => worker.cancelClosed(),
+      sendStatusUpdate: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20))
+        deliveryOrder.push("progress")
+        return { replyId: null }
+      },
+    })
+
+    await worker.runDueOnce(new Date())
+    deliveryOrder.push("answer")
+    await coordinator.drain()
+
+    expect(sendMessage).toHaveBeenCalledTimes(1)
+    expect(deliveryOrder).toEqual(["progress", "answer"])
+    expect(sendMessage).toHaveBeenCalledWith(
+      harness.group.accountId,
+      harness.group.telegramChatId,
+      answerDecision().answer,
+      "9012",
+      null,
+      expect.objectContaining({ threadId: thread.id, kind: "support_reply" }),
+    )
+    expect(harness.store.getThread(thread.id)).toMatchObject({ status: "answered", revision: 1 })
+    expect(harness.database.readReplies("WHERE r.thread_id=?", [thread.id])).toEqual([
+      expect.objectContaining({ status: "replied", telegramMessageId: "9012", inputRevision: 1 }),
+    ])
+  })
+
   it("稍等发送中收到普通补充消息后按当前版本收口并继续 AI", async () => {
     const harness = await createBaseHarness()
     const { thread } = createQuestion(harness, "priority-race", "帮忙看下 @technical_user", ["20001"])
@@ -481,7 +593,7 @@ describe("人工接管与发送边界", () => {
     ])
   })
 
-  it("人工优先已发稍等后模型输出硬拦截会转人工而不静默关闭", async () => {
+  it("人工优先已发稍等后业务语义不再触发硬拦截", async () => {
     const harness = await createBaseHarness()
     const { event, thread } = createQuestion(harness, "priority-output-rejected", "你是不是机器人")
     markHumanPriorityClaimed(harness, thread, event.id)
@@ -498,13 +610,13 @@ describe("人工接管与发送边界", () => {
     expect(sendMessage).toHaveBeenCalledWith(
       harness.group.accountId,
       harness.group.telegramChatId,
-      "这边没处理完，我帮你转给技术继续跟进",
+      "我是 AI 自动客服 现在帮你看",
       thread.anchorMessageId,
-      undefined,
+      null,
       expect.objectContaining({ threadId: thread.id, kind: "support_reply" }),
     )
     expect(harness.database.readReplies("WHERE r.thread_id=?", [thread.id])).toEqual([
-      expect.objectContaining({ status: "escalated", decision: "escalate", errorCode: "answer_model_failed" }),
+      expect.objectContaining({ status: "replied", decision: "reply", errorCode: null }),
     ])
   })
 
@@ -711,9 +823,7 @@ describe("人工接管与发送边界", () => {
     const replies = harness.database.readReplies("WHERE r.thread_id=? ORDER BY r.input_revision", [thread.id])
     expect(replies.map((reply) => reply.telegramMessageId)).toEqual(["3211", "3212"])
     expect(agentInputs[1]?.latestMessage).toBe("mcbpay的团队不也是你们吗")
-    expect(agentInputs[1]?.projectServices).toEqual(expect.arrayContaining([
-      { key: "mcbpay", name: "MCBPay" },
-    ]))
+    expect(agentInputs[1]).not.toHaveProperty("projectServices")
     const context = agentInputs[1]?.conversationContext ?? ""
     const firstUserAt = context.indexOf("[运营 ")
     const firstAnswerAt = context.indexOf("[客服 ")
@@ -742,7 +852,7 @@ describe("人工接管与发送边界", () => {
     expect(harness.database.readReplies("ORDER BY r.created_at DESC LIMIT 1")[0]?.answer).toBe(answer)
   })
 
-  it("回答模型自称 AI 或自动客服时静默阻断而不改写发送", async () => {
+  it("回答模型业务措辞不再由确定性代码静默阻断或改写", async () => {
     const harness = await createBaseHarness()
     const { thread } = createQuestion(harness, "3213-identity", "你是不是机器人")
     const snapshot = seedCodeSnapshot(harness)
@@ -755,17 +865,15 @@ describe("人工接管与发送边界", () => {
 
     await worker.runDueOnce(new Date())
 
-    expect(sendMessage).not.toHaveBeenCalled()
-    expect(harness.store.getThread(thread.id).status).toBe("closed")
+    expect(sendMessage).toHaveBeenCalledTimes(1)
+    expect(sendMessage.mock.calls[0]?.[2]).toBe("我是 AI 自动客服 现在帮你看")
+    expect(harness.store.getThread(thread.id).status).toBe("answered")
     expect(harness.database.readReplies("WHERE r.thread_id=?", [thread.id])).toEqual([
       expect.objectContaining({
-        status: "failed",
-        errorCode: "answer_model_failed",
-        decisionReason: expect.stringContaining("SupportModelOutputRejectedError"),
+        status: "replied",
+        errorCode: null,
       }),
     ])
-    expect(harness.database.readReplies("WHERE r.thread_id=?", [thread.id])[0]?.decisionReason)
-      .toContain("回复暴露了 AI、机器人或自动客服身份")
   })
 
   it("回答模型失败时不发送任何代码兜底消息", async () => {
@@ -1567,7 +1675,7 @@ describe("人工接管与发送边界", () => {
       _sourceChatId: string,
       _messageIds: string[],
       _ownership?: TelegramOutputOwnership,
-    ) => [`5${_messageIds[0]}`])
+    ) => _messageIds.map((messageId) => `5${messageId}`))
     const alerts = new TechnicalAlertService(
       harness.database,
       harness.store,
@@ -1591,9 +1699,9 @@ describe("人工接管与发送边界", () => {
     )).resolves.toEqual({ status: "sent", summary: "已转发 3 条", errorType: null })
 
     expect(sendMessage).not.toHaveBeenCalled()
-    expect(forwardMessages).toHaveBeenCalledTimes(6)
+    expect(forwardMessages).toHaveBeenCalledTimes(2)
     expect(forwardMessages.mock.calls.map((call) => call[3])).toEqual([
-      ["3550"], ["3551"], ["3552"], ["3550"], ["3551"], ["3552"],
+      ["3550", "3551", "3552"], ["3550", "3551", "3552"],
     ])
     expect(forwardMessages.mock.calls[0]?.[4]).toEqual({
       groupId: targetGroupId,
@@ -1602,7 +1710,7 @@ describe("人工接管与发送边界", () => {
       replyId: reply.id,
       kind: "technical_alert:escalation",
     })
-    expect(forwardMessages.mock.calls[3]?.[4]).toEqual(expect.objectContaining({
+    expect(forwardMessages.mock.calls[1]?.[4]).toEqual(expect.objectContaining({
       kind: "technical_alert:feature_request",
     }))
   })

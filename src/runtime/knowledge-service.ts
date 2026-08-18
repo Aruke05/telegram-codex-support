@@ -140,10 +140,6 @@ function ftsTrigramQuery(value: string): string | null {
   return [...terms].map((term) => `"${term.replaceAll('"', '""')}"`).join(" OR ") || null
 }
 
-function anomalyPatternForCorrection(value: string): boolean {
-  return /(?:延迟|失败|不到账|未到账|没到账|未回调|没回调|报错|异常|超时|错误|error|failed|failure|delay|timeout)/iu.test(value)
-}
-
 function sha256(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex")
 }
@@ -889,9 +885,7 @@ export class RuntimeKnowledgeService {
       const reply = this.getReply(replyRecordId)
       const authoredTitle = parsed.title ? this.sanitize(parsed.title) : ""
       const title = authoredTitle || `纠正：${reply.question.slice(0, 120)}`
-      const defaultApplicability = anomalyPatternForCorrection(reply.question)
-        ? `当出现与“${reply.question.slice(0, 240)}”同类的异常反馈时，即使没有明确问句也需要回复；资料不足先追问。`
-        : `当出现与“${reply.question.slice(0, 240)}”同类的问题时，优先采用这条人工纠正。`
+      const defaultApplicability = `当出现与“${reply.question.slice(0, 240)}”同类或近义的场景时，优先采用这条人工纠正；除非人工明确限定，否则规则跨项目、服务、通道、订单和错误码通用。`
       const defaultMemoryContent = [
         `适用条件：${defaultApplicability}`,
         `回答原则：${reason}`,
@@ -949,9 +943,7 @@ export class RuntimeKnowledgeService {
     return this.database.transaction(() => {
       const authoredTitle = parsed.title ? this.sanitize(parsed.title) : ""
       const title = authoredTitle || `纠正：${originalQuestion.slice(0, 120)}`
-      const defaultApplicability = anomalyPatternForCorrection(originalQuestion)
-        ? `当出现与“${originalQuestion.slice(0, 240)}”同类的异常反馈时，即使没有明确问句也需要回复；资料不足先追问。`
-        : `当出现与“${originalQuestion.slice(0, 240)}”同类的问题时，优先采用这条人工纠正。`
+      const defaultApplicability = `当出现与“${originalQuestion.slice(0, 240)}”同类或近义的场景时，优先采用这条人工纠正；除非人工明确限定，否则规则跨项目、服务、通道、订单和错误码通用。`
       const defaultMemoryContent = [
         `适用条件：${defaultApplicability}`,
         `回答原则：${reason}`,

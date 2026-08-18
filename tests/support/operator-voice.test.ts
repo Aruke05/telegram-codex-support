@@ -11,19 +11,15 @@ import { ModelConfigService } from "../../src/runtime/model-config-service.js"
 import { ConfiguredSecretRedactor } from "../../src/security/dlp.js"
 import { SupportInvestigationService } from "../../src/support/investigation-service.js"
 import {
-  auditableActionAnswerIsComplete,
-  featureRequestAnswerConfirmsDeployment,
-} from "../../src/support/investigation-service.js"
-import {
   baselineOperatorStyleProfile,
   operatorStyleProfileSchema,
   operatorStylePrompt,
 } from "../../src/support/operator-style.js"
 import {
   humanizeOperatorAnswer,
-  operatorAnswerStartsWithMechanicalAcknowledgement,
 } from "../../src/support/operator-voice.js"
 import { SupportThreadStore } from "../../src/support/thread-store.js"
+import { systemDirectivesPrompt } from "../../src/support/system-directives.js"
 
 const temporaryDirectories: string[] = []
 const testModelSnapshot = {
@@ -152,84 +148,17 @@ describe("运营参考回复风格", () => {
     expect(operatorStylePrompt(baselineOperatorStyleProfile)).toContain("复杂问题最多 3 条回复")
   })
 
-  it.each([
-    ["可以。按截图中的时间段，共释放了 1 笔", true],
-    ["能查，这段时间共释放了 1 笔", true],
-    ["查到了，这笔订单被释放后重新派发", true],
-    ["是的，这个功能已经通知技术", true],
-    ["可以，这个功能会加", true],
-    ["这个可以查，共释放了 1 笔", true],
-    ["这笔订单能查到操作记录，操作人是 xiaofan", true],
-    ["当前可以新增这个功能", true],
-    ["共释放了 1 笔，就是 DF202608142348201124703", false],
-    ["这个功能已经通知技术，技术上线后会解决", false],
-    ["发一下订单号", false],
-  ])("机械是非开场门禁 %#", (answer, rejected) => {
-    expect(operatorAnswerStartsWithMechanicalAcknowledgement(answer)).toBe(rejected)
+  it("产品改动由提示词约束回复意图而不是发送前正则门禁", () => {
+    const prompt = systemDirectivesPrompt()
+    expect(prompt).toContain("产品改动需求立即通知技术")
+    expect(prompt).toContain("业务语义全部由回答模型")
+    expect(prompt).toContain("不得用关键词 正则")
   })
 
-  it("产品改动回复必须同时说明已通知技术和上线后解决", () => {
-    expect(featureRequestAnswerConfirmsDeployment("已经通知技术了，技术上线后会解决")).toBe(true)
-    expect(featureRequestAnswerConfirmsDeployment("已经同步给开发，功能发布后会生效")).toBe(true)
-    expect(featureRequestAnswerConfirmsDeployment("已经通知技术了")).toBe(false)
-    expect(featureRequestAnswerConfirmsDeployment("技术上线后会解决")).toBe(false)
-    expect(featureRequestAnswerConfirmsDeployment("目前不支持，你先选一下方案")).toBe(false)
-  })
-
-  it("后台可审计动作必须有真实操作人核对并写入运营结论", () => {
-    const base = {
-      decision: "reply" as const,
-      escalationType: "none" as const,
-      answer: "订单在 23:53:33 被后台释放，随后重新派发",
-      quote: null,
-      reason: "释放导致重新派发",
-      confidence: 1,
-      usedMemoryVersionIds: [],
-      investigation: {
-        summary: "释放记录已查",
-        steps: [{
-          source: "message" as const,
-          title: "读取问题",
-          status: "confirmed" as const,
-          evidence: "DF202608142348201124703",
-          conclusion: "需要查订单",
-        }],
-      },
-    }
-
-    expect(auditableActionAnswerIsComplete(base)).toBe(false)
-    expect(auditableActionAnswerIsComplete({
-      ...base,
-      answer: "订单在 23:53:33 被释放，操作人是 xiaofan，随后重新派发",
-      investigation: {
-        summary: "释放审计已确认",
-        steps: [{
-          source: "database",
-          title: "父进程复核数据库只读查询",
-          status: "confirmed",
-          evidence: '父进程经绑定服务器重新执行 只读SQL=SELECT operator_name,action FROM audit_log WHERE order_no=\'DF202608142348201124703\' LIMIT 10 返回行数=1 截断=否 样本=[{"operator_name":"xiaofan","action":"release"}]',
-          conclusion: "已确认释放操作人和时间",
-        }],
-      },
-    })).toBe(true)
-    expect(auditableActionAnswerIsComplete({
-      ...base,
-      answer: "这段时间共释放了 1 笔，操作人在当前审计记录里无法确认",
-      investigation: {
-        summary: "释放审计未记录人员",
-        steps: [{
-          source: "database",
-          title: "父进程复核数据库只读查询",
-          status: "not_found",
-          evidence: "父进程经绑定服务器重新执行 只读SQL=SELECT operator_name FROM release_audit WHERE order_no='DF202608142348201124703' LIMIT 10 返回行数=0 截断=否 样本=[]",
-          conclusion: "当前释放审计没有操作人记录",
-        }],
-      },
-    })).toBe(true)
-    expect(auditableActionAnswerIsComplete({
-      ...base,
-      answer: "后台菜单里选中订单后点释放就行",
-    })).toBe(true)
+  it("后台可审计动作要求在统一提示词中核对操作人但不由代码判句式", () => {
+    const prompt = systemDirectivesPrompt()
+    expect(prompt).toContain("释放 补单 重新派发 强制改状态等可审计动作必须继续核对操作人")
+    expect(prompt).toContain("查不到操作人时明确说明记录未留下或无法确认")
   })
 
   it("代码兜底口语化仍可处理固定提示 但模型提示不再钉死索要材料句式", () => {
@@ -324,7 +253,7 @@ describe("运营参考回复风格", () => {
     expect(humanizeOperatorAnswer("您好，请提供订单号即可。\n第二行。", "", pinned)).toBe("补一下订单号。 第二行。")
   })
 
-  it("生产排查首轮和重试只注入线程固定风格 不混入系统基线风格", async () => {
+  it("生产排查只注入线程固定风格且不再用机械开场门槛触发重试", async () => {
     const { database, store } = await openThreadStore()
     const redactor = new ConfiguredSecretRedactor(database)
     const knowledge = new RuntimeKnowledgeService(database, redactor)
@@ -352,6 +281,12 @@ describe("运营参考回复风格", () => {
     expect(responseDirective?.content).toContain("生产配置 通道映射或后台业务数据")
     expect(responseDirective?.content).toContain("技术上线后会解决")
     expect(responseDirective?.content).toContain("不当成只回答可以或不可以的是非题")
+    const exampleDirective = knowledge.listDirectives({ enabled: true, scope: "global" })
+      .find((directive) => directive.title === "困难说明允许短例子")
+    expect(exampleDirective?.content).toContain("先给出本题结论和处理方式")
+    expect(exampleDirective?.content).toContain("明确标成假设")
+    expect(exampleDirective?.content).toContain("不得冒充本单证据")
+    expect(exampleDirective?.content).toContain("同一回复最多一个例子")
     const investigationDirective = knowledge.listDirectives({ enabled: true, scope: "global" })
       .find((directive) => directive.title === "自主只读排查")
     expect(investigationDirective?.content).toContain("必须继续核对操作人 操作时间 对象和结果")
@@ -454,7 +389,7 @@ describe("运营参考回复风格", () => {
       }, new AbortController().signal)
 
       const prompts = execute.mock.calls.map((call) => String(call[1]?.prompt))
-      expect(prompts).toHaveLength(2)
+      expect(prompts).toHaveLength(1)
       expect(prompts.map((prompt) => ({
         pinned18: prompt.includes("每句通常不超过 18 个字"),
         baseline32: prompt.includes("每句通常不超过 32 个字"),
@@ -465,17 +400,12 @@ describe("运营参考回复风格", () => {
           pinned18: true, baseline32: false,
           pinnedTone: true, baselineTone: false,
         },
-        {
-          pinned18: true, baseline32: false,
-          pinnedTone: true, baselineTone: false,
-        },
       ])
       expect(prompts.every((prompt) => prompt.includes("技术证据只放内部依据，不得当作运营答案。"))).toBe(true)
       expect(prompts.every((prompt) => prompt.includes("结构化业务值"))).toBe(true)
-      expect(prompts[1]).toContain("上一次 answer 未通过发送要求")
-      expect(prompts[1]).toContain("使用了可以 能查 查到了等机械确认开场")
-      expect(execute.mock.calls.map((call) => call[1]?.modelSnapshot)).toEqual([modelSnapshot, modelSnapshot])
-      expect(execute.mock.calls.map((call) => call[1]?.maxConcurrency)).toEqual([3, 3])
+      expect(prompts[0]).not.toContain("上一次 answer 未通过发送要求")
+      expect(execute.mock.calls.map((call) => call[1]?.modelSnapshot)).toEqual([modelSnapshot])
+      expect(execute.mock.calls.map((call) => call[1]?.maxConcurrency)).toEqual([3])
     } finally {
       database.close()
     }

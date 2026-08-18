@@ -210,6 +210,54 @@ export class ReplyService {
     return updated
   }
 
+  claimSideMessageSending(id: string, metadata: ReplyTransitionMetadata = {}): ReplyRecord | null {
+    const found = this.getDetail(id)
+    if (found.status !== "generating" || found.threadId === null || found.inputRevision === null) return null
+    const now = new Date().toISOString()
+    let claimed = false
+    this.database.transaction(() => {
+      const result = this.database.prepare(`UPDATE support_replies SET
+        status='sending',telegram_reply_message_id=?,code_revision=?,code_snapshot_id=?,code_sync_batch_id=?,
+        operator_delivery_status='sending',updated_at=?,error_code=?,decision_reason=?,decision_confidence=?
+        WHERE id=? AND status='generating' AND EXISTS (
+          SELECT 1 FROM support_threads thread
+          WHERE thread.id=support_replies.thread_id
+            AND thread.status IN ('collecting','generating')
+            AND thread.revision=support_replies.input_revision
+        )`).run(
+        metadata.telegramReplyMessageId === undefined ? found.telegramReplyMessageId : metadata.telegramReplyMessageId,
+        metadata.codeRevision === undefined ? found.codeRevision : metadata.codeRevision,
+        metadata.codeSnapshotId === undefined ? found.codeSnapshotId : metadata.codeSnapshotId,
+        metadata.codeSyncBatchId === undefined ? found.codeSyncBatchId : metadata.codeSyncBatchId,
+        now,
+        metadata.errorCode === undefined ? found.errorCode : metadata.errorCode,
+        metadata.decisionReason === undefined ? found.decisionReason : metadata.decisionReason,
+        metadata.decisionConfidence === undefined ? found.decisionConfidence : metadata.decisionConfidence,
+        id,
+      )
+      if (Number(result.changes) !== 1) return
+      claimed = true
+      if (metadata.answer !== undefined || metadata.quote !== undefined) {
+        const answer = metadata.answer === undefined ? found.answer : this.redactor.assertSafeOutbound(metadata.answer).safeText
+        const quote = metadata.quote === undefined || metadata.quote === null
+          ? metadata.quote === undefined ? found.quote : null
+          : this.redactor.redact(metadata.quote).text
+        this.database.prepare("UPDATE support_reply_payloads SET answer=?,quote_text=? WHERE reply_id=?").run(
+          answer, quote, id,
+        )
+      }
+      if (metadata.memoryVersionRefs !== undefined) {
+        this.database.prepare("DELETE FROM reply_memory_refs WHERE reply_id=?").run(id)
+        const insert = this.database.prepare("INSERT OR IGNORE INTO reply_memory_refs(reply_id,memory_version_id) VALUES (?,?)")
+        metadata.memoryVersionRefs.forEach((versionId) => insert.run(id, versionId))
+      }
+    })
+    if (!claimed) return null
+    const updated = this.getDetail(id)
+    this.events.publish({ id, status: updated.status, updatedAt: updated.updatedAt, durationMs: updated.durationMs })
+    return updated
+  }
+
   claimUnthreadedSending(id: string, metadata: ReplyTransitionMetadata = {}): ReplyRecord | null {
     const found = this.getDetail(id)
     if (found.status !== "generating" || found.threadId !== null) return null

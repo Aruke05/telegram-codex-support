@@ -281,6 +281,57 @@ supportThreadCoordinator = new SupportThreadCoordinator({
       throw error
     }
   },
+  sendStatusUpdate: async ({ group, service, thread, event, text }) => {
+    const outbound = configuredSecretRedactor.assertSafeOutbound(text)
+    if (!outbound.allowed || outbound.safeText !== text) throw new Error("催促进度回复未通过发送前安全校验")
+    const pending = replyService.createPending({
+      threadId: thread.id,
+      inputRevision: thread.revision,
+      groupId: group.id,
+      accountId: group.accountId,
+      projectId: service.projectId,
+      serviceId: service.id,
+      telegramMessageId: event.telegramMessageId,
+      senderUserId: event.senderUserId,
+      senderUsername: event.senderUsername,
+      senderDisplayName: event.senderDisplayName,
+      senderRole: event.senderRole,
+      service: service.key,
+      serviceSource: "group_binding",
+      question: event.safeText || event.attachmentSummary,
+    })
+    replyService.transition(pending.id, "generating")
+    const sending = replyService.claimSideMessageSending(pending.id, {
+      answer: text,
+      decisionReason: "运营仅询问当前排查进度，路由模型生成当班客服进度回复，原排查继续运行",
+      decisionConfidence: 1,
+    })
+    if (!sending) throw new Error("催促进度回复无法进入发送状态")
+    try {
+      const telegramMessageId = await telegramTransport.sendMessage(
+        group.accountId,
+        group.telegramChatId!,
+        text,
+        event.telegramMessageId,
+        undefined,
+        { groupId: group.id, threadId: thread.id, serviceId: service.id, replyId: pending.id, kind: "progress" },
+      )
+      replyService.transition(pending.id, "replied", { telegramReplyMessageId: telegramMessageId })
+      if (event.senderUserId) supportThreadStore.setSenderFocusAfterDeliveredReply(
+        thread.id, event.senderUserId, telegramMessageId,
+      )
+      return { replyId: pending.id }
+    } catch (error) {
+      replyService.transition(pending.id, "failed", {
+        errorCode: "support_status_update_failed",
+        decisionReason: "催促进度回复发送失败，原排查继续运行",
+        operatorDeliveryStatus: error instanceof TelegramDeliveryError && error.state === "uncertain"
+          ? "uncertain"
+          : "failed",
+      })
+      throw error
+    }
+  },
   correct: (input) => supportCorrectionService.handle(input).then(() => undefined),
   learningSourceObserver,
 })

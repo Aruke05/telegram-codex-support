@@ -39,14 +39,6 @@ function formalCopies(profile: OperatorStyleProfile): Array<[RegExp, string]> {
 
 const mechanicalOpeningPattern = /^\s*(?:(?:这个|这种情况|这段时间|这笔订单|这笔|当前|目前|该功能|该订单)\s*)?(?:能查到|可以查到|已查到|查到了|已经查到|能查|可以查|能确认|可以确认|确认到了|是的|对|没错|确实|可以|能)[ \t]*(?:[，,。！？!；;：:]+[ \t]*|\r?\n+[ \t]*|[ \t]+|(?=\S)|$)/u
 
-const technicalQuestionPattern = /(?:技术原因|技术细节|从技术上|错误码.{0,6}(?:含义|意思)|为什么.{0,12}(?:返回|报).{0,6}\d{3}|(?:发送|提交|下单|回调|请求).{0,12}(?:地址|URL|IP)|(?:来源|出口)\s*IP|(?:地址|URL|IP).{0,12}(?:是什么|多少|发一下|发下|给下|查下))/iu
-const interfacePathQuestionPattern = /(?:正确|具体|实际|真正).{0,8}(?:接口|路径|地址)|(?:接口|路径|地址).{0,8}(?:是什么|多少|发一下|发下|给下|怎么填)/u
-const technicalQuoteFragments = [
-  /\b(?:HTTP\s*)?\d{3}(?:\s+(?:Not\s+Allowed|Bad\s+Gateway|Gateway\s+Timeout|Internal\s+Server\s+Error|Forbidden|Unauthorized|Not\s+Found))?\b/giu,
-  /\b(?:nginx|HTML|HTTP|error|exception)\b/giu,
-  /\bUnable\s+to\s+parse(?:\s+order\s+result)?\b/giu,
-]
-
 function jsonSpans(value: string): TextSpan[] {
   const spans: TextSpan[] = []
   for (let start = 0; start < value.length; start += 1) {
@@ -200,31 +192,12 @@ export function stripMechanicalOperatorOpening(value: string): string {
   return stripped || value.trim()
 }
 
-export function operatorAnswerStartsWithMechanicalAcknowledgement(value: string): boolean {
-  return mechanicalOpeningPattern.test(value)
-}
-
-function interfacePathFromAnswer(value: string): string | null {
-  const absoluteUrl = value.match(/https?:\/\/[^\s，。！？；,!?;]+/iu)?.[0]
-  if (absoluteUrl) {
-    try {
-      const pathname = new URL(absoluteUrl).pathname
-      if (pathname !== "/") return pathname
-    } catch { /* 继续尝试相对路径。 */ }
-  }
-  return value.match(/\/[A-Za-z0-9._~!$&'()*+,;=:@%/-]*[A-Za-z0-9_~%/-]/u)?.[0] ?? null
-}
-
 export function humanizeOperatorAnswer(
   value: string,
-  latestMessage: string,
+  _latestMessage: string,
   profile: unknown,
 ): string {
   const parsedProfile = operatorStyleProfileSchema.parse(profile)
-  if (interfacePathQuestionPattern.test(latestMessage)) {
-    const interfacePath = interfacePathFromAnswer(value)
-    if (interfacePath) return `正确的下单接口是 ${interfacePath}`
-  }
   const naturalValue = stripMechanicalOperatorOpening(value)
   const originalValues = structuredSpans(naturalValue).map((span) => span.value)
   const formatted = formatOperatorText(naturalValue, parsedProfile)
@@ -232,18 +205,4 @@ export function humanizeOperatorAnswer(
   return sameStructuredValues(originalValues, formattedValues)
     ? formatted
     : naturalValue
-}
-
-export function operatorQuestionWantsTechnicalDetail(value: string): boolean {
-  return technicalQuestionPattern.test(value)
-}
-
-export function operatorQuoteForReply(quote: string | null, latestMessage: string): string | null {
-  if (!quote || operatorQuestionWantsTechnicalDetail(latestMessage)) return quote
-  let businessContent = quote
-  technicalQuoteFragments.forEach((pattern) => {
-    businessContent = businessContent.replace(pattern, "")
-  })
-  businessContent = businessContent.replace(/[\s，。！？；：,.!?;:()（）<>\[\]{}'"`_-]+/gu, "")
-  return businessContent ? quote : null
 }

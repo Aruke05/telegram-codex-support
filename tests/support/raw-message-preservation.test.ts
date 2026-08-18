@@ -83,7 +83,67 @@ class SequencedRouter implements SupportThreadRouterPort {
   }
 }
 
+class SplitRouter implements SupportThreadRouterPort {
+  async route(input: Parameters<SupportThreadRouterPort["route"]>[0]): Promise<ThreadRouteResult> {
+    const eventId = input.messages[0]!.id
+    return {
+      action: "split",
+      questionFragment: "",
+      issues: [
+        { eventIds: [eventId], questionFragment: "查询订单当前状态和处理结果" },
+        { eventIds: [eventId], questionFragment: "确认首次第三方响应应由哪一方负责" },
+      ],
+      reason: "同一条消息包含两个需要分别排查和答复的事项",
+      confidence: 1,
+      clarificationReply: null,
+    }
+  }
+}
+
 describe("Telegram 原始消息保真", () => {
+  it("同一群的一条消息可由模型拆成多个独立问题并分条处理", async () => {
+    const database = await createDatabase()
+    const store = new SupportThreadStore(database, new ConfiguredSecretRedactor(database))
+    const coordinator = new SupportThreadCoordinator({
+      database,
+      store,
+      router: new SplitRouter(),
+      batchWindowMs: 30_000,
+      wake: () => undefined,
+    })
+    const event = coordinator.accept({
+      groupId: "00000000-0000-4000-8000-000000000303",
+      messageId: "multi-1",
+      senderId: "30001",
+      senderUsername: null,
+      senderDisplayName: "运营",
+      fromBot: false,
+      replyToMessageId: null,
+      messageThreadId: null,
+      replyTargetIsBot: false,
+      text: "这笔最后成功了吗，首次返回错误到底是哪边原因？",
+      attachments: [],
+      createdAt: "2026-08-11T00:00:00.000Z",
+    })!
+
+    await coordinator.drain()
+
+    const links = database.prepare(`SELECT thread_id,question_fragment FROM support_thread_messages
+      WHERE message_event_id=? ORDER BY question_fragment`).all(event.id) as Array<{
+        thread_id: string
+        question_fragment: string
+      }>
+    expect(links.map((link) => link.question_fragment)).toEqual([
+      "查询订单当前状态和处理结果",
+      "确认首次第三方响应应由哪一方负责",
+    ])
+    expect(new Set(links.map((link) => link.thread_id)).size).toBe(2)
+    expect(database.prepare(`SELECT relation,COUNT(*) AS count FROM support_thread_links GROUP BY relation`).get())
+      .toEqual({ relation: "split_from", count: 1 })
+    expect(database.prepare("SELECT COUNT(*) AS count FROM support_threads").get()).toEqual({ count: 2 })
+    expect(database.prepare("SELECT COUNT(*) AS count FROM support_message_events").get()).toEqual({ count: 1 })
+  })
+
   it("回复此前未建档的原消息时携带原文新建问题而不是并入最近线程", async () => {
     const database = await createDatabase()
     const router = new SequencedRouter()

@@ -75,6 +75,13 @@ export type SupportThreadCoordinatorDependencies = {
     clarification: SupportRouteClarification
     text: string
   }): Promise<{ replyId: string | null }>
+  sendStatusUpdate?(input: {
+    group: RuntimeGroup
+    service: ProjectServiceRecord
+    thread: SupportThread
+    event: SupportMessageEvent
+    text: string
+  }): Promise<{ replyId: string | null }>
   correct?(input: CorrectionInput): Promise<void>
   alert?(group: RuntimeGroup, reason: string, event: SupportMessageEvent): Promise<void>
   learningSourceObserver?: Pick<LearningSourceObserver, "observe">
@@ -85,7 +92,6 @@ export type SupportThreadCoordinatorDependencies = {
   }): Promise<string>
 }
 
-const anomalyPattern = /(?:延迟|失败|不到账|未到账|没到账|未回调|没回调|报错|异常|超时|错误|error|failed|failure|delay|timeout)/iu
 const presenceReplyDelayMs = 5_000
 const presenceCheckPattern = /^有人在吗[?？!！。~～]*$/u
 
@@ -546,6 +552,27 @@ export class SupportThreadCoordinator {
     }))
     if (replyTargets.size === 1) {
       const target = [...replyTargets.values()][0]!
+      const targetDetail = this.deps.store.getThreadDetail(target.id)
+      const effectDecision = await this.routeDecision(batch, routeEvents, {
+        summary: target.summary,
+        recentMessages: targetDetail.messages.slice(-6).map((message) => ({
+          sender: "operator" as const,
+          text: message.event.safeText || message.event.attachmentSummary,
+          createdAt: message.event.createdAt,
+        })),
+      }, null, null, "classify")
+      if (effectDecision?.action === "follow_up" && effectDecision.investigationEffect === "status_only") {
+        const appended = this.appendStatusOnlyBatchToThread(
+          target.id,
+          batch.events,
+          effectDecision.questionFragment || combined,
+          "explicit_reply",
+        )
+        if (appended) {
+          await this.sendStatusOnlyUpdate(batch, appended, effectDecision.progressReply, batch.events)
+          return
+        }
+      }
       const first = batch.events[0]!
       const firstAppend = this.deps.store.appendMessageWithSenderFocus({
         threadId: target.id,
@@ -746,11 +773,33 @@ export class SupportThreadCoordinator {
     const decision = await this.routeDecision(batch, routeEvents, focusContext, null, ambiguityContext, "classify")
     if (!decision) return
     const question = decision.questionFragment || combined
-    if (decision.action === "idle" && !anomalyPattern.test(combined)) {
+    if (decision.action === "split") {
+      try {
+        this.createSplitThreads(batch.group, batch.service, batch.events, decision, settleAt, batch.id)
+      } catch {
+        this.createThread(batch.group, batch.service, batch.events, combined, settleAt, batch.id)
+      }
+      this.deps.cancelStale?.()
+      this.deps.wake()
+      return
+    }
+    if (decision.action === "idle") {
       batch.events.forEach((event) => this.deps.store.updateEventRoute(event.id, "ignored", "明确闲聊或无需客服介入"))
       return
     }
     if (decision.action === "follow_up" && focus) {
+      if (decision.investigationEffect === "status_only") {
+        const appended = this.appendStatusOnlyBatchToThread(
+          focus.threadId,
+          batch.events,
+          question,
+          "operator_reply",
+        )
+        if (appended) {
+          await this.sendStatusOnlyUpdate(batch, appended, decision.progressReply, batch.events)
+          return
+        }
+      }
       const appended = this.appendBatchToThread(focus.threadId, batch.events, question, settleAt, "operator_reply")
       if (appended) {
         this.deps.cancelStale?.()
@@ -849,6 +898,71 @@ export class SupportThreadCoordinator {
     return this.deps.store.getThread(result.thread.id)
   }
 
+  private createSplitThreads(
+    group: RuntimeGroup,
+    service: ProjectServiceRecord,
+    events: SupportMessageEvent[],
+    decision: ThreadRouteResult,
+    settleAt: string,
+    originBatchId: string,
+  ): SupportThread[] {
+    const issues = decision.issues ?? []
+    if (decision.action !== "split" || issues.length < 2) throw new Error("拆分路由缺少问题单元")
+    const eventsById = new Map(events.map((event) => [event.id, event]))
+    const covered = new Set(issues.flatMap((issue) => issue.eventIds))
+    if (issues.some((issue) => issue.eventIds.some((eventId) => !eventsById.has(eventId)))
+      || events.some((event) => !covered.has(event.id))) {
+      throw new Error("拆分路由与当前接收批次不一致")
+    }
+    return this.deps.database.transaction(() => {
+      const created = issues.map((issue, issueIndex) => {
+        const issueEvents = [...new Set(issue.eventIds)]
+          .map((eventId) => eventsById.get(eventId)!)
+          .sort((left, right) => left.createdAt.localeCompare(right.createdAt)
+            || left.telegramMessageId.localeCompare(right.telegramMessageId))
+        const first = issueEvents[0]!
+        const result = this.deps.store.createThreadWithSenderFocus({
+          groupId: group.id,
+          projectId: service.projectId,
+          serviceId: service.id,
+          originBatchId: issueIndex === 0 ? originBatchId : randomUUID(),
+          settleAt,
+          anchorMessageId: first.telegramMessageId,
+          latestMessageAt: issueEvents.at(-1)!.createdAt,
+          summary: issue.questionFragment,
+          originEventId: first.id,
+          questionFragment: issue.questionFragment,
+        }, {
+          senderUserId: first.senderUserId,
+          source: "new_thread",
+          operatorMessageId: first.telegramMessageId,
+        })
+        for (const event of issueEvents.slice(1)) {
+          const appended = this.deps.store.appendMessageWithSenderFocus({
+            threadId: result.thread.id,
+            eventId: event.id,
+            relation: "supplement",
+            questionFragment: issue.questionFragment,
+            settleAt,
+          }, {
+            senderUserId: event.senderUserId,
+            source: "new_thread",
+            operatorMessageId: event.telegramMessageId,
+          })
+          if (!appended) throw new Error("拆分问题无法完整写入客服记录")
+        }
+        return this.deps.store.getThread(result.thread.id)
+      })
+      const root = created[0]!
+      created.slice(1).forEach((thread) => this.deps.store.linkSplitThread(
+        root.id,
+        thread.id,
+        decision.reason,
+      ))
+      return created
+    })
+  }
+
   private appendBatchToThread(
     threadId: string,
     events: SupportMessageEvent[],
@@ -874,6 +988,59 @@ export class SupportThreadCoordinator {
       current = appended
     }
     return current
+  }
+
+  private appendStatusOnlyBatchToThread(
+    threadId: string,
+    events: SupportMessageEvent[],
+    question: string,
+    source: "operator_reply" | "explicit_reply",
+  ): SupportThread | null {
+    let current = this.deps.store.getThread(threadId)
+    if (current.status !== "collecting" && current.status !== "generating") return null
+    for (const [index, event] of events.entries()) {
+      const appended = this.deps.store.appendStatusOnlyMessageWithSenderFocus({
+        threadId,
+        eventId: event.id,
+        relation: "supplement",
+        questionFragment: originalQuestionFragment(event, question),
+        settleAt: current.settleAt,
+        ...(index === 0 ? { expectedRevision: current.revision } : {}),
+      }, {
+        senderUserId: event.senderUserId,
+        source,
+        operatorMessageId: event.telegramMessageId,
+      })
+      if (!appended) return null
+      current = appended
+    }
+    return current
+  }
+
+  private async sendStatusOnlyUpdate(
+    batch: Omit<PendingBatch, "timer">,
+    thread: SupportThread,
+    text: string | null | undefined,
+    events: SupportMessageEvent[],
+  ): Promise<void> {
+    const latestEvent = events.at(-1)!
+    let reason = "仅询问当前排查进度，不改变排查输入"
+    try {
+      if (text && this.deps.sendStatusUpdate) {
+        await this.deps.sendStatusUpdate({
+          group: batch.group,
+          service: batch.service,
+          thread,
+          event: latestEvent,
+          text,
+        })
+        reason = "仅询问当前排查进度，已由当班客服回复且不改变排查输入"
+      }
+    } catch {
+      reason = "仅询问当前排查进度，进度回复发送失败但不改变排查输入"
+    } finally {
+      events.forEach((event) => this.deps.store.updateEventRoute(event.id, "routed", reason))
+    }
   }
 
   private async routeDecision(

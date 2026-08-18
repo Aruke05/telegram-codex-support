@@ -847,6 +847,94 @@ export class SupportThreadStore {
     })
   }
 
+  appendStatusOnlyMessage(input: AppendThreadMessageInput): SupportThread | null {
+    return this.database.transaction(() => {
+      const current = this.getThread(input.threadId)
+      const event = this.getEvent(input.eventId)
+      if ((current.status !== "collecting" && current.status !== "generating")
+        || (input.expectedRevision !== undefined && current.revision !== input.expectedRevision)) {
+        return null
+      }
+      const existingLink = this.database.prepare(
+        "SELECT 1 FROM support_thread_messages WHERE thread_id=? AND message_event_id=? LIMIT 1",
+      ).get(input.threadId, input.eventId)
+      if (existingLink) return current
+      const position = Number((this.database.prepare(
+        "SELECT COALESCE(MAX(position),-1)+1 AS position FROM support_thread_messages WHERE thread_id=?",
+      ).get(input.threadId) as SqlRow).position)
+      const inserted = this.insertThreadMessage(
+        input.threadId,
+        input.eventId,
+        input.relation,
+        input.questionFragment,
+        position,
+        event.createdAt,
+      )
+      if (!inserted) return current
+      const now = new Date().toISOString()
+      this.database.prepare(`UPDATE support_threads SET
+        latest_message_at=CASE WHEN latest_message_at<? THEN ? ELSE latest_message_at END,updated_at=?
+        WHERE id=? AND revision=? AND status IN ('collecting','generating')`).run(
+        event.createdAt,
+        event.createdAt,
+        now,
+        input.threadId,
+        current.revision,
+      )
+      this.database.prepare(`UPDATE support_replies SET
+        telegram_message_id=?,sender_user_id=?,sender_username=?,sender_display_name=?,sender_role=?,updated_at=?
+        WHERE thread_id=? AND input_revision=? AND status IN ('pending','queued','generating')`).run(
+        event.telegramMessageId,
+        event.senderUserId,
+        event.senderUsername,
+        event.senderDisplayName,
+        event.senderRole,
+        now,
+        input.threadId,
+        current.revision,
+      )
+      this.setEventRoute(input.eventId, "batched", "已归入当前排查，等待进度回复完成")
+      return this.getThread(input.threadId)
+    })
+  }
+
+  appendStatusOnlyMessageWithSenderFocus(
+    input: AppendThreadMessageInput,
+    focus: SenderFocusUpdate,
+  ): SupportThread | null {
+    return this.database.transaction(() => {
+      const appended = this.appendStatusOnlyMessage(input)
+      if (!appended) return null
+      const event = this.getEvent(input.eventId)
+      this.upsertSenderFocus(appended, focus, event.createdAt)
+      return appended
+    })
+  }
+
+  hasPendingRoutingEventForThread(threadId: string): boolean {
+    return Boolean(this.database.prepare(`SELECT 1 FROM support_threads thread
+      JOIN support_message_events event ON event.group_id=thread.group_id
+        AND event.route_status IN ('received','batched')
+        AND event.created_at>=COALESCE(thread.generation_started_at,thread.updated_at)
+      WHERE thread.id=? AND thread.status='generating' AND (
+        event.reply_to_message_id IN (
+          SELECT source.telegram_message_id FROM support_thread_messages message
+          JOIN support_message_events source ON source.id=message.message_event_id
+          WHERE message.thread_id=thread.id
+        )
+        OR event.reply_to_message_id IN (
+          SELECT ownership.telegram_message_id FROM telegram_output_ownership ownership
+          WHERE ownership.thread_id=thread.id AND ownership.telegram_message_id IS NOT NULL
+        )
+        OR EXISTS (
+          SELECT 1 FROM support_sender_focus focus
+          WHERE focus.group_id=thread.group_id AND focus.service_id=thread.service_id
+            AND focus.sender_user_id=event.sender_user_id AND focus.thread_id=thread.id
+            AND focus.expires_at>event.created_at
+        )
+      ) LIMIT 1`).get(threadId))
+  }
+
   appendMessageWithSenderFocus(
     input: AppendThreadMessageInput,
     focus: SenderFocusUpdate,
@@ -1607,6 +1695,31 @@ export class SupportThreadStore {
     })
     result?.replyUpdates.forEach((event) => this.onExpiredReply?.(event))
     return result !== null
+  }
+
+  linkSplitThread(
+    sourceThreadId: string,
+    targetThreadId: string,
+    reason: string,
+    now = new Date().toISOString(),
+  ): boolean {
+    if (sourceThreadId === targetThreadId) return false
+    const source = this.getThread(sourceThreadId)
+    const target = this.getThread(targetThreadId)
+    if (source.groupId !== target.groupId
+      || source.projectId !== target.projectId
+      || source.serviceId !== target.serviceId) {
+      throw new Error("拆分问题必须属于同一群和服务")
+    }
+    const result = this.database.prepare(`INSERT OR IGNORE INTO support_thread_links(
+      source_thread_id,target_thread_id,relation,reason,created_at
+    ) VALUES (?,?,'split_from',?,?)`).run(
+      targetThreadId,
+      sourceThreadId,
+      reason.slice(0, 1000),
+      now,
+    )
+    return Number(result.changes) === 1
   }
 
   takeOverByHuman<T>(
