@@ -184,6 +184,75 @@ describe("白名单群批量更新 API", () => {
     })
   })
 
+  it("未填写群 ID 的草稿群可以通过单群编辑保存其他配置", async () => {
+    const { app, database, supportA } = await createHarness()
+    database.prepare("UPDATE telegram_groups SET telegram_chat_id=NULL WHERE id=?").run(supportA.id)
+
+    const response = await app.inject({
+      method: "PATCH",
+      url: `/api/telegram/groups/${supportA.id}`,
+      payload: { telegramChatId: null, enabled: false, replyStyle: "human" },
+    })
+
+    expect(response.statusCode).toBe(200)
+    expect(response.json()).toMatchObject({
+      id: supportA.id,
+      telegramChatId: null,
+      enabled: false,
+      replyStyle: "human",
+    })
+    expect(database.prepare("SELECT telegram_chat_id,enabled,reply_style FROM telegram_groups WHERE id=?").get(supportA.id))
+      .toEqual({ telegram_chat_id: null, enabled: 0, reply_style: "human" })
+  })
+
+  it("停用群可以清空群 ID 且启用群不能清空", async () => {
+    const { app, database, supportA } = await createHarness()
+
+    const clearDisabled = await app.inject({
+      method: "PATCH",
+      url: `/api/telegram/groups/${supportA.id}`,
+      payload: { telegramChatId: null, enabled: false },
+    })
+    expect(clearDisabled.statusCode).toBe(200)
+    expect(database.prepare("SELECT telegram_chat_id,enabled FROM telegram_groups WHERE id=?").get(supportA.id))
+      .toEqual({ telegram_chat_id: null, enabled: 0 })
+
+    database.prepare("UPDATE telegram_groups SET telegram_chat_id='-100000000001',enabled=1 WHERE id=?").run(supportA.id)
+    const clearEnabled = await app.inject({
+      method: "PATCH",
+      url: `/api/telegram/groups/${supportA.id}`,
+      payload: { telegramChatId: null },
+    })
+    expect(clearEnabled.statusCode).toBe(400)
+    expect(database.prepare("SELECT telegram_chat_id,enabled FROM telegram_groups WHERE id=?").get(supportA.id))
+      .toEqual({ telegram_chat_id: "-100000000001", enabled: 1 })
+  })
+
+  it("新增停用群仍拒绝空群 ID", async () => {
+    const { app, bot } = await createHarness()
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/telegram/groups",
+      payload: {
+        key: "new-draft", name: "新增草稿", telegramChatId: null, accountId: bot.id,
+        projectId, serviceId, enabled: false, accessMode: "bot", triggerMode: "all", platform: "service",
+        repositories: [], branch: null, serverAlias: null, databaseAlias: "database", knowledgeScope: "default",
+        purpose: "support", aiModelInstanceId: null, replyStyle: "unrestricted",
+      },
+    })
+    expect(response.statusCode).toBe(400)
+  })
+
+  it("停用客服账号时仍会联动停用已启用群", async () => {
+    const { admin, bot, database, supportA } = await createHarness()
+    await admin.updateGroup(supportA.id, { enabled: true })
+
+    await admin.updateAccount(bot.id, { enabled: false })
+
+    expect(database.prepare("SELECT enabled FROM telegram_groups WHERE id=?").get(supportA.id))
+      .toEqual({ enabled: 0 })
+  })
+
   it("批量启用未填写群 ID 的草稿群时返回明确中文原因", async () => {
     const { app, database, supportA } = await createHarness()
     database.prepare("UPDATE telegram_groups SET telegram_chat_id=NULL WHERE id=?").run(supportA.id)

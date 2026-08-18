@@ -90,7 +90,7 @@ const persistedGroupInputSchema = z.object({
 const updateGroupSchema = z.object({
   key: groupInputFields.key.optional(),
   name: groupInputFields.name.optional(),
-  telegramChatId: groupInputFields.telegramChatId.optional(),
+  telegramChatId: groupInputFields.telegramChatId.nullable().optional(),
   accountId: groupInputFields.accountId.optional(),
   projectId: z.string().uuid().nullable().optional(),
   serviceId: z.string().uuid().nullable().optional(),
@@ -409,7 +409,7 @@ export class RuntimeAdminService {
     const merged = persistedGroupInputSchema.parse({
       key: parsed.key ?? found.key,
       name: parsed.name ?? found.name,
-      telegramChatId: parsed.telegramChatId ?? found.telegramChatId,
+      telegramChatId: parsed.telegramChatId === undefined ? found.telegramChatId : parsed.telegramChatId,
       accountId: parsed.accountId === undefined ? found.accountId : parsed.accountId,
       projectId: parsed.projectId === undefined ? found.projectId : parsed.projectId,
       serviceId: parsed.serviceId === undefined ? found.serviceId : parsed.serviceId,

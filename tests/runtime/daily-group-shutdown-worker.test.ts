@@ -67,6 +67,23 @@ describe("每日自动关闭全部群 worker", () => {
     })
   })
 
+  it("存在未配置完整的停用草稿群时仍正常关闭其他群", () => {
+    enableSchedule()
+    const timestamp = "2026-08-15T00:00:00.000Z"
+    database.prepare(`INSERT INTO telegram_groups(
+      id,group_key,name,telegram_chat_id,account_id,project_id,service_id,enabled,access_mode,trigger_mode,
+      platform,repositories,branch,server_alias,database_alias,knowledge_scope,purpose,ai_model_instance_id,
+      reply_style,created_at,updated_at
+    ) VALUES (?,?,?,NULL,NULL,NULL,NULL,0,'bot','all','draft','[]',NULL,NULL,'none','default','support',NULL,
+      'unrestricted',?,?)`).run(
+      "00000000-0000-4000-8000-000000000004", "draft", "draft", timestamp, timestamp,
+    )
+
+    expect(worker.runDue(new Date("2026-08-15T15:00:10.000Z"))).toEqual({ executed: true, disabledCount: 3 })
+    expect(database.prepare("SELECT telegram_chat_id,account_id,enabled FROM telegram_groups WHERE group_key='draft'").get())
+      .toEqual({ telegram_chat_id: null, account_id: null, enabled: 0 })
+  })
+
   it("到点前不执行且同一上海日期只执行一次", () => {
     enableSchedule()
 

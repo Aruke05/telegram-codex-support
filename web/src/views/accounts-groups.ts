@@ -4,6 +4,7 @@ import { element, replaceChildren } from "../dom.js"
 import { icon } from "../icons.js"
 import { roleLearningSourceLabel } from "../learning-source-labels.js"
 import { accountOptions, allGroupsSelected, buildBatchGroupPatch, groupBatchActionBlocked, partitionGroupsForEnable, performGroupQuickToggle, selectedGroups, sharedAccessMode } from "../group-batch.js"
+import { optionalTelegramChatId, validateGroupForm } from "../group-form.js"
 import type { ModelInstance, ProjectView, TelegramAccount, TelegramGroup, TelegramLoginState, TelegramRole } from "../types.js"
 
 type ConnectionsData = {
@@ -212,6 +213,7 @@ function userLoginDialog(account: TelegramAccount, onCompleted: () => Promise<vo
 
 function groupForm(existing: TelegramGroup | undefined, accounts: TelegramAccount[], projects: ProjectView[], models: ModelInstance[], onSaved: () => Promise<void>, notify: Notify): void {
   const form = element("form", "dialog-form")
+  form.noValidate = true
   const key = textInput("key", "唯一英文标识")
   key.value = existing?.key ?? ""
   key.required = true
@@ -220,12 +222,10 @@ function groupForm(existing: TelegramGroup | undefined, accounts: TelegramAccoun
   name.required = true
   const chatId = textInput("telegramChatId", "例如 -1001234567890")
   chatId.value = existing?.telegramChatId ?? ""
-  chatId.required = true
   const project = selectInput("projectId", [{ value: "", label: "暂不绑定项目" }, ...projects.map((item) => ({ value: item.id, label: item.name }))])
   project.value = existing?.projectId ?? projects[0]?.id ?? ""
   const service = selectInput("serviceId", [])
-  const refreshServices = () => {
-    const selected = existing?.serviceId ?? service.value
+  const refreshServices = (selected = service.value) => {
     service.replaceChildren()
     const selectedProject = projects.find((item) => item.id === project.value)
     if (!selectedProject) {
@@ -236,13 +236,12 @@ function groupForm(existing: TelegramGroup | undefined, accounts: TelegramAccoun
     })
     service.value = selectedProject.services.some((item) => item.id === selected) ? selected : selectedProject.services[0]?.id ?? ""
   }
-  project.addEventListener("change", refreshServices)
-  refreshServices()
+  project.addEventListener("change", () => refreshServices())
+  refreshServices(existing?.serviceId ?? "")
   const accessMode = selectInput("accessMode", [{ value: "bot", label: "Bot" }, { value: "user", label: "个人账号" }])
   accessMode.value = existing?.accessMode ?? "bot"
   const account = selectInput("accountId", [{ value: "", label: "暂不绑定" }])
-  const refreshAccounts = () => {
-    const selected = existing?.accountId ?? account.value
+  const refreshAccounts = (selected = account.value) => {
     account.replaceChildren()
     const empty = element("option", "", "暂不绑定")
     empty.value = ""
@@ -254,8 +253,8 @@ function groupForm(existing: TelegramGroup | undefined, accounts: TelegramAccoun
     })
     account.value = selected
   }
-  accessMode.addEventListener("change", refreshAccounts)
-  refreshAccounts()
+  accessMode.addEventListener("change", () => refreshAccounts())
+  refreshAccounts(existing?.accountId ?? "")
   const triggerMode = selectInput("triggerMode", [{ value: "all", label: "每条文字都判断" }, { value: "command", label: "不处理群消息" }])
   triggerMode.value = existing?.triggerMode ?? "all"
   const purpose = selectInput("purpose", [{ value: "support", label: "客服群" }, { value: "technical_alert", label: "技术告警群" }])
@@ -279,6 +278,7 @@ function groupForm(existing: TelegramGroup | undefined, accounts: TelegramAccoun
     triggerMode.value = technicalAlert ? "command" : "all"
     project.disabled = service.disabled = technicalAlert
     project.required = service.required = !technicalAlert
+    chatId.required = !existing || enabled.checked
     projectSection.hidden = technicalAlert
     modelSection.hidden = !technicalAlert
     aiModel.required = false
@@ -309,13 +309,32 @@ function groupForm(existing: TelegramGroup | undefined, accounts: TelegramAccoun
     event.preventDefault()
     error.textContent = ""
     const technicalAlert = purpose.value === "technical_alert"
+    const issue = validateGroupForm({
+      key: key.value,
+      name: name.value,
+      telegramChatId: chatId.value,
+      accountId: account.value,
+      projectId: technicalAlert ? "" : project.value,
+      serviceId: technicalAlert ? "" : service.value,
+      enabled: enabled.checked,
+      existing: Boolean(existing),
+      purpose: purpose.value as TelegramGroup["purpose"],
+    })
+    ;[key, name, chatId, account, project, service].forEach((control) => control.removeAttribute("aria-invalid"))
+    if (issue) {
+      error.textContent = issue.message
+      const control = { key, name, telegramChatId: chatId, accountId: account, projectId: project, serviceId: service }[issue.field]
+      control?.setAttribute("aria-invalid", "true")
+      control?.focus()
+      return
+    }
     const selectedProject = technicalAlert ? undefined : projects.find((item) => item.id === project.value)
     const selectedService = selectedProject?.services.find((item) => item.id === service.value)
     const repositories: Array<"java-project" | "sfzf-web"> = []
     const serverResource = selectedProject?.servers.find((item) => item.serviceId === selectedService?.id)
     const databaseResource = selectedProject?.databases.find((item) => item.serviceId === selectedService?.id)
     const payload = {
-      key: key.value.trim(), name: name.value.trim(), telegramChatId: chatId.value.trim(),
+      key: key.value.trim(), name: name.value.trim(), telegramChatId: optionalTelegramChatId(chatId.value),
       accountId: account.value || null, enabled: enabled.checked, accessMode: accessMode.value,
       projectId: selectedProject?.id ?? null, serviceId: selectedService?.id ?? null,
       triggerMode: triggerMode.value, platform: selectedService?.key ?? "internal", repositories,

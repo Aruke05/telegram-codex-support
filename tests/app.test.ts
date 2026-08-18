@@ -12,6 +12,7 @@ import type { GroupCatalogResponse, HealthStatus, MagicBookStatus, TelegramRole 
 import { filterGroups } from "../web/src/group-filter.js"
 import { normalizeThemePreference } from "../web/src/theme.js"
 import { filterOptions } from "../web/src/option-filter.js"
+import { optionalTelegramChatId, validateGroupForm } from "../web/src/group-form.js"
 import { sensitiveCategoryLabel } from "../web/src/security-labels.js"
 import { learningObservationFacts, roleLearningSourceLabel } from "../web/src/learning-source-labels.js"
 import {
@@ -382,5 +383,53 @@ describe("白名单群批量配置状态", () => {
       .toEqual({ ok: false, error: "所选群接入方式不一致 请先统一接入方式" })
     expect(buildBatchGroupPatch({ groups: [botGroup, otherBotGroup], accessMode: "", accountId: botA.id, replyStyle: "" }, [botA, user]))
       .toEqual({ ok: true, patch: { accountId: botA.id } })
+  })
+})
+
+describe("白名单群编辑表单", () => {
+  const draft = {
+    key: "dapay",
+    name: "DApay 越南技术支持群",
+    telegramChatId: "",
+    accountId: "",
+    projectId: "00000000-0000-4000-8000-000000000101",
+    serviceId: "00000000-0000-4000-8000-000000000102",
+    enabled: false,
+    existing: true,
+    purpose: "support" as const,
+  }
+
+  it("未启用的草稿群允许在没有群 ID 和账号时保存其他设置", () => {
+    expect(validateGroupForm(draft)).toBeNull()
+    expect(optionalTelegramChatId("   ")).toBeNull()
+  })
+
+  it("新增群仍必须填写群 ID 不扩大草稿规则", () => {
+    expect(validateGroupForm({ ...draft, existing: false })).toEqual({
+      field: "telegramChatId",
+      message: "添加群前请先填写群 ID",
+    })
+  })
+
+  it("启用草稿群时明确指出缺少群 ID 而不是静默不提交", () => {
+    expect(validateGroupForm({ ...draft, enabled: true })).toEqual({
+      field: "telegramChatId",
+      message: "启用群前请先填写群 ID",
+    })
+  })
+
+  it("填写群 ID 后继续指出启用所缺的客服账号", () => {
+    expect(validateGroupForm({ ...draft, enabled: true, telegramChatId: " -1001234567890 " })).toEqual({
+      field: "accountId",
+      message: "启用群前请先绑定客服账号",
+    })
+    expect(optionalTelegramChatId(" -1001234567890 ")).toBe("-1001234567890")
+  })
+
+  it("群 ID 格式错误时给出可见提示", () => {
+    expect(validateGroupForm({ ...draft, telegramChatId: "group-100" })).toEqual({
+      field: "telegramChatId",
+      message: "群 ID 只能填写数字，可在开头带负号",
+    })
   })
 })
