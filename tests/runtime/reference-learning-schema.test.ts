@@ -359,7 +359,7 @@ describe("参考学习 v23 schema", () => {
   it("新库为每个 run/observation 保存唯一且不可改写的严格终态结果", async () => {
     const database = await RuntimeDatabase.open(await temporaryDatabase("fresh-terminal-results.sqlite"))
     try {
-      expect(database.schemaVersion()).toBe(29)
+      expect(database.schemaVersion()).toBe(31)
       const observationId = seedObservation(database)
       const runId = "00000000-0000-4000-8000-000000000201"
       const resultId = "00000000-0000-4000-8000-000000000202"
@@ -451,7 +451,7 @@ describe("参考学习 v23 schema", () => {
 
     const migrated = await open(filePath)
     try {
-      expect(migrated.schemaVersion()).toBe(29)
+      expect(migrated.schemaVersion()).toBe(31)
       expect(migrated.prepare(`SELECT message_event_id,source_telegram_user_id,source_role,thread_id,service_id,
         association_reason,association_confidence,takeover_status,classification,risk,created_at
         FROM learning_source_observations WHERE id=?`).get("00000000-0000-4000-8000-000000000106")).toEqual({
@@ -706,7 +706,7 @@ describe("参考学习 v23 schema", () => {
   it("新库只新增风格版本与证据能力并限制最多一个 active", async () => {
     const database = await RuntimeDatabase.open(await temporaryDatabase("fresh.sqlite"))
     try {
-      expect(database.schemaVersion()).toBe(29)
+      expect(database.schemaVersion()).toBe(31)
       const tables = database.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all() as Array<{ name: string }>
       expect(tables.map((row) => row.name)).toEqual(expect.arrayContaining([
         "operator_style_versions",
@@ -753,7 +753,7 @@ describe("参考学习 v23 schema", () => {
 
     const database = await RuntimeDatabase.open(filePath)
     try {
-      expect(database.schemaVersion()).toBe(29)
+      expect(database.schemaVersion()).toBe(31)
       expect(database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='learning_source_observations'").get()).toBeTruthy()
       expect(database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='operator_style_versions'").get()).toBeTruthy()
       expect(database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='operator_style_version_evidence'").get()).toBeTruthy()
@@ -777,7 +777,7 @@ describe("参考学习 v23 schema", () => {
 
     const migrated = await RuntimeDatabase.open(filePath)
     try {
-      expect(migrated.schemaVersion()).toBe(29)
+      expect(migrated.schemaVersion()).toBe(31)
       const evidence = migrated.prepare(`SELECT id,operator_style_version_id,observation_id,
         source_telegram_user_id,thread_id FROM operator_style_version_evidence`).get() as Record<string, unknown>
       expect(evidence).toEqual(expect.objectContaining({
@@ -842,7 +842,7 @@ describe("参考学习 v23 schema", () => {
     const restored = await RuntimeDatabase.open(await temporaryDatabase(`restored-v${version}.sqlite`))
     try {
       await new BackupService(restored).import(portablePath)
-      expect(restored.schemaVersion()).toBe(29)
+      expect(restored.schemaVersion()).toBe(31)
       expect(restored.prepare("SELECT COUNT(*) AS count FROM operator_style_versions").get()).toEqual({ count: 0 })
     } finally {
       restored.close()
@@ -891,7 +891,7 @@ describe("参考学习 v23 schema", () => {
     const restored = await RuntimeDatabase.open(await temporaryDatabase(`restored-v${version}.sqlite`))
     try {
       await new BackupService(restored).import(portablePath)
-      expect(restored.schemaVersion()).toBe(29)
+      expect(restored.schemaVersion()).toBe(31)
       expect(restored.prepare(`SELECT id,processing_status,current_run_id FROM learning_source_observations
         WHERE id=?`).get(observationId)).toEqual({
         id: observationId,

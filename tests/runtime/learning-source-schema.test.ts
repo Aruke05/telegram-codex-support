@@ -330,7 +330,7 @@ describe("可信回复观察审计 schema", () => {
     const database = await RuntimeDatabase.open(await temporaryDatabase("fresh.sqlite"))
     try {
       const { eventId, serviceId } = seedObservationReferences(database)
-      expect(database.schemaVersion()).toBe(29)
+      expect(database.schemaVersion()).toBe(31)
       const columns = database.prepare("PRAGMA table_info(telegram_roles)").all() as Array<{ name: string; dflt_value: string | null }>
       const column = columns.find((row) => row.name === "learning_source_enabled")
       expect(column?.dflt_value).toBe("0")
@@ -384,7 +384,7 @@ describe("可信回复观察审计 schema", () => {
 
     const database = await RuntimeDatabase.open(filePath)
     try {
-      expect(database.schemaVersion()).toBe(29)
+      expect(database.schemaVersion()).toBe(31)
       expect(database.readRoles()).toEqual([expect.objectContaining({ telegramUserId: "10003", learningSourceEnabled: false })])
     } finally {
       database.close()
@@ -399,7 +399,7 @@ describe("可信回复观察审计 schema", () => {
 
     const database = await RuntimeDatabase.open(filePath)
     try {
-      expect(database.schemaVersion()).toBe(29)
+      expect(database.schemaVersion()).toBe(31)
       expect(database.prepare("PRAGMA table_info(telegram_roles)").all()).toEqual(expect.arrayContaining([
         expect.objectContaining({ name: "learning_source_enabled" }),
       ]))
@@ -423,7 +423,7 @@ describe("可信回复观察审计 schema", () => {
 
     const database = await RuntimeDatabase.open(filePath)
     try {
-      expect(database.schemaVersion()).toBe(29)
+      expect(database.schemaVersion()).toBe(31)
       expect(database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='learning_source_observations'").get()).toBeTruthy()
       expect(database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='support_reply_alert_deliveries'").get()).toBeTruthy()
       expectAdminChatCancellation(database)
@@ -464,7 +464,7 @@ describe("可信回复观察审计 schema", () => {
       await new BackupService(source).export(exportPath)
       const portable = RuntimeDatabase.openPortable(exportPath, true)
       try {
-        expect(portable.schemaVersion()).toBe(29)
+        expect(portable.schemaVersion()).toBe(31)
         expect(portable.readRoles()).toEqual([expect.objectContaining({ telegramUserId: "10004", learningSourceEnabled: true })])
         expect(portable.prepare("SELECT 1 FROM learning_source_observations WHERE message_event_id=?").get(eventId)).toBeTruthy()
         expect(portable.prepare("SELECT status FROM memory_maintenance_runs WHERE id=?").get(runId)).toEqual({ status: "failed" })
@@ -478,7 +478,7 @@ describe("可信回复观察审计 schema", () => {
       const restored = await RuntimeDatabase.open(await temporaryDatabase("restored.sqlite"))
       try {
         await new BackupService(restored).import(exportPath)
-        expect(restored.schemaVersion()).toBe(29)
+        expect(restored.schemaVersion()).toBe(31)
         expect(restored.readRoles()).toEqual([expect.objectContaining({ telegramUserId: "10004", learningSourceEnabled: true })])
         expect(restored.prepare("SELECT processing_status,lock_token,locked_at FROM learning_source_observations WHERE message_event_id=?").get(eventId)).toEqual({
           processing_status: "pending", lock_token: null, locked_at: null,
@@ -572,7 +572,7 @@ describe("可信回复观察审计 schema", () => {
     const restored = await RuntimeDatabase.open(await temporaryDatabase("remote-v13-portable-restored.sqlite"))
     try {
       await new BackupService(restored).import(exportPath)
-      expect(restored.schemaVersion()).toBe(29)
+      expect(restored.schemaVersion()).toBe(31)
       expect(restored.prepare("SELECT status FROM admin_chat_turns WHERE id=?").get(cancelledTurnId)).toEqual({ status: "cancelled" })
       expect(restored.prepare("PRAGMA foreign_key_check").all()).toEqual([])
     } finally {
@@ -608,7 +608,7 @@ describe("可信回复观察审计 schema", () => {
     const restored = await RuntimeDatabase.open(await temporaryDatabase("v14-restored.sqlite"))
     try {
       await new BackupService(restored).import(exportPath)
-      expect(restored.schemaVersion()).toBe(29)
+      expect(restored.schemaVersion()).toBe(31)
       expect(restored.prepare("PRAGMA foreign_key_check").all()).toEqual([])
       expect(restored.readReplies("WHERE r.id=?", [replyId])).toEqual([
         expect.objectContaining({ id: replyId, operatorDeliveryStatus: null }),

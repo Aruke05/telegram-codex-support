@@ -32,7 +32,7 @@ describe("统一问题路由 schema 谱系", () => {
     const database = await RuntimeDatabase.open(await databasePath("unified-routing-fresh-"))
     openDatabases.push(database)
 
-    expect(database.schemaVersion()).toBe(29)
+    expect(database.schemaVersion()).toBe(31)
     expect(tableNames(database)).toEqual([
       "support_route_clarifications",
       "support_sender_focus",
@@ -57,7 +57,7 @@ describe("统一问题路由 schema 谱系", () => {
 
     const migrated = await RuntimeDatabase.open(filePath)
     openDatabases.push(migrated)
-    expect(migrated.schemaVersion()).toBe(29)
+    expect(migrated.schemaVersion()).toBe(31)
     expect(tableNames(migrated)).toEqual([
       "support_route_clarifications",
       "support_sender_focus",
@@ -86,7 +86,7 @@ describe("统一问题路由 schema 谱系", () => {
 
     const migrated = await RuntimeDatabase.open(filePath)
     openDatabases.push(migrated)
-    expect(migrated.schemaVersion()).toBe(29)
+    expect(migrated.schemaVersion()).toBe(31)
     expect(tableNames(migrated)).toEqual([
       "support_route_clarifications",
       "support_sender_focus",

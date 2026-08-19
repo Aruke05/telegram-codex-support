@@ -37,7 +37,7 @@ function columnNames(database: RuntimeDatabase, table: string): string[] {
 }
 
 function expectCombinedCapabilities(database: RuntimeDatabase): void {
-  expect(database.schemaVersion()).toBe(29)
+  expect(database.schemaVersion()).toBe(31)
   expect(tableNames(database)).toEqual(expect.arrayContaining([
     "model_instances",
     "model_catalog_entries",

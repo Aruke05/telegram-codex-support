@@ -33,7 +33,7 @@ describe("每日自动关闭全部群 schema", () => {
 
     const migrated = await RuntimeDatabase.open(harness.databasePath)
     try {
-      expect(migrated.schemaVersion()).toBe(29)
+      expect(migrated.schemaVersion()).toBe(31)
       expect(migrated.prepare("SELECT * FROM daily_group_shutdown_schedule WHERE id=1").get()).toMatchObject({
         enabled: 0,
         local_time: "23:00",
