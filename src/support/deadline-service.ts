@@ -125,6 +125,10 @@ export class SupportDeadlineService {
   private async sendHumanPriorityClaim(claim: HumanPriorityClaim): Promise<void> {
     try {
       const thread = this.deps.store.getThread(claim.threadId)
+      if (thread.answerOperationMode === "learning") {
+        this.deps.store.completeHumanPriorityClaim(claim, null, "学习模式禁止 Telegram 输出")
+        return
+      }
       const detail = this.deps.store.getThreadDetail(thread.id)
       const group = this.deps.database.readGroups().find((item) => item.id === thread.groupId)
       const state = this.deps.database.prepare(`SELECT human_priority_state FROM support_threads
@@ -161,6 +165,10 @@ export class SupportDeadlineService {
   private async sendProgress(notification: SupportThreadNotification): Promise<void> {
     try {
       const thread = this.deps.store.getThread(notification.threadId)
+      if (thread.answerOperationMode === "learning") {
+        this.deps.store.failNotification(notification.id, "学习模式禁止 Telegram 输出")
+        return
+      }
       const detail = this.deps.store.getThreadDetail(thread.id)
       const group = this.deps.database.readGroups().find((item) => item.id === thread.groupId)
       if (thread.status !== "generating" || thread.revision !== notification.inputRevision || !group?.enabled || !group.telegramChatId) {
@@ -194,6 +202,10 @@ export class SupportDeadlineService {
   private async sendTimeout(notification: SupportThreadNotification): Promise<void> {
     try {
       const thread = this.deps.store.getThread(notification.threadId)
+      if (thread.answerOperationMode === "learning") {
+        this.deps.store.failNotification(notification.id, "学习模式禁止 Telegram 输出")
+        return
+      }
       const detail = this.deps.store.getThreadDetail(thread.id)
       const sourceGroup = this.deps.database.readGroups().find((item) => item.id === thread.groupId)
       const service = this.deps.database.readProjectServices("WHERE id=?", [thread.serviceId])[0]

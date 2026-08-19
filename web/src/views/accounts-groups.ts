@@ -269,6 +269,11 @@ function groupForm(existing: TelegramGroup | undefined, accounts: TelegramAccoun
     { value: "unrestricted", label: "AI 原始回复" },
   ])
   replyStyle.value = existing?.replyStyle ?? "unrestricted"
+  const operationMode = selectInput("operationMode", [
+    { value: "live", label: "正式回复" },
+    { value: "learning", label: "学习模式（只生成不发送）" },
+  ])
+  operationMode.value = existing?.operationMode ?? "live"
   const projectSection = group("form-section", element("h3", "form-section__title", "项目归属"), group("form-grid", formField("项目（必选）", project), formField("服务（必选）", service)), element("p", "form-section__note", "客服群固定使用这里绑定的服务。消息里的上游名称不会改变服务。"))
   const modelSection = group("form-section", element("h3", "form-section__title", "技术群用途"), element("p", "form-section__note", "只接收运营问题原消息转发 目前不处理 /ai 或其他消息"))
   const enabled = element("input")
@@ -282,6 +287,8 @@ function groupForm(existing: TelegramGroup | undefined, accounts: TelegramAccoun
     projectSection.hidden = technicalAlert
     modelSection.hidden = !technicalAlert
     aiModel.required = false
+    operationMode.disabled = technicalAlert
+    if (technicalAlert) operationMode.value = "live"
     if (!technicalAlert && !project.value) { project.value = projects[0]?.id ?? ""; refreshServices() }
   }
   purpose.addEventListener("change", syncPurpose)
@@ -296,7 +303,10 @@ function groupForm(existing: TelegramGroup | undefined, accounts: TelegramAccoun
     group("form-section", element("h3", "form-section__title", "接入与用途"), group("form-grid", formField("接入方式", accessMode), formField("客服账号", account), formField("触发方式", triggerMode), formField("群用途", purpose))),
     projectSection,
     modelSection,
-    group("form-section", element("h3", "form-section__title", "回复方式"), formField("回答风格", replyStyle, "AI 原始回复不会套用真人口吻、长度、标点或技术词限制；安全和只读边界始终保留。")),
+    group("form-section", element("h3", "form-section__title", "回复方式"), group("form-grid",
+      formField("回答风格", replyStyle, "AI 原始回复不会套用真人口吻、长度、标点或技术词限制；安全和只读边界始终保留。"),
+      formField("运行模式", operationMode, "学习模式会完整生成并与可信真人回复对比，但不会向群或技术群发送客服消息。切回正式回复只影响之后的新问题。"),
+    )),
     toggle,
     error,
   )
@@ -343,6 +353,7 @@ function groupForm(existing: TelegramGroup | undefined, accounts: TelegramAccoun
       knowledgeScope: selectedProject?.defaultKnowledgeScope ?? "technical-alert", purpose: purpose.value,
       aiModelInstanceId: technicalAlert ? aiModel.value || null : null,
       replyStyle: replyStyle.value,
+      operationMode: operationMode.value,
     }
     setButtonBusy(save, true)
     void (existing ? api.updateGroup(existing.id, payload) : api.createGroup(payload)).then(async () => {
@@ -449,7 +460,7 @@ function groupRow(
   selection.append(selectionInput)
   const main = element("div", "list-row__main")
   const title = element("div", "list-row__title-row")
-  title.append(element("h3", "list-row__title", group.name), badge(group.enabled ? "已启用" : "未启用", group.enabled ? "success" : "neutral"), badge(group.purpose === "technical_alert" ? "技术告警" : "客服群", group.purpose === "technical_alert" ? "warning" : "accent"))
+  title.append(element("h3", "list-row__title", group.name), badge(group.enabled ? "已启用" : "未启用", group.enabled ? "success" : "neutral"), badge(group.purpose === "technical_alert" ? "技术告警" : "客服群", group.purpose === "technical_alert" ? "warning" : "accent"), group.purpose === "support" ? badge(group.operationMode === "learning" ? "学习模式" : "正式回复", group.operationMode === "learning" ? "warning" : "success") : document.createTextNode(""))
   const account = accounts.find((item) => item.id === group.accountId)
   const route = group.purpose === "technical_alert" ? "只接收运营原消息转发" : "运行配置回答模型"
   main.append(title, element("p", "list-row__description", `${group.platform} · ${group.telegramChatId ?? "未填写群 ID"} · ${account?.name ?? "未绑定账号"}`), element("p", "list-row__meta", `${group.branch ?? "无代码分支"} · ${group.purpose === "technical_alert" ? "不处理群消息" : "每条文字都判断"} · ${route} · ${replyStyleLabel(group.replyStyle)}`))
@@ -502,6 +513,11 @@ function batchGroupDialog(
     { value: "human", label: "真人口吻" },
     { value: "unrestricted", label: "AI 原始回复" },
   ])
+  const operationMode = selectInput("operationMode", [
+    { value: "", label: "不修改运行模式" },
+    { value: "live", label: "正式回复" },
+    { value: "learning", label: "学习模式（只生成不发送）" },
+  ])
   const commonAccessMode = sharedAccessMode(groups)
   const refreshAccounts = () => {
     const resolvedMode = accessMode.value === "bot" || accessMode.value === "user"
@@ -535,7 +551,8 @@ function batchGroupDialog(
   }
   const error = formError()
   form.append(
-    group("form-grid", formField("接入方式", accessMode), formField("客服账号", account), formField("回复方式", replyStyle)),
+    group("form-grid", formField("接入方式", accessMode), formField("客服账号", account), formField("回复方式", replyStyle),
+      formField("运行模式", operationMode, "可批量开启学习模式；系统仍会拆分问题和完整排查，但不会向任何群发送客服输出。")),
     triggerSummary,
     error,
   )
@@ -559,6 +576,7 @@ function batchGroupDialog(
       accessMode: accessMode.value === "bot" || accessMode.value === "user" ? accessMode.value : "",
       accountId: account.value,
       replyStyle: replyStyle.value === "human" || replyStyle.value === "unrestricted" ? replyStyle.value : "",
+      operationMode: operationMode.value === "live" || operationMode.value === "learning" ? operationMode.value : "",
     }, accounts)
     if (!result.ok) {
       error.textContent = result.error

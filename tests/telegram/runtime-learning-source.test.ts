@@ -90,6 +90,7 @@ async function createHarness() {
     purpose: "support",
     aiModelInstanceId: null,
     replyStyle: "human",
+    operationMode: "live",
     createdAt: timestamp,
     updatedAt: timestamp,
   }
@@ -165,6 +166,7 @@ async function createBotHarness() {
     purpose: "support",
     aiModelInstanceId: null,
     replyStyle: "human",
+    operationMode: "live",
     createdAt: timestamp,
     updatedAt: timestamp,
   }

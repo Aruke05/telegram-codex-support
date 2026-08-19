@@ -11,6 +11,7 @@ export type AdminChatTurnEvent = {
   kind: "admin-chat-turn"
   id: string
   sessionId: string
+  ownerUserId: string | null
   status: AdminChatTurnStatus
   updatedAt: string
 }

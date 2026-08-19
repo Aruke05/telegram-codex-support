@@ -143,6 +143,7 @@ export function assertSafeOutbound(input: string): SafeOutboundResult {
 
 export class ConfiguredSecretRedactor {
   private secrets: string[] = []
+  private outboundSecrets: string[] = []
   private privateKeyBodies: string[] = []
 
   constructor(
@@ -155,6 +156,7 @@ export class ConfiguredSecretRedactor {
   refresh(): void {
     const servers = this.source.readServerResources()
     const databases = this.source.readDatabaseResources()
+    const additionalSecrets = this.additionalSecrets()
     this.privateKeyBodies = servers.map((server) => server.privateKey
       .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----|-----END [A-Z ]*PRIVATE KEY-----/gi, "")
       .replace(/\s+/g, ""))
@@ -162,7 +164,12 @@ export class ConfiguredSecretRedactor {
     this.secrets = [...new Set([
       ...servers.flatMap((server) => [server.host, server.username, server.privateKey, server.workdir ?? ""]),
       ...databases.flatMap((database) => [database.host, database.database, database.username, database.password]),
-      ...this.additionalSecrets(),
+      ...additionalSecrets,
+    ].filter((value) => value.length >= 4))].sort((left, right) => right.length - left.length)
+    this.outboundSecrets = [...new Set([
+      ...servers.map((server) => server.privateKey),
+      ...databases.flatMap((database) => [database.host, database.database, database.username, database.password]),
+      ...additionalSecrets,
     ].filter((value) => value.length >= 4))].sort((left, right) => right.length - left.length)
   }
 
@@ -170,7 +177,8 @@ export class ConfiguredSecretRedactor {
     this.refresh()
     let text = input
     let exactChanged = false
-    this.secrets.forEach((secret) => {
+    const exactSecrets = mode === "business-outbound" ? this.outboundSecrets : this.secrets
+    exactSecrets.forEach((secret) => {
       if (!text.includes(secret)) return
       text = text.split(secret).join(replacement)
       exactChanged = true

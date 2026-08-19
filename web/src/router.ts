@@ -1,6 +1,6 @@
 import type { RouteKey } from "./types.js"
 
-export const routeKeys = ["overview", "projects", "connections", "replies", "chat", "memories", "docs", "models", "runtime", "transfer", "settings"] as const
+export const routeKeys = ["overview", "projects", "connections", "replies", "chat", "memories", "docs", "models", "runtime", "transfer", "settings", "access"] as const
 
 export type NormalizedRoute = RouteKey | "groups" | "security"
 

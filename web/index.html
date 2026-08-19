@@ -10,7 +10,25 @@
   </head>
   <body>
     <a class="skip-link" href="#main-content">跳到主要内容</a>
-    <div class="app-shell" id="app">
+    <main class="login-screen" id="login-screen" hidden>
+      <form class="login-card" id="login-form" autocomplete="on">
+        <div class="login-card__brand" aria-hidden="true">M</div>
+        <p class="login-card__eyebrow">Mercury Claw</p>
+        <h1>登录 AI 客服控制台</h1>
+        <p class="login-card__description">请输入账号和密码继续。</p>
+        <label class="form-field">
+          <span class="form-field__label">账号</span>
+          <input class="input-control" id="login-username" name="username" autocomplete="username" maxlength="80" required />
+        </label>
+        <label class="form-field">
+          <span class="form-field__label">密码</span>
+          <input class="input-control" id="login-secret" name="secret" autocomplete="off" maxlength="1024" required />
+        </label>
+        <p class="form-error login-card__error" id="login-error" aria-live="polite"></p>
+        <button class="button button--primary login-card__submit" id="login-submit" type="submit">登录</button>
+      </form>
+    </main>
+    <div class="app-shell" id="app" hidden>
       <aside class="sidebar" id="sidebar" aria-label="主导航">
         <div class="brand">
           <span class="brand__mark" aria-hidden="true">M</span>
@@ -28,7 +46,7 @@
               <span>本机安全运行</span>
             </div>
           </div>
-          <span class="version-label">本地管理台 · v2.1.0</span>
+          <span class="version-label">管理台 · v2.2.2</span>
         </div>
       </aside>
       <button class="sidebar-scrim" id="sidebar-scrim" type="button" aria-label="关闭导航"></button>
@@ -55,6 +73,7 @@
               <span class="refresh-button__icon" aria-hidden="true"></span>
               <span>刷新</span>
             </button>
+            <button class="button button--secondary" id="logout-button" type="button">退出</button>
           </div>
         </header>
         <main class="main-content" id="main-content" tabindex="-1">

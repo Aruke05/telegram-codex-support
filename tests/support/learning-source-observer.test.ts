@@ -93,6 +93,23 @@ class NewThreadRouter implements SupportThreadRouterPort {
   }
 }
 
+class SplitRouter implements SupportThreadRouterPort {
+  async route(input: Parameters<SupportThreadRouterPort["route"]>[0]): Promise<ThreadRouteResult> {
+    const eventId = input.messages[0]!.id
+    return {
+      action: "split",
+      questionFragment: "",
+      issues: [
+        { eventIds: [eventId], questionFragment: "核对第一笔订单" },
+        { eventIds: [eventId], questionFragment: "核对第二笔订单" },
+      ],
+      reason: "一条消息包含两个独立问题",
+      confidence: 1,
+      clarificationReply: null,
+    }
+  }
+}
+
 function incoming(input: {
   groupId: string
   messageId: string
@@ -226,6 +243,27 @@ function seedApplicationOutput(
 }
 
 describe("可信人工回复观察", () => {
+  it("学习模式不把未配置角色的个人客服账号发言当作真人标准答案", async () => {
+    const harness = await createHarness()
+    harness.database.prepare("UPDATE telegram_groups SET operation_mode='learning' WHERE id=?")
+      .run(harness.group.id)
+    const threadId = await createQuestionThread(harness, "shadow-owner-91")
+
+    harness.coordinator.accept(incoming({
+      groupId: harness.group.id,
+      messageId: "shadow-owner-92",
+      senderId: "20009",
+      senderUsername: "current_support_account",
+      text: "未配置为学习来源的客服账号发言",
+      replyToMessageId: "shadow-owner-91",
+      accountOwnerOutgoing: true,
+    }))
+
+    expect(observations(harness.database)).toEqual([])
+    expect(harness.database.prepare("SELECT COUNT(*) AS count FROM shadow_human_answer_links").get()).toEqual({ count: 0 })
+    expect(harness.threadStore.getThread(threadId).status).toBe("collecting")
+  })
+
   it("个人客服账号手工发言无需配置角色也只作为人工接管，不创建客服问题", async () => {
     const harness = await createHarness()
     const threadId = await createQuestionThread(harness, "91")
@@ -338,6 +376,120 @@ describe("可信人工回复观察", () => {
     ])
     expect(event.routeStatus).toBe("role_skipped")
     expect(harness.threadStore.getThreadDetail(threadId).messages.map((message) => message.event.telegramMessageId)).toEqual(["301"])
+  })
+
+  it("学习模式将一条可信人工答复关联到同批拆分出的多个问题且不接管", async () => {
+    const harness = await createHarness()
+    harness.database.prepare("UPDATE telegram_groups SET operation_mode='learning' WHERE id=?")
+      .run(harness.group.id)
+    seedRole(harness.database, "20001", true)
+    const rootThreadId = await createQuestionThread(harness, "split-301")
+    const childThreadId = await createQuestionThread(harness, "split-302")
+    expect(harness.threadStore.linkSplitThread(rootThreadId, childThreadId, "同一批消息拆成两个问题")).toBe(true)
+
+    const event = harness.coordinator.accept(incoming({
+      groupId: harness.group.id,
+      messageId: "split-303",
+      senderId: "20001",
+      text: "两个问题都核对过了 第一笔是上游延迟 第二笔是银行映射没开",
+      replyToMessageId: "split-301",
+    }))!
+
+    expect(harness.threadStore.getThread(rootThreadId).status).toBe("collecting")
+    expect(harness.threadStore.getThread(childThreadId).status).toBe("collecting")
+    expect(observations(harness.database)).toEqual([
+      expect.objectContaining({
+        messageEventId: event.id,
+        threadId: rootThreadId,
+        processingStatus: "ignored",
+      }),
+    ])
+    expect(harness.database.prepare(`SELECT human_message_event_id,thread_id,input_revision
+      FROM shadow_human_answer_links ORDER BY thread_id`).all()).toEqual([
+      { human_message_event_id: event.id, thread_id: childThreadId, input_revision: 1 },
+      { human_message_event_id: event.id, thread_id: rootThreadId, input_revision: 1 },
+    ].sort((left, right) => left.thread_id.localeCompare(right.thread_id)))
+  })
+
+  it("学习模式下真人抢先回复也等待路由拆分后再原子关联全部问题", async () => {
+    const harness = await createHarness({ router: new SplitRouter(), batchWindowMs: 30_000 })
+    harness.database.prepare("UPDATE telegram_groups SET operation_mode='learning' WHERE id=?")
+      .run(harness.group.id)
+    seedRole(harness.database, "20001", true)
+    const question = harness.coordinator.accept(incoming({
+      groupId: harness.group.id,
+      messageId: "early-split-1",
+      senderId: "30001",
+      text: "第一笔一直处理中 第二笔银行编码为空",
+    }))!
+    const answer = harness.coordinator.accept(incoming({
+      groupId: harness.group.id,
+      messageId: "early-split-2",
+      senderId: "20001",
+      text: "第一笔是上游延迟 第二笔是银行映射没开",
+      replyToMessageId: "early-split-1",
+    }))!
+
+    expect(harness.database.prepare("SELECT COUNT(*) AS count FROM support_threads").get()).toEqual({ count: 0 })
+    expect(observations(harness.database)).toEqual([
+      expect.objectContaining({ messageEventId: answer.id, threadId: null, classification: "shadow_reference_reply" }),
+    ])
+    await harness.coordinator.drain()
+
+    expect(harness.database.prepare("SELECT COUNT(*) AS count FROM support_threads").get()).toEqual({ count: 2 })
+    expect(harness.database.prepare(`SELECT COUNT(*) AS count FROM shadow_human_answer_links
+      WHERE human_message_event_id=?`).get(answer.id)).toEqual({ count: 2 })
+    expect(harness.threadStore.getEventRelation(question.id)).not.toBeNull()
+
+    harness.observer.observe(answer)
+    harness.observer.reconcilePending()
+    expect(harness.database.prepare(`SELECT COUNT(*) AS count FROM shadow_human_answer_links
+      WHERE human_message_event_id=?`).get(answer.id)).toEqual({ count: 2 })
+  })
+
+  it("线程已固定为学习模式后切回正式仍能恢复未完成的真人多对多关联", async () => {
+    const harness = await createHarness()
+    harness.database.prepare("UPDATE telegram_groups SET operation_mode='learning' WHERE id=?")
+      .run(harness.group.id)
+    seedRole(harness.database, "20001", true)
+    const rootThreadId = await createQuestionThread(harness, "mode-switch-1")
+    const childThreadId = await createQuestionThread(harness, "mode-switch-2")
+    harness.threadStore.linkSplitThread(rootThreadId, childThreadId, "同批拆分")
+    const answer = harness.threadStore.recordEvent({
+      groupId: harness.group.id,
+      accountId: harness.group.accountId,
+      telegramMessageId: "mode-switch-answer",
+      replyToMessageId: "mode-switch-1",
+      messageThreadId: null,
+      senderUserId: "20001",
+      senderUsername: "role_20001",
+      senderDisplayName: "可信客服",
+      senderRole: "operator",
+      text: "第一笔上游延迟 第二笔映射没开",
+      attachmentSummary: "",
+      routeStatus: "role_skipped",
+      skipReason: "角色消息不进入问题线程",
+    }).event
+    harness.learningStore.record({
+      messageEventId: answer.id,
+      sourceTelegramUserId: "20001",
+      sourceRole: "operator",
+      threadId: null,
+      serviceId: harness.service.id,
+      associationReason: "none",
+      associationConfidence: 0,
+      takeoverStatus: "not_linked",
+      classification: "shadow_reference_reply",
+      risk: "low",
+      processingStatus: "ignored",
+    })
+    harness.database.prepare("UPDATE telegram_groups SET operation_mode='live' WHERE id=?").run(harness.group.id)
+
+    expect(harness.observer.reconcilePending()).toBe(1)
+    expect(harness.database.prepare(`SELECT thread_id FROM shadow_human_answer_links
+      WHERE human_message_event_id=? ORDER BY thread_id`).all(answer.id)).toEqual([
+      { thread_id: childThreadId }, { thread_id: rootThreadId },
+    ].sort((left, right) => left.thread_id.localeCompare(right.thread_id)))
   })
 
   it("按直接机器人答复和回复链的固定优先级关联同一线程", async () => {

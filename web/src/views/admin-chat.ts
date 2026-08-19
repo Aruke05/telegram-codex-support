@@ -840,7 +840,7 @@ export function renderAdminChat(container: HTMLElement, notify: Notify): void {
     }
     context.replaceChildren(
       element("strong", "admin-chat-context__title", session.title),
-      element("span", "admin-chat-context__meta", `${session.project.name} · ${session.service.name} · ${session.service.branch}`),
+      element("span", "admin-chat-context__meta", `${session.project.name} · ${session.service.name} · ${session.service.branch} · ${session.createdByUsername}`),
     )
     markSessionRead(session.id)
     renderSessionList()
@@ -879,7 +879,10 @@ export function renderAdminChat(container: HTMLElement, notify: Notify): void {
       button.setAttribute("aria-label", `${session.title} ${session.service.name}${stateLabel ? ` ${stateLabel}` : ""}`)
       const copy = element("span", "admin-chat-session__copy")
       const meta = element("span", "admin-chat-session__meta")
-      meta.append(element("span", "admin-chat-session__service", session.service.name), element("time", "admin-chat-session__time", formatDateTime(session.updatedAt)))
+      meta.append(
+        element("span", "admin-chat-session__service", `${session.service.name} · ${session.createdByUsername}`),
+        element("time", "admin-chat-session__time", formatDateTime(session.updatedAt)),
+      )
       copy.append(element("strong", "admin-chat-session__title", session.title), meta)
       const state = element("span", `admin-chat-session__state admin-chat-session__state--${unread ? "unread" : session.latestTurnStatus || "idle"}`)
       state.append(element("span", "admin-chat-session__state-dot"), document.createTextNode(stateLabel))
@@ -1164,7 +1167,7 @@ export function renderAdminChat(container: HTMLElement, notify: Notify): void {
         detail = { session: created.session, turns: [created.turn] }
         context.replaceChildren(
           element("strong", "admin-chat-context__title", created.session.title),
-          element("span", "admin-chat-context__meta", `${created.session.project.name} · ${created.session.service.name} · ${created.session.service.branch}`),
+          element("span", "admin-chat-context__meta", `${created.session.project.name} · ${created.session.service.name} · ${created.session.service.branch} · ${created.session.createdByUsername}`),
         )
       } else if (detail && activeSessionId === requestedSessionId) {
         detail = {
@@ -1206,7 +1209,7 @@ export function renderAdminChat(container: HTMLElement, notify: Notify): void {
   })
 
   startLiveUpdates()
-  void api.getProjects().then((response) => {
+  void api.getAdminChatServices().then((response) => {
     if (!isActive()) return
     projects = response.projects
     const options = serviceOptions(projects)

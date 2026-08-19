@@ -221,8 +221,18 @@ export function registerOperationsRoutes(
     })
     reply.raw.write(": connected\n\n")
     const unsubscribe = replyEvents.subscribe((event) => {
-      const eventName = "kind" in event && event.kind === "admin-chat-turn" ? "admin-chat-turn" : "reply-status"
-      if (!reply.raw.destroyed) reply.raw.write(`event: ${eventName}\ndata: ${JSON.stringify(event)}\n\n`)
+      const principal = request.auth
+      const adminChatEvent = "kind" in event && event.kind === "admin-chat-turn"
+      if (principal) {
+        if (adminChatEvent && !principal.menus.includes("chat")) return
+        if (!adminChatEvent && !principal.menus.includes("replies")) return
+        if (adminChatEvent && !principal.isSuperAdmin && event.ownerUserId !== principal.userId) return
+      }
+      const eventName = adminChatEvent ? "admin-chat-turn" : "reply-status"
+      const publicEvent = adminChatEvent
+        ? { kind: event.kind, id: event.id, sessionId: event.sessionId, status: event.status, updatedAt: event.updatedAt }
+        : event
+      if (!reply.raw.destroyed) reply.raw.write(`event: ${eventName}\ndata: ${JSON.stringify(publicEvent)}\n\n`)
     })
     const heartbeat = setInterval(() => {
       if (!reply.raw.destroyed) reply.raw.write(": heartbeat\n\n")

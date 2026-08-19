@@ -52,7 +52,7 @@ export type SupportThreadNotification = {
 export type SupportTimeoutClaim = {
   threadId: string
   inputRevision: number
-  notificationKinds: ["timeout_operator", "timeout_alert"]
+  notificationKinds: [] | ["timeout_operator", "timeout_alert"]
 }
 export type HumanPriorityClaim = {
   threadId: string
@@ -180,6 +180,7 @@ function threadFromRow(row: SqlRow): SupportThread {
     answerIncludeAiMemory: Number(row.answer_include_ai_memory) === 1,
     answerIncludeInterfaceDocs: Number(row.answer_include_interface_docs) === 1,
     answerIncludeMagicBook: Number(row.answer_include_magic_book) === 1,
+    answerOperationMode: row.answer_operation_mode,
     generationStartedAt: row.generation_started_at,
     progressDueAt: row.progress_due_at,
     hardDeadlineAt: row.hard_deadline_at,
@@ -465,6 +466,7 @@ export class SupportThreadStore {
       originBatchId: input.originBatchId,
       operatorStyleVersionId: null,
       operatorStyleProfile: baselineOperatorStyleProfile,
+      answerOperationMode: "live",
       generationStartedAt: null,
       progressDueAt: null,
       hardDeadlineAt: null,
@@ -507,14 +509,15 @@ export class SupportThreadStore {
         answerIncludeAiMemory: answerPolicy.includeAiMemory,
         answerIncludeInterfaceDocs: answerPolicy.includeInterfaceDocs,
         answerIncludeMagicBook: answerPolicy.includeMagicBook,
+        answerOperationMode: group.operationMode ?? "live",
       })
       this.database.prepare(`INSERT INTO support_threads(
         id,group_id,project_id,service_id,status,revision,settle_at,anchor_message_id,latest_message_at,summary,
         origin_batch_id,operator_style_version_id,operator_style_profile_json,
         answer_model_instance_id,answer_reply_style,answer_timeout_seconds,answer_max_concurrency,
-        answer_binding_enabled,answer_include_ai_memory,answer_include_interface_docs,answer_include_magic_book,
+        answer_binding_enabled,answer_include_ai_memory,answer_include_interface_docs,answer_include_magic_book,answer_operation_mode,
         created_at,updated_at
-      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
         pinnedThread.id,
         pinnedThread.groupId,
         pinnedThread.projectId,
@@ -536,6 +539,7 @@ export class SupportThreadStore {
         Number(pinnedThread.answerIncludeAiMemory),
         Number(pinnedThread.answerIncludeInterfaceDocs),
         Number(pinnedThread.answerIncludeMagicBook),
+        pinnedThread.answerOperationMode,
         pinnedThread.createdAt,
         pinnedThread.updatedAt,
       )
@@ -1205,7 +1209,8 @@ export class SupportThreadStore {
                 AND ownership.delivery_status IN ('sending','sent','unknown'))
           )`).run(now, now, now)
       const row = this.database.prepare(`SELECT id,revision FROM support_threads
-        WHERE status='collecting' AND human_priority_state='waiting' AND human_priority_due_at<=?
+        WHERE status='collecting' AND answer_operation_mode='live'
+          AND human_priority_state='waiting' AND human_priority_due_at<=?
         ORDER BY human_priority_due_at,id LIMIT 1`).get(now) as SqlRow | undefined
       if (!row) return null
       const result = this.database.prepare(`UPDATE support_threads SET
@@ -1542,7 +1547,8 @@ export class SupportThreadStore {
   claimDueProgress(now = new Date().toISOString()): SupportThreadNotification | null {
     return this.database.transaction(() => {
       const row = this.database.prepare(`SELECT t.* FROM support_threads t
-        WHERE t.status='generating' AND t.progress_due_at IS NOT NULL AND t.progress_due_at<=?
+        WHERE t.status='generating' AND t.answer_operation_mode='live'
+          AND t.progress_due_at IS NOT NULL AND t.progress_due_at<=?
           AND t.human_priority_progress_message_id IS NULL
           AND NOT EXISTS(SELECT 1 FROM support_thread_notifications n
             WHERE n.thread_id=t.id AND n.kind='progress' AND (
@@ -1582,13 +1588,15 @@ export class SupportThreadStore {
       const row = this.database.prepare(`SELECT notification.* FROM support_thread_notifications notification
         JOIN support_threads thread ON thread.id=notification.thread_id
         WHERE notification.id=? AND notification.status='pending'
-          AND thread.status='generating' AND thread.revision=notification.input_revision`).get(id) as SqlRow | undefined
+          AND thread.status='generating' AND thread.revision=notification.input_revision
+          AND thread.answer_operation_mode='live'`).get(id) as SqlRow | undefined
       if (!row) return null
       const result = this.database.prepare(`UPDATE support_thread_notifications SET status='sending',updated_at=?
         WHERE id=? AND status='pending' AND EXISTS (
           SELECT 1 FROM support_threads thread
           WHERE thread.id=support_thread_notifications.thread_id
             AND thread.status='generating' AND thread.revision=support_thread_notifications.input_revision
+            AND thread.answer_operation_mode='live'
         )`).run(now, id)
       return Number(result.changes) === 1
         ? notificationFromRow({ ...row, status: "sending", updated_at: now })
@@ -1605,17 +1613,22 @@ export class SupportThreadStore {
       const thread = threadFromRow(row)
       const closed = this.closeThreadRows(thread.id, "AI 客服", "排查超过1小时", now)
       if (!closed.changed) return null
-      const insert = this.database.prepare(`INSERT OR IGNORE INTO support_thread_notifications(
-        id,thread_id,input_revision,kind,status,due_at,telegram_message_id,error_message,created_at,updated_at
-      ) VALUES(?,?,?,?,?,?,?,?,?,?)`)
-      ;(["timeout_operator", "timeout_alert"] as const).forEach((kind) => insert.run(
-        randomUUID(), thread.id, thread.revision, kind, "pending", now, null, null, now, now,
-      ))
+      const notificationKinds: SupportTimeoutClaim["notificationKinds"] = thread.answerOperationMode === "learning"
+        ? []
+        : ["timeout_operator", "timeout_alert"]
+      if (notificationKinds.length > 0) {
+        const insert = this.database.prepare(`INSERT OR IGNORE INTO support_thread_notifications(
+          id,thread_id,input_revision,kind,status,due_at,telegram_message_id,error_message,created_at,updated_at
+        ) VALUES(?,?,?,?,?,?,?,?,?,?)`)
+        notificationKinds.forEach((kind) => insert.run(
+          randomUUID(), thread.id, thread.revision, kind, "pending", now, null, null, now, now,
+        ))
+      }
       return {
         claim: {
           threadId: thread.id,
           inputRevision: thread.revision,
-          notificationKinds: ["timeout_operator", "timeout_alert"] as ["timeout_operator", "timeout_alert"],
+          notificationKinds,
         },
         replyUpdates: closed.replyUpdates,
       }
@@ -1628,12 +1641,24 @@ export class SupportThreadStore {
     if (kinds.length === 0) return null
     return this.database.transaction(() => {
       const placeholders = kinds.map(() => "?").join(",")
-      const row = this.database.prepare(`SELECT * FROM support_thread_notifications
-        WHERE status='pending' AND due_at<=? AND kind IN (${placeholders})
-        ORDER BY due_at,id LIMIT 1`).get(now, ...kinds) as SqlRow | undefined
+      this.database.prepare(`UPDATE support_thread_notifications AS notification SET
+        status='failed',error_message='学习模式禁止 Telegram 输出',updated_at=?
+        WHERE notification.status IN ('pending','sending') AND notification.kind IN (${placeholders})
+          AND EXISTS (
+            SELECT 1 FROM support_threads thread
+            WHERE thread.id=notification.thread_id AND thread.answer_operation_mode='learning'
+          )`).run(now, ...kinds)
+      const row = this.database.prepare(`SELECT notification.* FROM support_thread_notifications notification
+        JOIN support_threads thread ON thread.id=notification.thread_id
+        WHERE notification.status='pending' AND notification.due_at<=?
+          AND notification.kind IN (${placeholders}) AND thread.answer_operation_mode='live'
+        ORDER BY notification.due_at,notification.id LIMIT 1`).get(now, ...kinds) as SqlRow | undefined
       if (!row) return null
       const result = this.database.prepare(`UPDATE support_thread_notifications SET status='sending',updated_at=?
-        WHERE id=? AND status='pending'`).run(now, String(row.id))
+        WHERE id=? AND status='pending' AND EXISTS (
+          SELECT 1 FROM support_threads thread
+          WHERE thread.id=support_thread_notifications.thread_id AND thread.answer_operation_mode='live'
+        )`).run(now, String(row.id))
       if (Number(result.changes) !== 1) return null
       return notificationFromRow({ ...row, status: "sending", updated_at: now })
     })
@@ -1944,6 +1969,9 @@ export class SupportThreadStore {
   }
 
   private applyHumanPriorityFromEvent(threadId: string, eventId: string, now: string): void {
+    const mode = this.database.prepare("SELECT answer_operation_mode FROM support_threads WHERE id=?")
+      .get(threadId) as { answer_operation_mode?: string } | undefined
+    if (mode?.answer_operation_mode === "learning") return
     const event = this.database.prepare(`SELECT group_id,created_at,human_priority_user_ids_json,human_priority_due_at
       FROM support_message_events WHERE id=?`).get(eventId) as SqlRow | undefined
     if (!event?.human_priority_due_at) return

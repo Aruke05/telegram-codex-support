@@ -30,6 +30,7 @@ import { ReadonlyAgentToolBroker } from "./diagnostics/readonly-agent-tool-broke
 import { RuntimeControlService } from "./runtime/control-service.js"
 import { DailyGroupShutdownWorker } from "./runtime/daily-group-shutdown-worker.js"
 import { LocalSecretVault } from "./runtime/secret-vault.js"
+import { AdminAuthService } from "./auth/service.js"
 import { ConfiguredSecretRedactor } from "./security/dlp.js"
 import { TelegramConnectionService } from "./telegram/connection-service.js"
 import { TelegramUserLoginService } from "./telegram/user-login-service.js"
@@ -55,6 +56,9 @@ import { OperatorStyleService } from "./learning/operator-style-service.js"
 import { ReferenceLearningWorker } from "./learning/reference-worker.js"
 import { MemoryLearningWorker } from "./learning/worker.js"
 import { MemoryAuthoringService } from "./learning/authoring.js"
+import { CodexShadowReportAgent } from "./learning/shadow-report-agent.js"
+import { ShadowReportStore } from "./learning/shadow-report-store.js"
+import { ShadowReportWorker } from "./learning/shadow-report-worker.js"
 import { AttachmentService } from "./telegram/attachment-service.js"
 import { TelegramDeliveryError, TelegramRuntime } from "./telegram/runtime.js"
 
@@ -67,6 +71,7 @@ const runtimeDatabase = await RuntimeDatabase.open(
   RuntimeAdminService.seedGroups(groupCatalog),
 )
 const runtimeAdminService = new RuntimeAdminService(runtimeDatabase, vault)
+const authService = new AdminAuthService(runtimeDatabase, vault)
 const dailyGroupShutdownWorker = new DailyGroupShutdownWorker(runtimeDatabase)
 const projectAdminService = new ProjectAdminService(runtimeDatabase)
 const resourceResolver = new ResourceResolver(runtimeDatabase)
@@ -94,6 +99,8 @@ runtimeKnowledgeService.indexStaticKnowledge([
 ])
 const directApiAdapter = new DirectApiAdapter(fetch, new ReadonlyAgentToolBroker((value) => configuredSecretRedactor.redact(value).text))
 const codexExecutor = new CodexExecutor(modelConfigService, undefined, directApiAdapter)
+const shadowReportStore = new ShadowReportStore(runtimeDatabase)
+const shadowReportWorker = new ShadowReportWorker(shadowReportStore, new CodexShadowReportAgent(codexExecutor))
 const memoryAuthoringService = new MemoryAuthoringService(codexExecutor, runtimeKnowledgeService)
 const projectCodeSyncService = new ProjectCodeSyncService(runtimeDatabase, resolve(env.dataDir, "runtime"))
 const memoryLearningWorker = new MemoryLearningWorker(
@@ -368,6 +375,9 @@ const app = buildApp({
   telegramUserLoginService: new TelegramUserLoginService(runtimeAdminService),
   supportThreadQueryService,
   attachmentService,
+  shadowReportStore,
+  shadowReportWorker,
+  authService,
   magicBookRepository: new MagicBookRepository(snapshot),
   knowledgeResolver: new KnowledgeResolver(snapshot),
   interfaceDocuments: {
@@ -390,6 +400,7 @@ app.addHook("onClose", async () => {
   await supportDeadlineService.stop()
   await adminChatWorker.stop()
   await referenceLearningWorker.stop()
+  await shadowReportWorker.stop()
   await codexExecutor.shutdown()
   await telegramRuntime.stop()
   runtimeDatabase.close()
@@ -507,3 +518,4 @@ telegramRuntime.start()
 hourlyCodeSyncWorker.start()
 supportDeadlineService.start()
 referenceLearningWorker.start()
+shadowReportWorker.start()

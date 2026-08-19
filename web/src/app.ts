@@ -5,7 +5,7 @@ import { formatDateTime } from "./format.js"
 import { icon, type IconName } from "./icons.js"
 import { watchRoutes } from "./router.js"
 import { AppStore, type OverviewState } from "./store.js"
-import type { RouteKey, ThemePreference } from "./types.js"
+import type { MenuKey, RouteKey, ThemePreference } from "./types.js"
 import { renderConnections } from "./views/accounts-groups.js"
 import { renderDocs } from "./views/docs.js"
 import { renderMemories } from "./views/memories.js"
@@ -17,8 +17,9 @@ import { renderAdminChat, stopAdminChatEvents } from "./views/admin-chat.js"
 import { renderSettings } from "./views/settings.js"
 import { renderTransfer } from "./views/transfer.js"
 import { renderRuntime } from "./views/runtime.js"
+import { renderAccessControl } from "./views/access-control.js"
 
-type NavigationItem = { route: RouteKey; label: string; title?: string; section: string; icon: IconName }
+type NavigationItem = { route: MenuKey; label: string; title?: string; section: string; icon: IconName }
 
 const items: NavigationItem[] = [
   { route: "overview", label: "运行概览", section: "控制台", icon: "dashboard" },
@@ -32,6 +33,7 @@ const items: NavigationItem[] = [
   { route: "runtime", label: "运行配置", section: "运行", icon: "cpu" },
   { route: "transfer", label: "导入导出", section: "数据", icon: "transfer" },
   { route: "settings", label: "系统设置", section: "数据", icon: "settings" },
+  { route: "access", label: "账号与角色", section: "数据", icon: "shield" },
 ]
 
 function required<T extends Element>(selector: string): T {
@@ -41,6 +43,13 @@ function required<T extends Element>(selector: string): T {
 }
 
 const shell = required<HTMLElement>("#app")
+const loginScreen = required<HTMLElement>("#login-screen")
+const loginForm = required<HTMLFormElement>("#login-form")
+const loginUsername = required<HTMLInputElement>("#login-username")
+const loginPassword = required<HTMLInputElement>("#login-secret")
+loginPassword.type = "password"
+const loginError = required<HTMLElement>("#login-error")
+const loginSubmit = required<HTMLButtonElement>("#login-submit")
 const navigation = required<HTMLElement>("#navigation")
 const main = required<HTMLElement>("#main-content")
 const topbarTitle = required<HTMLElement>("#topbar-title")
@@ -50,6 +59,7 @@ const themeSelect = required<HTMLSelectElement>("#theme-select")
 const mobileMenu = required<HTMLButtonElement>("#mobile-menu")
 const sidebarScrim = required<HTMLButtonElement>("#sidebar-scrim")
 const toast = required<HTMLElement>("#toast")
+const logoutButton = required<HTMLButtonElement>("#logout-button")
 
 const store = new AppStore(api)
 let overview: OverviewState | undefined
@@ -58,6 +68,11 @@ let toastTimer: number | undefined
 let pageTitleBase = "AI 客服控制台"
 let adminChatTitleTimer = 0
 let adminChatTitleFlip = false
+let authenticated = false
+let notificationsStarted = false
+let notificationListenersInstalled = false
+let notificationEvents: EventSource | null = null
+let grantedMenus = new Set<MenuKey>()
 const adminChatUnreadStorageKey = "mercuryclaw.admin-chat.unread-sessions"
 
 function adminChatUnreadSessions(): Set<string> {
@@ -101,9 +116,10 @@ function refreshAdminChatNotifications(): void {
 }
 
 function startAdminChatNotifications(): void {
-  if (typeof EventSource === "undefined") return
-  const events = new EventSource("/api/replies/events")
-  events.addEventListener("admin-chat-turn", (event) => {
+  if (notificationsStarted || !grantedMenus.has("chat") || typeof EventSource === "undefined") return
+  notificationsStarted = true
+  notificationEvents = new EventSource("/api/replies/events")
+  notificationEvents.addEventListener("admin-chat-turn", (event) => {
     let update: { sessionId?: string; status?: string } | null = null
     try { update = JSON.parse((event as MessageEvent<string>).data) as { sessionId?: string; status?: string } } catch { return }
     if (!update?.sessionId || !["completed", "failed", "cancelled"].includes(update.status || "")) return
@@ -113,8 +129,11 @@ function startAdminChatNotifications(): void {
     document.dispatchEvent(new CustomEvent("admin-chat-turn-notification", { detail: update }))
     refreshAdminChatNotifications()
   })
-  document.addEventListener("admin-chat-unread-changed", refreshAdminChatNotifications)
-  document.addEventListener("visibilitychange", refreshAdminChatNotifications)
+  if (!notificationListenersInstalled) {
+    notificationListenersInstalled = true
+    document.addEventListener("admin-chat-unread-changed", refreshAdminChatNotifications)
+    document.addEventListener("visibilitychange", refreshAdminChatNotifications)
+  }
 }
 
 function showToast(message: string): void {
@@ -135,8 +154,9 @@ function closeSidebar(): void {
 }
 
 function buildNavigation(): void {
+  replaceChildren(navigation)
   let activeSection = ""
-  items.forEach((item) => {
+  items.filter((item) => grantedMenus.has(item.route)).forEach((item) => {
     if (item.section !== activeSection) {
       navigation.append(element("p", "navigation__section", item.section))
       activeSection = item.section
@@ -164,14 +184,15 @@ function updateNavigation(route: RouteKey): void {
 }
 
 function renderCurrentRoute(): void {
+  if (!grantedMenus.has(currentRoute)) return
   updateNavigation(currentRoute)
   if (currentRoute !== "replies") stopReplyEvents()
   if (currentRoute !== "chat") stopAdminChatEvents()
-  if (!overview) {
+  if ((currentRoute === "overview" || currentRoute === "settings") && !overview) {
     replaceChildren(main, loadingState())
     return
   }
-  if (currentRoute === "overview") renderOverview(main, overview)
+  if (currentRoute === "overview") renderOverview(main, overview!)
   else if (currentRoute === "projects") renderProjects(main, showToast, markChanged)
   else if (currentRoute === "connections") renderConnections(main, showToast, markChanged)
   else if (currentRoute === "replies") renderReplies(main, showToast, markChanged)
@@ -181,7 +202,17 @@ function renderCurrentRoute(): void {
   else if (currentRoute === "models") renderModels(main, showToast)
   else if (currentRoute === "runtime") renderRuntime(main, showToast)
   else if (currentRoute === "transfer") renderTransfer(main, showToast, markChanged)
-  else renderSettings(main, overview)
+  else if (currentRoute === "access") renderAccessControl(main, showToast)
+  else renderSettings(main, overview!)
+}
+
+function loadCurrentRoute(force = false): void {
+  if (!authenticated) return
+  if (currentRoute === "overview" || currentRoute === "settings") void loadOverview(force)
+  else {
+    lastUpdated.textContent = ""
+    renderCurrentRoute()
+  }
 }
 
 async function loadOverview(force = false): Promise<void> {
@@ -202,8 +233,6 @@ async function loadOverview(force = false): Promise<void> {
   }
 }
 
-buildNavigation()
-startAdminChatNotifications()
 mobileMenu.append(icon("menu"))
 required<HTMLElement>(".refresh-button__icon").append(icon("refresh"))
 const initialTheme = loadTheme()
@@ -216,16 +245,81 @@ mobileMenu.addEventListener("click", () => {
   mobileMenu.setAttribute("aria-expanded", String(open))
 })
 sidebarScrim.addEventListener("click", closeSidebar)
-refreshButton.addEventListener("click", () => { store.invalidate(); void loadOverview(true) })
+refreshButton.addEventListener("click", () => {
+  store.invalidate()
+  overview = undefined
+  loadCurrentRoute(true)
+})
 watchRoutes({
   location: window.location,
   addEventListener: (_type, listener) => window.addEventListener("hashchange", listener),
   removeEventListener: (_type, listener) => window.removeEventListener("hashchange", listener),
 }, (route) => {
   currentRoute = route
-  if (overview) renderCurrentRoute()
-  else void loadOverview()
+  if (!authenticated) return
+  if (!grantedMenus.has(route)) {
+    const fallback = items.find((item) => grantedMenus.has(item.route))?.route ?? "chat"
+    if (window.location.hash !== `#/${fallback}`) window.location.hash = `#/${fallback}`
+    return
+  }
+  loadCurrentRoute()
   main.scrollTo({ top: 0, behavior: "instant" })
 })
-shell.dataset.ready = "true"
-void loadOverview()
+
+function showLogin(message = ""): void {
+  authenticated = false
+  grantedMenus.clear()
+  stopAdminChatEvents()
+  stopReplyEvents()
+  notificationEvents?.close()
+  notificationEvents = null
+  notificationsStarted = false
+  shell.hidden = true
+  loginScreen.hidden = false
+  loginError.textContent = message
+  loginPassword.value = ""
+  window.setTimeout(() => loginUsername.focus(), 0)
+}
+
+function enterConsole(menus: MenuKey[]): void {
+  grantedMenus = new Set(menus)
+  authenticated = true
+  loginScreen.hidden = true
+  shell.hidden = false
+  shell.dataset.ready = "true"
+  buildNavigation()
+  startAdminChatNotifications()
+  const fallback = items.find((item) => grantedMenus.has(item.route))?.route
+  if (!fallback) {
+    showLogin("当前账号没有可用功能")
+    return
+  }
+  if (!grantedMenus.has(currentRoute)) {
+    window.location.hash = `#/${fallback}`
+  } else loadCurrentRoute()
+}
+
+loginForm.addEventListener("submit", (event) => {
+  event.preventDefault()
+  loginError.textContent = ""
+  setButtonBusy(loginSubmit, true)
+  void api.login(loginUsername.value, loginPassword.value).then((context) => {
+    loginPassword.value = ""
+    enterConsole(context.menus)
+  }).catch((error: unknown) => {
+    loginError.textContent = error instanceof Error ? error.message : "登录失败，请稍后再试"
+    loginPassword.select()
+  }).finally(() => setButtonBusy(loginSubmit, false))
+})
+
+logoutButton.addEventListener("click", () => {
+  setButtonBusy(logoutButton, true)
+  void api.logout().catch(() => undefined).finally(() => {
+    setButtonBusy(logoutButton, false)
+    showLogin()
+  })
+})
+
+api.onUnauthorized(() => showLogin("登录已失效，请重新登录"))
+
+void api.getAuthContext().then((context) => enterConsole(context.menus)).catch(() => showLogin())

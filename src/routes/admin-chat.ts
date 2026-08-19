@@ -10,13 +10,14 @@ import type { AdminChatSession, AdminChatTurn } from "../runtime/types.js"
 import type { ConfiguredSecretRedactor } from "../security/dlp.js"
 import type { AttachmentService } from "../telegram/attachment-service.js"
 import type { SupportAttachmentContext } from "../support/agent.js"
+import { requirePrincipal } from "../auth/types.js"
 
 type AdminChatWorkerPort = { wake(): void; cancel(turnId: string): boolean }
 
 export type AdminChatRoutesDependencies = {
   store: AdminChatStore
   worker: AdminChatWorkerPort
-  database: Pick<RuntimeDatabase, "readProjects" | "readProjectServices">
+  database: Pick<RuntimeDatabase, "readProjects" | "readProjectServices" | "prepare">
   redactor: ConfiguredSecretRedactor
   attachments?: Pick<AttachmentService, "prepareBuffer" | "resolveStoredPath">
   authoring?: Pick<MemoryAuthoringService, "correctAdminChatTurn">
@@ -118,6 +119,10 @@ function contentDisposition(name: string, download: boolean): string {
 }
 
 export function registerAdminChatRoutes(app: FastifyInstance, deps: AdminChatRoutesDependencies): void {
+  const viewer = (request: FastifyRequest) => {
+    const principal = requirePrincipal(request)
+    return { userId: principal.userId, isSuperAdmin: principal.isSuperAdmin }
+  }
   const publicSession = (session: AdminChatSession & {
     latestTurnStatus?: AdminChatTurn["status"] | null
     latestTurnUpdatedAt?: string | null
@@ -125,8 +130,14 @@ export function registerAdminChatRoutes(app: FastifyInstance, deps: AdminChatRou
     const project = deps.database.readProjects("WHERE id=?", [session.projectId])[0]
     const service = deps.database.readProjectServices("WHERE id=?", [session.serviceId])[0]
     if (!project || !service) throw new Error("后台对话关联的项目服务不存在")
+    const owner = session.createdByUserId
+      ? deps.database.prepare("SELECT username FROM admin_users WHERE id=?").get(session.createdByUserId) as { username?: unknown } | undefined
+      : undefined
+    const createdByUsername = deps.redactor.redact(String(owner?.username ?? "system")).text
+    const { createdByUserId: _createdByUserId, ...safeSession } = session
     return {
-      ...session,
+      ...safeSession,
+      createdByUsername,
       title: deps.redactor.redact(session.title).text,
       latestTurnStatus: session.latestTurnStatus ?? null,
       latestTurnUpdatedAt: session.latestTurnUpdatedAt ?? null,
@@ -145,7 +156,8 @@ export function registerAdminChatRoutes(app: FastifyInstance, deps: AdminChatRou
   app.post<{ Body: unknown }>("/api/admin-chat/sessions", async (request, reply) => {
     try {
       const input = createSessionSchema.parse(request.body)
-      return reply.code(201).send(publicSession(deps.store.createSession(input.serviceId)))
+      const principal = requirePrincipal(request)
+      return reply.code(201).send(publicSession(deps.store.createSession(input.serviceId, principal.userId)))
     } catch (error) {
       return handleKnownError(error, reply)
     }
@@ -153,12 +165,40 @@ export function registerAdminChatRoutes(app: FastifyInstance, deps: AdminChatRou
 
   app.get<{ Querystring: unknown }>("/api/admin-chat/sessions", async (request) => {
     const input = listSessionsSchema.parse(request.query)
-    return { sessions: deps.store.listSessions(input.serviceId).map(publicSession) }
+    return { sessions: deps.store.listSessions(input.serviceId, viewer(request)).map(publicSession) }
+  })
+
+  app.get("/api/admin-chat/services", async () => {
+    const projects = deps.database.readProjects("WHERE enabled=1")
+    const services = deps.database.readProjectServices("WHERE enabled=1")
+    return {
+      projects: projects.map((project) => ({
+        id: project.id,
+        key: project.key,
+        name: project.name,
+        enabled: project.enabled,
+        services: services.filter((service) => service.projectId === project.id).map((service) => ({
+          id: service.id,
+          projectId: service.projectId,
+          key: service.key,
+          name: service.name,
+          region: service.region,
+          timezone: service.timezone,
+          branch: service.branch,
+          enabled: service.enabled,
+          repositories: [],
+          serverCount: 0,
+          databaseCount: 0,
+          createdAt: service.createdAt,
+          updatedAt: service.updatedAt,
+        })),
+      })),
+    }
   })
 
   app.get<{ Params: { id: string } }>("/api/admin-chat/sessions/:id", async (request, reply) => {
     try {
-      const detail = deps.store.getSession(idSchema.parse(request.params.id))
+      const detail = deps.store.getSession(idSchema.parse(request.params.id), viewer(request))
       return {
         session: publicSession(detail.session),
         turns: detail.turns.map((turn) => publicTurn(turn, deps.redactor)),
@@ -172,7 +212,8 @@ export function registerAdminChatRoutes(app: FastifyInstance, deps: AdminChatRou
     try {
       const message = await messageInput(request, deps.attachments)
       const input = createConversationSchema.parse(message.fields)
-      const created = deps.store.createSessionWithTurn(input.serviceId, input.question, message.files)
+      const principal = requirePrincipal(request)
+      const created = deps.store.createSessionWithTurn(input.serviceId, input.question, message.files, principal.userId)
       deps.worker.wake()
       return reply.code(202).send({
         session: publicSession(created.session),
@@ -193,6 +234,7 @@ export function registerAdminChatRoutes(app: FastifyInstance, deps: AdminChatRou
           idSchema.parse(request.params.id),
           input.question,
           message.files,
+          viewer(request),
         )
         created.supersededTurnIds.forEach((turnId) => deps.worker.cancel(turnId))
         deps.worker.wake()
@@ -205,7 +247,7 @@ export function registerAdminChatRoutes(app: FastifyInstance, deps: AdminChatRou
 
   app.post<{ Params: { id: string } }>("/api/admin-chat/turns/:id/retry", async (request, reply) => {
     try {
-      const created = deps.store.retryTurnSupersedingActive(idSchema.parse(request.params.id))
+      const created = deps.store.retryTurnSupersedingActive(idSchema.parse(request.params.id), viewer(request))
       created.supersededTurnIds.forEach((turnId) => deps.worker.cancel(turnId))
       deps.worker.wake()
       return reply.code(202).send(publicTurn(created.turn, deps.redactor))
@@ -217,7 +259,7 @@ export function registerAdminChatRoutes(app: FastifyInstance, deps: AdminChatRou
   app.post<{ Params: { id: string } }>("/api/admin-chat/turns/:id/cancel", async (request, reply) => {
     try {
       const turnId = idSchema.parse(request.params.id)
-      const turn = deps.store.cancelTurn(turnId)
+      const turn = deps.store.cancelTurn(turnId, viewer(request))
       deps.worker.cancel(turnId)
       return reply.send(publicTurn(turn, deps.redactor))
     } catch (error) {
@@ -229,9 +271,9 @@ export function registerAdminChatRoutes(app: FastifyInstance, deps: AdminChatRou
     try {
       const input = correctionSchema.parse(request.body)
       const turnId = idSchema.parse(request.params.id)
-      const original = deps.store.getTurn(turnId)
+      const original = deps.store.getTurn(turnId, viewer(request))
       if (original.status !== "completed") throw new Error("只有已完成的回答可以纠正")
-      const session = deps.store.getSession(original.sessionId).session
+      const session = deps.store.getSession(original.sessionId, viewer(request)).session
       const project = deps.database.readProjects("WHERE id=?", [session.projectId])[0]
       const service = deps.database.readProjectServices("WHERE id=?", [session.serviceId])[0]
       if (!project || !service) throw new Error("后台对话关联的项目服务不存在")
@@ -241,7 +283,7 @@ export function registerAdminChatRoutes(app: FastifyInstance, deps: AdminChatRou
         previousAnswer: previousCorrection?.correctedAnswer || original.answer,
         correctedAnswer: input.correctedAnswer,
         reason: input.reason,
-        correctedBy: input.correctedBy,
+        correctedBy: requirePrincipal(request).username,
         scope: project.defaultKnowledgeScope,
         region: service.region || null,
         branch: service.branch || null,
@@ -253,7 +295,7 @@ export function registerAdminChatRoutes(app: FastifyInstance, deps: AdminChatRou
         turnId,
         input.correctedAnswer,
         input.reason,
-        input.correctedBy,
+        requirePrincipal(request).username,
       )
       return reply.code(201).send(publicTurn(turn, deps.redactor))
     } catch (error) {
@@ -264,7 +306,7 @@ export function registerAdminChatRoutes(app: FastifyInstance, deps: AdminChatRou
   app.get<{ Params: { id: string }; Querystring: unknown }>("/api/admin-chat/attachments/:id", async (request, reply) => {
     try {
       const input = attachmentQuerySchema.parse(request.query)
-      const attachment = deps.store.getAttachment(idSchema.parse(request.params.id))
+      const attachment = deps.store.getAttachment(idSchema.parse(request.params.id), viewer(request))
       const filePath = deps.attachments?.resolveStoredPath(attachment.storagePath)
       if (!filePath) return reply.code(404).send({ error: "附件文件不存在" })
       reply.type(attachment.mimeType || "application/octet-stream")

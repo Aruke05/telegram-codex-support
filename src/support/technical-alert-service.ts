@@ -129,6 +129,10 @@ export class TechnicalAlertService {
     replyId: string,
     outputKind: string,
   ): Promise<TechnicalAlertDelivery> {
+    const record = this.replies.getDetail(replyId)
+    if (record.threadId && this.store.getThread(record.threadId).answerOperationMode === "learning") {
+      return { status: "not_configured", summary: "学习模式禁止 Telegram 输出", errorType: null }
+    }
     const target = this.database.readGroups().find((group) => (
       group.enabled && group.purpose === "technical_alert" && group.telegramChatId
     ))
@@ -140,7 +144,6 @@ export class TechnicalAlertService {
     const targetAccountId = target.accountId
     const targetChatId = target.telegramChatId!
     const sourceChatId = sourceGroup.telegramChatId
-    const record = this.replies.getDetail(replyId)
     const messageIds = record.threadId
       ? this.store.listThreadForwardMessageIds(record.threadId)
       : record.telegramMessageId ? [record.telegramMessageId] : []

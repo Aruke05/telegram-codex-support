@@ -24,6 +24,10 @@ const portableTables = [
   "service_code_sync_schedule",
   "project_servers",
   "project_databases",
+  "admin_users",
+  "admin_roles",
+  "admin_user_roles",
+  "admin_role_menus",
   "telegram_groups",
   "telegram_roles",
   "learning_source_observations",
@@ -48,6 +52,10 @@ const portableTables = [
   "support_replies",
   "support_reply_alert_deliveries",
   "support_reply_payloads",
+  "shadow_answer_results",
+  "shadow_human_answer_links",
+  "shadow_learning_reports",
+  "shadow_comparisons",
   "reply_memory_refs",
   "admin_chat_sessions",
   "admin_chat_turns",
@@ -70,6 +78,7 @@ const sensitiveScanTables = [
   "telegram_output_ownership",
   "telegram_outgoing_candidates",
   "support_message_attachments", "support_replies", "support_reply_payloads", "reply_memory_refs",
+  "shadow_answer_results", "shadow_human_answer_links", "shadow_learning_reports", "shadow_comparisons",
   "admin_chat_attachments", "admin_chat_corrections",
   "memory_maintenance_runs", "knowledge_documents",
   "model_profiles", "model_instances", "runtime_model_bindings", "runtime_settings", "daily_group_shutdown_schedule",
@@ -349,6 +358,11 @@ export class BackupService {
     let portableHasThreadLinks = false
     let portableHasSenderFocus = false
     let portableHasDailyGroupShutdownSchedule = false
+    let portableHasGroupOperationMode = false
+    let portableHasThreadOperationMode = false
+    let portableHasShadowLearning = false
+    let portableHasAdminAccess = false
+    let portableHasAdminChatOwner = false
     let portableModels: PortableModelLineage = "modern"
     try {
       const portableSchemaVersion = portableStructure.schemaVersion()
@@ -395,6 +409,14 @@ export class BackupService {
       const portableThreadColumns = (portableStructure.prepare(
         "PRAGMA table_info(support_threads)",
       ).all() as Array<{ name: string }>).map((column) => column.name)
+      portableHasGroupOperationMode = (portableStructure.prepare(
+        "PRAGMA table_info(telegram_groups)",
+      ).all() as Array<{ name: string }>).some((column) => column.name === "operation_mode")
+      portableHasThreadOperationMode = portableThreadColumns.includes("answer_operation_mode")
+      portableHasShadowLearning = ["shadow_answer_results", "shadow_human_answer_links", "shadow_learning_reports", "shadow_comparisons"]
+        .every((table) => Boolean(portableStructure.prepare(
+          "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        ).get(table)))
       const portableEventColumns = (portableStructure.prepare(
         "PRAGMA table_info(support_message_events)",
       ).all() as Array<{ name: string }>).map((column) => column.name)
@@ -451,6 +473,12 @@ export class BackupService {
       portableHasDailyGroupShutdownSchedule = Boolean(portableStructure.prepare(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='daily_group_shutdown_schedule'",
       ).get())
+      portableHasAdminAccess = ["admin_users", "admin_roles", "admin_user_roles", "admin_role_menus"].every((table) => Boolean(
+        portableStructure.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table),
+      ))
+      portableHasAdminChatOwner = (portableStructure.prepare(
+        "PRAGMA table_info(admin_chat_sessions)",
+      ).all() as Array<{ name: string }>).some((column) => column.name === "created_by_user_id")
       if (portableHasAdminChatAttachments !== portableHasAdminChatCorrections) {
         throw new Error("迁移数据库后台对话扩展结构不完整")
       }
@@ -466,6 +494,20 @@ export class BackupService {
         const copy = (table: string, columns: string, select = columns, suffix = "") => this.database.connection.exec(
           `INSERT INTO main.${table}(${columns}) SELECT ${select} FROM portable.${table} ${suffix}`,
         )
+        if (portableHasAdminAccess) {
+          this.database.connection.exec(`
+            DELETE FROM main.admin_user_roles;
+            DELETE FROM main.admin_role_menus;
+            DELETE FROM main.admin_users;
+            DELETE FROM main.admin_roles;
+          `)
+          copy("admin_roles", "id,role_key,name,is_super_admin,created_at,updated_at")
+          copy("admin_users", "id,username,password_hash,password_salt,password_cost,enabled,auth_version,created_at,updated_at")
+          copy("admin_role_menus", "role_id,menu_key,created_at")
+          copy("admin_user_roles", "user_id,role_id,created_at")
+          this.database.connection.exec(`INSERT OR IGNORE INTO main.admin_role_menus(role_id,menu_key,created_at)
+            SELECT id,'access',strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM main.admin_roles WHERE is_super_admin=1`)
+        }
         copy("projects", "id,project_key,name,description,enabled,default_knowledge_scope,created_at,updated_at")
         copy("project_repositories", "id,project_id,name,local_path,remote_url,branch,enabled,created_at,updated_at")
         const importedRepositories = this.database.prepare("SELECT id,remote_url FROM project_repositories").all() as Array<{
@@ -550,14 +592,15 @@ export class BackupService {
         const replyStyleExpression = portableModels === "modern" ? "reply_style" : "'unrestricted'"
         this.database.prepare(`INSERT INTO main.telegram_groups(
           id,group_key,name,telegram_chat_id,account_id,project_id,service_id,enabled,access_mode,trigger_mode,
-          platform,repositories,branch,server_alias,database_alias,knowledge_scope,purpose,ai_model_instance_id,reply_style,created_at,updated_at
+          platform,repositories,branch,server_alias,database_alias,knowledge_scope,purpose,ai_model_instance_id,reply_style,
+          operation_mode,created_at,updated_at
         ) SELECT id,group_key,name,telegram_chat_id,
           CASE access_mode WHEN 'bot' THEN ? WHEN 'user' THEN ? ELSE NULL END,
           CASE WHEN purpose='technical_alert' THEN NULL ELSE project_id END,
           CASE WHEN purpose='technical_alert' THEN NULL ELSE service_id END,
           CASE access_mode WHEN 'bot' THEN enabled AND ? IS NOT NULL WHEN 'user' THEN enabled AND ? IS NOT NULL ELSE 0 END,
           access_mode,trigger_mode,platform,repositories,branch,server_alias,database_alias,knowledge_scope,purpose,
-          ${groupModelExpression},${replyStyleExpression},created_at,updated_at
+          ${groupModelExpression},${replyStyleExpression},${portableHasGroupOperationMode ? "operation_mode" : "'live'"},created_at,updated_at
           FROM portable.telegram_groups`).run(botAccountId, userAccountId, botAccountId, userAccountId)
         copy("telegram_roles", "id,telegram_user_id,username,display_name,role,can_correct,enabled,learning_source_enabled,created_at,updated_at",
           `id,telegram_user_id,username,display_name,role,can_correct,enabled,${portableHasLearningSourceRoles ? "learning_source_enabled" : "0"},created_at,updated_at`)
@@ -593,13 +636,14 @@ export class BackupService {
           latest_message_at,summary,origin_batch_id,operator_style_version_id,operator_style_profile_json,
           answer_model_instance_id,answer_reply_style,answer_timeout_seconds,answer_max_concurrency,
           answer_binding_enabled,answer_include_ai_memory,answer_include_interface_docs,answer_include_magic_book,
+          answer_operation_mode,
           generation_started_at,progress_due_at,hard_deadline_at,human_priority_state,human_priority_user_ids_json,
           human_priority_due_at,human_priority_source_event_id,human_priority_progress_message_id,human_priority_error,
           closed_at,closed_by,closed_reason,created_at,updated_at`,
           `id,group_id,project_id,service_id,status,revision,settle_at,anchor_message_id,latest_message_at,summary,
           ${portableHasOriginBatchId ? "origin_batch_id" : "NULL"},
           ${portableHasThreadStylePin ? "operator_style_version_id,operator_style_profile_json" : `NULL,'${baselineOperatorStyleProfileSql}'`},
-          ${answerPolicySelect},
+          ${answerPolicySelect},${portableHasThreadOperationMode ? "answer_operation_mode" : "'live'"},
           generation_started_at,progress_due_at,hard_deadline_at,
           ${portableHasHumanPriority
             ? "human_priority_state,human_priority_user_ids_json,human_priority_due_at,human_priority_source_event_id,human_priority_progress_message_id,human_priority_error"
@@ -674,6 +718,29 @@ export class BackupService {
           project_id,service_id,telegram_message_id,telegram_reply_message_id,service,decision,status,sender_user_id,sender_username,sender_display_name,sender_role,service_source,code_revision,
           ${portableHasServiceCodeTables ? "code_snapshot_id,code_sync_batch_id" : "NULL,NULL"},${portableHasOperatorDeliveryStatus ? "operator_delivery_status" : "NULL"},created_at,updated_at,generation_started_at,heartbeat_at,duration_ms,error_code,decision_reason,decision_confidence,corrected_at`)
         copy("support_reply_payloads", "reply_id,question,answer,quote_text,has_attachment")
+        if (portableHasShadowLearning) {
+          copy("shadow_answer_results", `id,reply_id,thread_id,input_revision,outcome_status,decision,answer,quote_text,
+            reason,confidence,code_revision,memory_version_refs_json,simulated_action,output_redacted,error_code,created_at,updated_at`)
+          copy("shadow_human_answer_links", `id,observation_id,human_message_event_id,thread_id,input_revision,
+            shadow_result_id,match_reason,match_confidence,created_at`)
+          copy("shadow_learning_reports", `id,trigger_type,due_at,cutoff_at,status,claim_token,attempt_count,sample_count,
+            summary_json,rendered_markdown,error_message,started_at,completed_at,created_at,updated_at`,
+            `id,trigger_type,due_at,cutoff_at,CASE WHEN status='running' THEN 'pending' ELSE status END,NULL,attempt_count,
+            sample_count,summary_json,rendered_markdown,
+            CASE WHEN status='running' THEN '迁移时报告生成中断，已重新排队' ELSE error_message END,
+            CASE WHEN status='running' THEN NULL ELSE started_at END,
+            CASE WHEN status='running' THEN NULL ELSE completed_at END,created_at,updated_at`)
+          copy("shadow_comparisons", `id,report_id,shadow_result_id,thread_id,input_revision,
+            question_snapshot,shadow_answer_snapshot,human_answers_json,
+            human_message_event_ids_json,comparison_json,created_at`)
+        } else {
+          this.database.prepare(`INSERT INTO shadow_learning_reports(
+            id,trigger_type,due_at,cutoff_at,status,claim_token,attempt_count,sample_count,
+            summary_json,rendered_markdown,error_message,started_at,completed_at,created_at,updated_at
+          ) VALUES ('00000000-0000-4000-8000-000000000029','scheduled',
+            '2026-08-20T15:00:00.000Z','2026-08-20T15:00:00.000Z','pending',NULL,0,0,
+            NULL,NULL,NULL,NULL,NULL,'2026-08-19T00:00:00.000Z','2026-08-19T00:00:00.000Z')`).run()
+        }
         if (portableHasReplyAlertDeliveries) {
           copy("support_reply_alert_deliveries", "reply_id,alert_kind,status,created_at,updated_at",
             "reply_id,alert_kind,CASE WHEN status='sending' THEN 'uncertain' ELSE status END,created_at,updated_at")
@@ -694,7 +761,8 @@ export class BackupService {
               CASE WHEN resolution_status='pending' THEN 'unknown' ELSE resolution_status END,created_at,updated_at`)
         }
         copy("reply_memory_refs", "reply_id,memory_version_id")
-        copy("admin_chat_sessions", "id,project_id,service_id,title,created_at,updated_at")
+        copy("admin_chat_sessions", "id,project_id,service_id,created_by_user_id,title,created_at,updated_at",
+          portableHasAdminChatOwner ? "id,project_id,service_id,created_by_user_id,title,created_at,updated_at" : "id,project_id,service_id,NULL,title,created_at,updated_at")
         copy("admin_chat_turns", "id,session_id,position,question,answer,decision,status,investigation_json,decision_reason,decision_confidence,code_revision,code_snapshot_id,code_sync_batch_id,memory_version_refs_json,error_code,created_at,updated_at,generation_started_at,completed_at")
         if (portableHasAdminChatAttachments && portableHasAdminChatCorrections) {
           copy("admin_chat_attachments", "id,turn_id,file_name,mime_type,file_size,kind,storage_path,extracted_text,created_at")
@@ -736,13 +804,22 @@ export class BackupService {
     const integrity = portable.prepare("PRAGMA integrity_check").all() as Array<{ integrity_check: string }>
     if (integrity.length !== 1 || integrity[0]?.integrity_check !== "ok") throw new Error("迁移数据库完整性检查失败")
     const schemaVersion = portable.schemaVersion()
-    if (![12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27].includes(schemaVersion)) {
+    if (![12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31].includes(schemaVersion)) {
       throw new Error("迁移数据库版本不兼容")
     }
     const existing = new Set((portable.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>).map((row) => row.name))
+    const shadowLearningTableCount = [
+      "shadow_answer_results", "shadow_human_answer_links", "shadow_learning_reports", "shadow_comparisons",
+    ].filter((table) => existing.has(table)).length
+    if (shadowLearningTableCount !== 0 && shadowLearningTableCount !== 4) {
+      throw new Error("迁移数据库影子学习结构谱系不完整")
+    }
     const modelLineage = portableModelLineage(portable, existing)
     if (portableTables.some((table) => (
       table !== "learning_source_observations"
+      && !(schemaVersion <= 29 && (
+        table === "admin_users" || table === "admin_roles" || table === "admin_user_roles" || table === "admin_role_menus"
+      ))
       && !(schemaVersion <= 22 && table === "reference_learning_results")
       && !(table === "admin_chat_attachments" || table === "admin_chat_corrections")
       && table !== "support_reply_alert_deliveries"
@@ -753,6 +830,7 @@ export class BackupService {
         table === "support_thread_links" || table === "support_sender_focus" || table === "support_route_clarifications"
       ))
       && !(schemaVersion <= 25 && table === "daily_group_shutdown_schedule")
+      && !(schemaVersion <= 28 && ["shadow_answer_results", "shadow_human_answer_links", "shadow_learning_reports", "shadow_comparisons"].includes(table))
       && !(modelLineage === "legacy" && portableModelTables.includes(table as (typeof portableModelTables)[number]))
       && !existing.has(table)
     ))) throw new Error("迁移数据库结构不完整")

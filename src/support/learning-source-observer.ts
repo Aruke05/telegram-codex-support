@@ -8,6 +8,7 @@ import type {
 import type { LearningSourceStore } from "./learning-source-store.js"
 import type { SupportThreadLifecycleService } from "./thread-lifecycle-service.js"
 import type { SupportThreadStore } from "./thread-store.js"
+import { ShadowLearningStore } from "./shadow-learning-store.js"
 
 export type LearningSourceObserverDependencies = {
   database: RuntimeDatabase
@@ -18,7 +19,11 @@ export type LearningSourceObserverDependencies = {
 }
 
 export class LearningSourceObserver {
-  constructor(private readonly deps: LearningSourceObserverDependencies) {}
+  private readonly shadowLearning: ShadowLearningStore
+
+  constructor(private readonly deps: LearningSourceObserverDependencies) {
+    this.shadowLearning = new ShadowLearningStore(deps.database)
+  }
 
   observe(event: SupportMessageEvent, trustedRole?: TelegramRole): LearningSourceObservation | null {
     const group = this.deps.database.readGroups().find((candidate) => candidate.id === event.groupId)
@@ -35,11 +40,20 @@ export class LearningSourceObserver {
       ? trustedRole
       : configuredRole
     if (!role || event.routeStatus !== "role_skipped") return null
-    const existing = this.deps.observations.findByMessageEvent(event.id)
-    if (existing) return existing
-
     const serviceId = group.serviceId
-    const association = this.associate(event, serviceId)
+    const learningMode = group.operationMode === "learning"
+    const association = this.associate(event, serviceId, !learningMode)
+    const shadowReference = learningMode || association.thread?.answerOperationMode === "learning"
+    if (shadowReference && !configuredRole) return null
+    const existing = this.deps.observations.findByMessageEvent(event.id)
+    if (existing) {
+      if (shadowReference && association.thread) this.shadowLearning.linkHumanAnswer({
+        observationId: existing.id,
+        humanMessageEventId: event.id,
+        primaryThreadId: association.thread.id,
+      })
+      return existing
+    }
     const record = (takeoverStatus: LearningSourceObservation["takeoverStatus"]): LearningSourceObservation => (
       this.deps.observations.findByMessageEvent(event.id) ?? this.deps.observations.record({
         messageEventId: event.id,
@@ -50,13 +64,26 @@ export class LearningSourceObserver {
         associationReason: association.reason,
         associationConfidence: association.confidence,
         takeoverStatus,
-        classification: "reference_reply",
+        classification: shadowReference ? "shadow_reference_reply" : "reference_reply",
         risk: "low",
-        processingStatus: association.reason === "ambiguous" || association.reason === "none" ? "ignored" : "pending",
+        processingStatus: shadowReference || association.reason === "ambiguous" || association.reason === "none"
+          ? "ignored"
+          : "pending",
       })
     )
     if (association.reason === "ambiguous") return record("ambiguous")
     if (!association.thread) return record("not_linked")
+    if (shadowReference) {
+      return this.deps.database.transaction(() => {
+        const observation = record(association.thread ? "thread_already_terminal" : "not_linked")
+        if (association.thread) this.shadowLearning.linkHumanAnswer({
+          observationId: observation.id,
+          humanMessageEventId: event.id,
+          primaryThreadId: association.thread.id,
+        })
+        return observation
+      })
+    }
     return this.deps.lifecycle.takeOverFromHuman(
       association.thread.id,
       role.displayName || role.username || role.telegramUserId,
@@ -65,7 +92,31 @@ export class LearningSourceObserver {
     )
   }
 
-  private associate(event: SupportMessageEvent, serviceId: string | null): {
+  reconcilePending(): number {
+    const rows = this.deps.database.prepare(`SELECT observation.message_event_id
+      FROM learning_source_observations observation
+      WHERE observation.classification='shadow_reference_reply'
+        AND NOT EXISTS (
+          SELECT 1 FROM shadow_human_answer_links link WHERE link.observation_id=observation.id
+        )
+      ORDER BY observation.created_at,observation.id`).all() as Array<{ message_event_id: string }>
+    let linked = 0
+    for (const row of rows) {
+      const event = this.deps.threads.getEvent(row.message_event_id)
+      const observation = this.deps.observations.findByMessageEvent(event.id)
+      if (!observation) continue
+      const association = this.associate(event, observation.serviceId, false)
+      if (!association.thread || association.thread.answerOperationMode !== "learning") continue
+      if (this.shadowLearning.linkHumanAnswer({
+        observationId: observation.id,
+        humanMessageEventId: event.id,
+        primaryThreadId: association.thread.id,
+      }).length > 0) linked += 1
+    }
+    return linked
+  }
+
+  private associate(event: SupportMessageEvent, serviceId: string | null, allowMaterialize: boolean): {
     thread: SupportThread | null
     reason: LearningSourceObservation["associationReason"]
     confidence: number
@@ -74,7 +125,7 @@ export class LearningSourceObserver {
       const directEvent = this.deps.threads.getEventByTelegramMessage(event.groupId, event.replyToMessageId)
       if (directEvent) {
         const relation = this.deps.threads.getEventRelation(directEvent.id)
-          ?? (this.deps.materializePendingBatch(directEvent.id)
+          ?? (allowMaterialize && this.deps.materializePendingBatch(directEvent.id)
             ? this.deps.threads.getEventRelation(directEvent.id)
             : null)
         if (relation?.thread.groupId === event.groupId && relation.relation === "origin") {

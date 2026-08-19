@@ -66,7 +66,7 @@ describe("GET /health", () => {
       status: "ok",
       service: "telegram-codex-support",
       version: "2.1.0",
-      schemaVersion: 27,
+      schemaVersion: 29,
     })
     expect(response.body).not.toContain("TOKEN")
   })
@@ -266,6 +266,7 @@ describe("白名单群批量配置状态", () => {
     purpose: "support",
     aiModelInstanceId: null,
     replyStyle: "unrestricted",
+    operationMode: "live",
     createdAt: "2026-08-13T00:00:00.000Z",
     updatedAt: "2026-08-13T00:00:00.000Z",
   })

@@ -394,6 +394,7 @@ export class DirectApiAdapter {
   }
 
   private isToolAllowed<T>(name: string, input: AdapterExecutionInput<T>): boolean {
+    if (input.accessMode === "shadow-report") return false
     return input.accessMode !== "reference-classifier" || referenceClassifierTools.has(name)
   }
 

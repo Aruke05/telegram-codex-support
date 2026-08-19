@@ -143,6 +143,23 @@ async function close(server: Server): Promise<void> {
 }
 
 describe("Reference classifier Codex permissions", () => {
+  it("影子报告使用无网络且只能读取空工作目录的严格权限", () => {
+    const cwd = "/private/tmp/shadow-report-empty"
+    const args = executorModule.buildCodexArgs(
+      { ...referenceClassifierInvocation(cwd, []), accessMode: "shadow-report" },
+      "/private/tmp/schema.json",
+      "/private/tmp/result.json",
+    )
+    const overrides = configOverrides(args)
+    expect(args).toContain("--strict-config")
+    expect(sandboxMode(args)).toBeNull()
+    expect(overrides).toContain('default_permissions="shadow-report"')
+    expect(overrides).toContain("permissions.shadow-report.network.enabled=false")
+    expect(overrides.some((override) => override.startsWith("permissions.shadow-report.filesystem=")
+      && override.includes('\":root\"=\"deny\"')
+      && override.includes(`${JSON.stringify(cwd)}=\"read\"`))).toBe(true)
+  })
+
   it("uses a strict inline permission profile without the legacy sandbox flag", () => {
     const cwd = "/safe/current-snapshot"
     const repository = "/safe/current-snapshot/java-project"

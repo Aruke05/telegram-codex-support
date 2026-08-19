@@ -25,6 +25,8 @@ export const telegramAccountSchema = z.object({
   updatedAt: z.string().datetime(),
 }).strict()
 
+export const groupOperationModeSchema = z.enum(["live", "learning"])
+
 export const runtimeGroupSchema = z.object({
   id: z.string().uuid(),
   key: z.string().trim().min(1).max(80),
@@ -45,6 +47,7 @@ export const runtimeGroupSchema = z.object({
   purpose: z.enum(["support", "technical_alert"]),
   aiModelInstanceId: z.string().uuid().nullable(),
   replyStyle: z.enum(["human", "unrestricted"]),
+  operationMode: groupOperationModeSchema.default("live"),
   createdAt: z.string().datetime(),
   updatedAt: z.string().datetime(),
 }).strict()
@@ -474,6 +477,7 @@ export const supportThreadSchema = z.object({
   answerIncludeAiMemory: z.boolean(),
   answerIncludeInterfaceDocs: z.boolean(),
   answerIncludeMagicBook: z.boolean(),
+  answerOperationMode: groupOperationModeSchema.default("live"),
   generationStartedAt: z.string().datetime().nullable(),
   progressDueAt: z.string().datetime().nullable(),
   hardDeadlineAt: z.string().datetime().nullable(),
@@ -628,6 +632,7 @@ export const adminChatSessionSchema = z.object({
   id: z.string().uuid(),
   projectId: z.string().uuid(),
   serviceId: z.string().uuid(),
+  createdByUserId: z.string().uuid().nullable(),
   title: z.string().min(1).max(72),
   createdAt: z.string().datetime(),
   updatedAt: z.string().datetime(),

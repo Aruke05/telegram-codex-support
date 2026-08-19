@@ -207,6 +207,7 @@ CREATE TABLE IF NOT EXISTS support_threads (
   answer_include_ai_memory INTEGER NOT NULL DEFAULT 1 CHECK (answer_include_ai_memory IN (0, 1)),
   answer_include_interface_docs INTEGER NOT NULL DEFAULT 1 CHECK (answer_include_interface_docs IN (0, 1)),
   answer_include_magic_book INTEGER NOT NULL DEFAULT 1 CHECK (answer_include_magic_book IN (0, 1)),
+  answer_operation_mode TEXT NOT NULL DEFAULT 'live' CHECK(answer_operation_mode IN ('live','learning')),
   generation_started_at TEXT,
   progress_due_at TEXT,
   hard_deadline_at TEXT,
@@ -443,12 +444,15 @@ CREATE TABLE IF NOT EXISTS admin_chat_sessions (
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE RESTRICT,
   service_id TEXT NOT NULL REFERENCES project_services(id) ON DELETE RESTRICT,
+  created_by_user_id TEXT REFERENCES admin_users(id) ON DELETE RESTRICT,
   title TEXT NOT NULL,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS admin_chat_sessions_service_recent_idx
   ON admin_chat_sessions(service_id,updated_at DESC,id DESC);
+CREATE INDEX IF NOT EXISTS admin_chat_sessions_owner_recent_idx
+  ON admin_chat_sessions(created_by_user_id,updated_at DESC,id DESC);
 
 CREATE TABLE IF NOT EXISTS admin_chat_turns (
   id TEXT PRIMARY KEY,
@@ -473,6 +477,80 @@ CREATE TABLE IF NOT EXISTS admin_chat_turns (
   UNIQUE(session_id,position)
 );
 CREATE INDEX IF NOT EXISTS admin_chat_turns_work_idx ON admin_chat_turns(status,created_at,id);
+`
+
+const adminAccessSchema = `
+CREATE TABLE IF NOT EXISTS admin_users (
+  id TEXT PRIMARY KEY,
+  username TEXT NOT NULL COLLATE NOCASE UNIQUE CHECK(length(trim(username)) BETWEEN 1 AND 80),
+  password_hash TEXT NOT NULL CHECK(length(password_hash)>0),
+  password_salt TEXT NOT NULL CHECK(length(password_salt)>0),
+  password_cost INTEGER NOT NULL DEFAULT 16384 CHECK(password_cost BETWEEN 16384 AND 262144),
+  enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
+  auth_version INTEGER NOT NULL DEFAULT 1 CHECK(auth_version>=1),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS admin_roles (
+  id TEXT PRIMARY KEY,
+  role_key TEXT NOT NULL UNIQUE CHECK(length(trim(role_key)) BETWEEN 1 AND 80),
+  name TEXT NOT NULL CHECK(length(trim(name)) BETWEEN 1 AND 80),
+  is_super_admin INTEGER NOT NULL DEFAULT 0 CHECK(is_super_admin IN (0,1)),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS admin_user_roles (
+  user_id TEXT NOT NULL REFERENCES admin_users(id) ON DELETE CASCADE,
+  role_id TEXT NOT NULL REFERENCES admin_roles(id) ON DELETE CASCADE,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(user_id,role_id)
+);
+CREATE INDEX IF NOT EXISTS admin_user_roles_role_idx ON admin_user_roles(role_id,user_id);
+
+CREATE TABLE IF NOT EXISTS admin_role_menus (
+  role_id TEXT NOT NULL REFERENCES admin_roles(id) ON DELETE CASCADE,
+  menu_key TEXT NOT NULL CHECK(menu_key IN (
+    'overview','projects','connections','replies','chat','memories','docs','models','runtime','transfer','settings','access'
+  )),
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(role_id,menu_key)
+);
+CREATE INDEX IF NOT EXISTS admin_role_menus_menu_idx ON admin_role_menus(menu_key,role_id);
+`
+
+const adminAccessSeedSql = `
+INSERT OR IGNORE INTO admin_roles(id,role_key,name,is_super_admin,created_at,updated_at)
+VALUES
+  ('00000000-0000-4000-8000-000000000100','super_admin','系统管理',1,strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  ('00000000-0000-4000-8000-000000000200','standard','业务使用',0,strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'));
+
+INSERT OR IGNORE INTO admin_users(
+  id,username,password_hash,password_salt,password_cost,enabled,auth_version,created_at,updated_at
+) VALUES
+  ('00000000-0000-4000-8000-000000000901','09','71FbesRBIOWOKT330xvtE46PKwwmkX6Zi83n6bfZ35BepucrMY9gmyoYiFkBh0o8C1jj9y1XQe4S8CfKmzpQ5g','BbQicl6cISpfLdCWlFJddA',16384,1,1,strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  ('00000000-0000-4000-8000-000000000902','oldwang','umMSbpANfbqbnBC1j04DF66cwi66fIEWdLCmhSYoaJeGsEKjp8XKStLgGyHhq1oGWdXdTklBxedYlcZsCD8YQA','q5fXUG7vbYWNVTzxPFpKJQ',16384,1,1,strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'));
+
+INSERT OR IGNORE INTO admin_user_roles(user_id,role_id,created_at)
+SELECT id,'00000000-0000-4000-8000-000000000100',strftime('%Y-%m-%dT%H:%M:%fZ','now')
+FROM admin_users WHERE username IN ('09','oldwang') COLLATE NOCASE;
+
+INSERT OR IGNORE INTO admin_role_menus(role_id,menu_key,created_at)
+VALUES
+  ('00000000-0000-4000-8000-000000000100','overview',strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  ('00000000-0000-4000-8000-000000000100','projects',strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  ('00000000-0000-4000-8000-000000000100','connections',strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  ('00000000-0000-4000-8000-000000000100','replies',strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  ('00000000-0000-4000-8000-000000000100','chat',strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  ('00000000-0000-4000-8000-000000000100','memories',strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  ('00000000-0000-4000-8000-000000000100','docs',strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  ('00000000-0000-4000-8000-000000000100','models',strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  ('00000000-0000-4000-8000-000000000100','runtime',strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  ('00000000-0000-4000-8000-000000000100','transfer',strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  ('00000000-0000-4000-8000-000000000100','settings',strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  ('00000000-0000-4000-8000-000000000100','access',strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  ('00000000-0000-4000-8000-000000000200','chat',strftime('%Y-%m-%dT%H:%M:%fZ','now'));
 `
 
 const adminChatConversationExtensionSchema = `
@@ -567,6 +645,100 @@ CREATE INDEX IF NOT EXISTS operator_style_version_evidence_observation_idx
   ON operator_style_version_evidence(observation_id,operator_style_version_id);
 `
 
+const shadowLearningSchema = `
+CREATE TABLE IF NOT EXISTS shadow_answer_results (
+  id TEXT PRIMARY KEY,
+  reply_id TEXT NOT NULL UNIQUE REFERENCES support_replies(id) ON DELETE CASCADE,
+  thread_id TEXT NOT NULL REFERENCES support_threads(id) ON DELETE CASCADE,
+  input_revision INTEGER NOT NULL CHECK (input_revision >= 1),
+  outcome_status TEXT NOT NULL CHECK (outcome_status IN ('completed','failed')),
+  decision TEXT CHECK (decision IS NULL OR decision IN ('reply','ignore','escalate')),
+  answer TEXT NOT NULL DEFAULT '',
+  quote_text TEXT,
+  reason TEXT,
+  confidence REAL CHECK (confidence IS NULL OR (confidence >= 0 AND confidence <= 1)),
+  code_revision TEXT,
+  memory_version_refs_json TEXT NOT NULL DEFAULT '[]',
+  simulated_action TEXT NOT NULL,
+  output_redacted INTEGER NOT NULL DEFAULT 0 CHECK (output_redacted IN (0,1)),
+  error_code TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(thread_id,input_revision)
+);
+CREATE INDEX IF NOT EXISTS shadow_answer_results_status_idx
+  ON shadow_answer_results(outcome_status,created_at,id);
+CREATE INDEX IF NOT EXISTS shadow_answer_results_thread_idx
+  ON shadow_answer_results(thread_id,input_revision);
+
+CREATE TABLE IF NOT EXISTS shadow_human_answer_links (
+  id TEXT PRIMARY KEY,
+  observation_id TEXT NOT NULL REFERENCES learning_source_observations(id) ON DELETE RESTRICT,
+  human_message_event_id TEXT NOT NULL REFERENCES support_message_events(id) ON DELETE RESTRICT,
+  thread_id TEXT NOT NULL REFERENCES support_threads(id) ON DELETE CASCADE,
+  input_revision INTEGER NOT NULL CHECK (input_revision >= 1),
+  shadow_result_id TEXT REFERENCES shadow_answer_results(id) ON DELETE SET NULL,
+  match_reason TEXT NOT NULL CHECK (match_reason IN ('direct','split_family')),
+  match_confidence REAL NOT NULL CHECK (match_confidence >= 0 AND match_confidence <= 1),
+  created_at TEXT NOT NULL,
+  UNIQUE(human_message_event_id,thread_id,input_revision)
+);
+CREATE INDEX IF NOT EXISTS shadow_human_answer_links_thread_idx
+  ON shadow_human_answer_links(thread_id,input_revision,created_at,id);
+CREATE INDEX IF NOT EXISTS shadow_human_answer_links_observation_idx
+  ON shadow_human_answer_links(observation_id,created_at,id);
+
+CREATE TABLE IF NOT EXISTS shadow_learning_reports (
+  id TEXT PRIMARY KEY,
+  trigger_type TEXT NOT NULL CHECK (trigger_type IN ('scheduled','manual')),
+  due_at TEXT NOT NULL,
+  cutoff_at TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('pending','running','completed','failed')),
+  claim_token TEXT,
+  attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+  sample_count INTEGER NOT NULL DEFAULT 0 CHECK (sample_count >= 0),
+  summary_json TEXT,
+  rendered_markdown TEXT,
+  error_message TEXT,
+  started_at TEXT,
+  completed_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS shadow_learning_reports_due_idx
+  ON shadow_learning_reports(status,due_at,id);
+
+CREATE TABLE IF NOT EXISTS shadow_comparisons (
+  id TEXT PRIMARY KEY,
+  report_id TEXT NOT NULL REFERENCES shadow_learning_reports(id) ON DELETE CASCADE,
+  shadow_result_id TEXT REFERENCES shadow_answer_results(id) ON DELETE SET NULL,
+  thread_id TEXT REFERENCES support_threads(id) ON DELETE SET NULL,
+  input_revision INTEGER NOT NULL CHECK (input_revision >= 1),
+  question_snapshot TEXT NOT NULL,
+  shadow_answer_snapshot TEXT NOT NULL,
+  human_answers_json TEXT NOT NULL DEFAULT '[]',
+  human_message_event_ids_json TEXT NOT NULL DEFAULT '[]',
+  comparison_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(report_id,shadow_result_id)
+);
+CREATE INDEX IF NOT EXISTS shadow_comparisons_report_idx
+  ON shadow_comparisons(report_id,created_at,id);
+
+INSERT INTO shadow_learning_reports(
+  id,trigger_type,due_at,cutoff_at,status,claim_token,attempt_count,sample_count,
+  summary_json,rendered_markdown,error_message,started_at,completed_at,created_at,updated_at
+) SELECT
+  '00000000-0000-4000-8000-000000000029','scheduled',
+  '2026-08-20T15:00:00.000Z','2026-08-20T15:00:00.000Z','pending',NULL,0,0,
+  NULL,NULL,NULL,NULL,NULL,'2026-08-19T00:00:00.000Z','2026-08-19T00:00:00.000Z'
+WHERE NOT EXISTS (
+  SELECT 1 FROM shadow_learning_reports
+  WHERE trigger_type='scheduled' AND due_at='2026-08-20T15:00:00.000Z'
+    AND cutoff_at='2026-08-20T15:00:00.000Z'
+);
+`
+
 const schema = `
 PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = WAL;
@@ -628,6 +800,9 @@ CREATE TABLE IF NOT EXISTS project_service_repositories (
 );
 CREATE INDEX IF NOT EXISTS project_service_repositories_repository_idx
   ON project_service_repositories(repository_id, service_id);
+
+${adminAccessSchema}
+${adminAccessSeedSql}
 
 CREATE TABLE IF NOT EXISTS project_servers (
   id TEXT PRIMARY KEY,
@@ -699,6 +874,7 @@ CREATE TABLE IF NOT EXISTS telegram_groups (
   purpose TEXT NOT NULL CHECK (purpose IN ('support', 'technical_alert')),
   ai_model_instance_id TEXT REFERENCES model_instances(id) ON DELETE RESTRICT,
   reply_style TEXT NOT NULL DEFAULT 'unrestricted' CHECK (reply_style IN ('human','unrestricted')),
+  operation_mode TEXT NOT NULL DEFAULT 'live' CHECK(operation_mode IN ('live','learning')),
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -872,6 +1048,98 @@ CREATE TABLE IF NOT EXISTS support_reply_payloads (
   answer TEXT NOT NULL,
   quote_text TEXT,
   has_attachment INTEGER NOT NULL DEFAULT 0 CHECK (has_attachment IN (0, 1))
+);
+
+CREATE TABLE IF NOT EXISTS shadow_answer_results (
+  id TEXT PRIMARY KEY,
+  reply_id TEXT NOT NULL UNIQUE REFERENCES support_replies(id) ON DELETE CASCADE,
+  thread_id TEXT NOT NULL REFERENCES support_threads(id) ON DELETE CASCADE,
+  input_revision INTEGER NOT NULL CHECK (input_revision >= 1),
+  outcome_status TEXT NOT NULL CHECK (outcome_status IN ('completed','failed')),
+  decision TEXT CHECK (decision IS NULL OR decision IN ('reply','ignore','escalate')),
+  answer TEXT NOT NULL DEFAULT '',
+  quote_text TEXT,
+  reason TEXT,
+  confidence REAL CHECK (confidence IS NULL OR (confidence >= 0 AND confidence <= 1)),
+  code_revision TEXT,
+  memory_version_refs_json TEXT NOT NULL DEFAULT '[]',
+  simulated_action TEXT NOT NULL,
+  output_redacted INTEGER NOT NULL DEFAULT 0 CHECK (output_redacted IN (0,1)),
+  error_code TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(thread_id,input_revision)
+);
+CREATE INDEX IF NOT EXISTS shadow_answer_results_status_idx
+  ON shadow_answer_results(outcome_status,created_at,id);
+CREATE INDEX IF NOT EXISTS shadow_answer_results_thread_idx
+  ON shadow_answer_results(thread_id,input_revision);
+
+CREATE TABLE IF NOT EXISTS shadow_human_answer_links (
+  id TEXT PRIMARY KEY,
+  observation_id TEXT NOT NULL REFERENCES learning_source_observations(id) ON DELETE RESTRICT,
+  human_message_event_id TEXT NOT NULL REFERENCES support_message_events(id) ON DELETE RESTRICT,
+  thread_id TEXT NOT NULL REFERENCES support_threads(id) ON DELETE CASCADE,
+  input_revision INTEGER NOT NULL CHECK (input_revision >= 1),
+  shadow_result_id TEXT REFERENCES shadow_answer_results(id) ON DELETE SET NULL,
+  match_reason TEXT NOT NULL CHECK (match_reason IN ('direct','split_family')),
+  match_confidence REAL NOT NULL CHECK (match_confidence >= 0 AND match_confidence <= 1),
+  created_at TEXT NOT NULL,
+  UNIQUE(human_message_event_id,thread_id,input_revision)
+);
+CREATE INDEX IF NOT EXISTS shadow_human_answer_links_thread_idx
+  ON shadow_human_answer_links(thread_id,input_revision,created_at,id);
+CREATE INDEX IF NOT EXISTS shadow_human_answer_links_observation_idx
+  ON shadow_human_answer_links(observation_id,created_at,id);
+
+CREATE TABLE IF NOT EXISTS shadow_learning_reports (
+  id TEXT PRIMARY KEY,
+  trigger_type TEXT NOT NULL CHECK (trigger_type IN ('scheduled','manual')),
+  due_at TEXT NOT NULL,
+  cutoff_at TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('pending','running','completed','failed')),
+  claim_token TEXT,
+  attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+  sample_count INTEGER NOT NULL DEFAULT 0 CHECK (sample_count >= 0),
+  summary_json TEXT,
+  rendered_markdown TEXT,
+  error_message TEXT,
+  started_at TEXT,
+  completed_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS shadow_learning_reports_due_idx
+  ON shadow_learning_reports(status,due_at,id);
+
+CREATE TABLE IF NOT EXISTS shadow_comparisons (
+  id TEXT PRIMARY KEY,
+  report_id TEXT NOT NULL REFERENCES shadow_learning_reports(id) ON DELETE CASCADE,
+  shadow_result_id TEXT REFERENCES shadow_answer_results(id) ON DELETE SET NULL,
+  thread_id TEXT REFERENCES support_threads(id) ON DELETE SET NULL,
+  input_revision INTEGER NOT NULL CHECK (input_revision >= 1),
+  question_snapshot TEXT NOT NULL,
+  shadow_answer_snapshot TEXT NOT NULL,
+  human_answers_json TEXT NOT NULL DEFAULT '[]',
+  human_message_event_ids_json TEXT NOT NULL DEFAULT '[]',
+  comparison_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(report_id,shadow_result_id)
+);
+CREATE INDEX IF NOT EXISTS shadow_comparisons_report_idx
+  ON shadow_comparisons(report_id,created_at,id);
+
+INSERT INTO shadow_learning_reports(
+  id,trigger_type,due_at,cutoff_at,status,claim_token,attempt_count,sample_count,
+  summary_json,rendered_markdown,error_message,started_at,completed_at,created_at,updated_at
+) SELECT
+  '00000000-0000-4000-8000-000000000029','scheduled',
+  '2026-08-20T15:00:00.000Z','2026-08-20T15:00:00.000Z','pending',NULL,0,0,
+  NULL,NULL,NULL,NULL,NULL,'2026-08-19T00:00:00.000Z','2026-08-19T00:00:00.000Z'
+WHERE NOT EXISTS (
+  SELECT 1 FROM shadow_learning_reports
+  WHERE trigger_type='scheduled' AND due_at='2026-08-20T15:00:00.000Z'
+    AND cutoff_at='2026-08-20T15:00:00.000Z'
 );
 
 CREATE TABLE IF NOT EXISTS support_attachments (
@@ -3022,6 +3290,166 @@ function migrateV26ToV27(connection: DatabaseSync): void {
   }
 }
 
+function migrateV27ToV28(connection: DatabaseSync): void {
+  connection.exec("BEGIN IMMEDIATE")
+  try {
+    if (tableExists(connection, "telegram_groups") && !tableColumns(connection, "telegram_groups").has("operation_mode")) {
+      connection.exec("ALTER TABLE telegram_groups ADD COLUMN operation_mode TEXT NOT NULL DEFAULT 'live' CHECK(operation_mode IN ('live','learning'))")
+    }
+    if (tableExists(connection, "support_threads") && !tableColumns(connection, "support_threads").has("answer_operation_mode")) {
+      connection.exec("ALTER TABLE support_threads ADD COLUMN answer_operation_mode TEXT NOT NULL DEFAULT 'live' CHECK(answer_operation_mode IN ('live','learning'))")
+    }
+    connection.exec("UPDATE metadata SET value='28' WHERE key='schema_version'")
+    connection.exec("COMMIT")
+  } catch (error) {
+    try { connection.exec("ROLLBACK") } catch { /* 事务已结束时无需处理。 */ }
+    throw error
+  }
+}
+
+const shadowLearningRequiredColumns: Record<string, string[]> = {
+  shadow_answer_results: [
+    "id", "reply_id", "thread_id", "input_revision", "outcome_status", "decision", "answer", "quote_text",
+    "reason", "confidence", "code_revision", "memory_version_refs_json", "simulated_action", "output_redacted",
+    "error_code", "created_at", "updated_at",
+  ],
+  shadow_human_answer_links: [
+    "id", "observation_id", "human_message_event_id", "thread_id", "input_revision", "shadow_result_id",
+    "match_reason", "match_confidence", "created_at",
+  ],
+  shadow_learning_reports: [
+    "id", "trigger_type", "due_at", "cutoff_at", "status", "claim_token", "attempt_count", "sample_count",
+    "summary_json", "rendered_markdown", "error_message", "started_at", "completed_at", "created_at", "updated_at",
+  ],
+  shadow_comparisons: [
+    "id", "report_id", "shadow_result_id", "thread_id", "input_revision", "question_snapshot",
+    "shadow_answer_snapshot", "human_answers_json", "human_message_event_ids_json", "comparison_json", "created_at",
+  ],
+}
+
+const shadowLearningRequiredForeignKeys: Record<string, Array<[string, string, string]>> = {
+  shadow_answer_results: [
+    ["reply_id", "support_replies", "CASCADE"], ["thread_id", "support_threads", "CASCADE"],
+  ],
+  shadow_human_answer_links: [
+    ["observation_id", "learning_source_observations", "RESTRICT"],
+    ["human_message_event_id", "support_message_events", "RESTRICT"],
+    ["thread_id", "support_threads", "CASCADE"], ["shadow_result_id", "shadow_answer_results", "SET NULL"],
+  ],
+  shadow_learning_reports: [],
+  shadow_comparisons: [
+    ["report_id", "shadow_learning_reports", "CASCADE"], ["shadow_result_id", "shadow_answer_results", "SET NULL"],
+    ["thread_id", "support_threads", "SET NULL"],
+  ],
+}
+
+const shadowLearningRequiredSql = new Map<string, string[]>([
+  ["shadow_answer_results", ["check(outcome_statusin('completed','failed'))", "unique(thread_id,input_revision)"]],
+  ["shadow_human_answer_links", ["check(match_reasonin('direct','split_family'))", "unique(human_message_event_id,thread_id,input_revision)"]],
+  ["shadow_learning_reports", ["check(statusin('pending','running','completed','failed'))"]],
+  ["shadow_comparisons", ["unique(report_id,shadow_result_id)"]],
+])
+
+function assertShadowLearningStructure(connection: DatabaseSync, existingOnly = false): void {
+  const tables = Object.keys(shadowLearningRequiredColumns)
+  const present = tables.filter((table) => tableExists(connection, table))
+  if (!existingOnly && present.length !== tables.length) throw new Error("影子学习结构不完整")
+  for (const table of present) {
+    const columns = tableColumns(connection, table)
+    if (shadowLearningRequiredColumns[table]!.some((column) => !columns.has(column))) {
+      throw new Error(`影子学习结构不兼容：${table} 缺少必需列`)
+    }
+    const foreignKeys = connection.prepare(`PRAGMA foreign_key_list(${table})`).all() as Array<{
+      from: string
+      table: string
+      on_delete: string
+    }>
+    if (shadowLearningRequiredForeignKeys[table]!.some(([from, target, onDelete]) => !foreignKeys.some((key) => (
+      key.from === from && key.table === target && key.on_delete.toUpperCase() === onDelete
+    )))) throw new Error(`影子学习结构不兼容：${table} 外键约束不完整`)
+    const row = connection.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name=?").get(table) as
+      | { sql: string }
+      | undefined
+    const normalized = row?.sql.toLowerCase().replace(/\s+/gu, "") ?? ""
+    if (shadowLearningRequiredSql.get(table)!.some((fragment) => !normalized.includes(fragment))) {
+      throw new Error(`影子学习结构不兼容：${table} CHECK 或唯一约束不完整`)
+    }
+  }
+}
+
+function migrateV28ToV29(connection: DatabaseSync): void {
+  connection.exec("BEGIN IMMEDIATE")
+  try {
+    assertShadowLearningStructure(connection, true)
+    connection.exec(shadowLearningSchema)
+    assertShadowLearningStructure(connection)
+    if (tableExists(connection, "support_thread_notifications") && tableExists(connection, "support_threads")
+      && tableColumns(connection, "support_threads").has("answer_operation_mode")) {
+      connection.exec(`UPDATE support_thread_notifications AS notification
+        SET status='failed',error_message='升级到 v29 时阻止学习模式历史通知出站',updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE status IN ('pending','sending') AND EXISTS (
+          SELECT 1 FROM support_threads thread
+          WHERE thread.id=notification.thread_id AND thread.answer_operation_mode='learning'
+        )`)
+    }
+    connection.exec("UPDATE metadata SET value='29' WHERE key='schema_version'")
+    connection.exec("COMMIT")
+  } catch (error) {
+    try { connection.exec("ROLLBACK") } catch { /* 事务已结束时无需处理。 */ }
+    throw error
+  }
+}
+
+function migrateV29ToV30(connection: DatabaseSync): void {
+  connection.exec("BEGIN IMMEDIATE")
+  try {
+    connection.exec(adminAccessSchema)
+    connection.exec(adminAccessSeedSql)
+    if (tableExists(connection, "admin_chat_sessions")) {
+      const columns = tableColumns(connection, "admin_chat_sessions")
+      if (!columns.has("created_by_user_id")) {
+        connection.exec("ALTER TABLE admin_chat_sessions ADD COLUMN created_by_user_id TEXT REFERENCES admin_users(id) ON DELETE RESTRICT")
+      }
+      connection.exec(`CREATE INDEX IF NOT EXISTS admin_chat_sessions_owner_recent_idx
+        ON admin_chat_sessions(created_by_user_id,updated_at DESC,id DESC)`)
+    }
+    connection.exec("UPDATE metadata SET value='30' WHERE key='schema_version'")
+    connection.exec("COMMIT")
+  } catch (error) {
+    try { connection.exec("ROLLBACK") } catch { /* 事务已结束时无需处理。 */ }
+    throw error
+  }
+}
+
+function migrateV30ToV31(connection: DatabaseSync): void {
+  connection.exec("BEGIN IMMEDIATE")
+  try {
+    connection.exec(`
+      DROP INDEX IF EXISTS admin_role_menus_menu_idx;
+      ALTER TABLE admin_role_menus RENAME TO admin_role_menus_v30;
+      CREATE TABLE admin_role_menus (
+        role_id TEXT NOT NULL REFERENCES admin_roles(id) ON DELETE CASCADE,
+        menu_key TEXT NOT NULL CHECK(menu_key IN (
+          'overview','projects','connections','replies','chat','memories','docs','models','runtime','transfer','settings','access'
+        )),
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(role_id,menu_key)
+      );
+      INSERT INTO admin_role_menus(role_id,menu_key,created_at)
+      SELECT role_id,menu_key,created_at FROM admin_role_menus_v30;
+      DROP TABLE admin_role_menus_v30;
+      CREATE INDEX admin_role_menus_menu_idx ON admin_role_menus(menu_key,role_id);
+      INSERT OR IGNORE INTO admin_role_menus(role_id,menu_key,created_at)
+      VALUES('00000000-0000-4000-8000-000000000100','access',strftime('%Y-%m-%dT%H:%M:%fZ','now'));
+      UPDATE metadata SET value='31' WHERE key='schema_version';
+    `)
+    connection.exec("COMMIT")
+  } catch (error) {
+    try { connection.exec("ROLLBACK") } catch { /* 事务已结束时无需处理。 */ }
+    throw error
+  }
+}
+
 function ensureAdminChatConversationExtensions(connection: DatabaseSync): void {
   connection.exec("DROP INDEX IF EXISTS admin_chat_turns_one_active_idx")
   connection.exec(adminChatConversationExtensionSchema)
@@ -3110,6 +3538,10 @@ export class RuntimeDatabase {
       if (current === 24) { migrateV24ToV25(connection); current = 25 }
       if (current === 25) { migrateV25ToV26(connection); current = 26 }
       if (current === 26) { migrateV26ToV27(connection); current = 27 }
+      if (current === 27) { migrateV27ToV28(connection); current = 28 }
+      if (current === 28) { migrateV28ToV29(connection); current = 29 }
+      if (current === 29) { migrateV29ToV30(connection); current = 30 }
+      if (current === 30) { migrateV30ToV31(connection); current = 31 }
       if (current !== DATABASE_SCHEMA_VERSION) {
         connection.close()
         throw new Error("运行数据库版本不兼容")
@@ -3132,6 +3564,7 @@ export class RuntimeDatabase {
       assertReferenceLearningAuditStructure(connection)
       assertMultiIssueThreadStructure(connection)
       assertSupportSenderFocusStructure(connection)
+      assertShadowLearningStructure(connection)
     } catch (error) {
       connection.close()
       throw error
@@ -3182,6 +3615,10 @@ export class RuntimeDatabase {
       if (current === 24) { migrateV24ToV25(connection); current = 25 }
       if (current === 25) { migrateV25ToV26(connection); current = 26 }
       if (current === 26) { migrateV26ToV27(connection); current = 27 }
+      if (current === 27) { migrateV27ToV28(connection); current = 28 }
+      if (current === 28) { migrateV28ToV29(connection); current = 29 }
+      if (current === 29) { migrateV29ToV30(connection); current = 30 }
+      if (current === 30) { migrateV30ToV31(connection); current = 31 }
       if (current !== DATABASE_SCHEMA_VERSION) {
         connection.close()
         throw new Error("迁移数据库版本不兼容")
@@ -3203,6 +3640,7 @@ export class RuntimeDatabase {
         assertReferenceLearningAuditStructure(connection)
         assertMultiIssueThreadStructure(connection)
         assertSupportSenderFocusStructure(connection)
+        assertShadowLearningStructure(connection)
         assertPortableReferenceLearningGroupTopology(connection)
         ensureV3Columns(connection)
         ensureV3ReplySearch(connection)
@@ -3219,9 +3657,13 @@ export class RuntimeDatabase {
           assertReferenceLearningAuditStructure(connection)
           assertPortableReferenceLearningGroupTopology(connection)
         }
+        if (current === 28 && Object.keys(shadowLearningRequiredColumns).some((table) => tableExists(connection, table))) {
+          assertShadowLearningStructure(connection)
+        }
         if (current >= DATABASE_SCHEMA_VERSION) {
           assertMultiIssueThreadStructure(connection)
           assertSupportSenderFocusStructure(connection)
+          assertShadowLearningStructure(connection)
         }
       } catch (error) {
         connection.close()
@@ -3351,6 +3793,7 @@ export class RuntimeDatabase {
       repositories: jsonArray(row.repositories), branch: row.branch, serverAlias: row.server_alias,
       databaseAlias: row.database_alias, knowledgeScope: row.knowledge_scope, purpose: row.purpose,
       aiModelInstanceId: row.ai_model_instance_id, replyStyle: row.reply_style,
+      operationMode: row.operation_mode,
       createdAt: row.created_at, updatedAt: row.updated_at,
     }))
   }
@@ -3538,11 +3981,12 @@ export class RuntimeDatabase {
 
   insertGroup(group: RuntimeGroup): void {
     this.prepare(`INSERT INTO telegram_groups
-      (id,group_key,name,telegram_chat_id,account_id,project_id,service_id,enabled,access_mode,trigger_mode,platform,repositories,branch,server_alias,database_alias,knowledge_scope,purpose,ai_model_instance_id,reply_style,created_at,updated_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+      (id,group_key,name,telegram_chat_id,account_id,project_id,service_id,enabled,access_mode,trigger_mode,platform,repositories,branch,server_alias,database_alias,knowledge_scope,purpose,ai_model_instance_id,reply_style,operation_mode,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
       group.id, group.key, group.name, group.telegramChatId, group.accountId, group.projectId, group.serviceId, Number(group.enabled), group.accessMode,
       group.triggerMode, group.platform, JSON.stringify(group.repositories), group.branch, group.serverAlias,
-      group.databaseAlias, group.knowledgeScope, group.purpose, group.aiModelInstanceId, group.replyStyle, group.createdAt, group.updatedAt,
+      group.databaseAlias, group.knowledgeScope, group.purpose, group.aiModelInstanceId, group.replyStyle,
+      group.operationMode ?? "live", group.createdAt, group.updatedAt,
     )
   }
 
@@ -3646,6 +4090,10 @@ export class RuntimeDatabase {
     this.prepare("UPDATE metadata SET value='1' WHERE key='allow_maintenance_delete'").run()
     try {
       this.connection.exec(`
+        DELETE FROM shadow_comparisons;
+        DELETE FROM shadow_human_answer_links;
+        DELETE FROM shadow_answer_results;
+        DELETE FROM shadow_learning_reports;
         DELETE FROM telegram_outgoing_candidates;
         DELETE FROM telegram_output_ownership;
         DELETE FROM telegram_offsets;

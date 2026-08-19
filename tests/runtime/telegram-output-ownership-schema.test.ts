@@ -118,7 +118,7 @@ describe("Telegram 输出所有权 v22 能力", () => {
   it("fresh 数据库建立持久 ownership 状态机、反向索引与精确 message-id 唯一约束", async () => {
     const database = await open(await databasePath("fresh.sqlite"))
 
-    expect(database.schemaVersion()).toBe(27)
+    expect(database.schemaVersion()).toBe(29)
     const columns = database.prepare("PRAGMA table_info(telegram_output_ownership)").all() as Array<{
       name: string
       notnull: number
@@ -175,7 +175,7 @@ describe("Telegram 输出所有权 v22 能力", () => {
     databases.splice(databases.indexOf(runtimeV21), 1)
 
     const migrated = await open(runtimePath)
-    expect(migrated.schemaVersion()).toBe(27)
+    expect(migrated.schemaVersion()).toBe(29)
     expect(migrated.prepare("SELECT COUNT(*) AS count FROM telegram_output_ownership").get()).toEqual({ count: 0 })
     expect(migrated.prepare("SELECT COUNT(*) AS count FROM telegram_outgoing_candidates").get()).toEqual({ count: 0 })
 
@@ -191,7 +191,7 @@ describe("Telegram 输出所有权 v22 能力", () => {
 
     const portable = RuntimeDatabase.openPortable(portablePath)
     databases.push(portable)
-    expect(portable.schemaVersion()).toBe(27)
+    expect(portable.schemaVersion()).toBe(29)
     expect(portable.prepare("SELECT COUNT(*) AS count FROM telegram_output_ownership").get()).toEqual({ count: 0 })
     expect(portable.prepare("SELECT COUNT(*) AS count FROM telegram_outgoing_candidates").get()).toEqual({ count: 0 })
   })
@@ -509,7 +509,7 @@ describe("Telegram 输出所有权 v22 能力", () => {
     downgradeTerminalAuditToV22(filePath)
 
     const migrated = await open(filePath)
-    expect(migrated.schemaVersion()).toBe(27)
+    expect(migrated.schemaVersion()).toBe(29)
     expect(migrated.prepare("SELECT delivery_status FROM telegram_output_ownership WHERE id=?").get(ownershipId))
       .toEqual({ delivery_status: "sending" })
     expect(migrated.prepare("SELECT resolution_status FROM telegram_outgoing_candidates WHERE id=?").get(candidateId))
@@ -817,7 +817,7 @@ describe("Telegram 输出所有权 v22 能力", () => {
     const restored = await open(await databasePath(`portable-v${version}-restored.sqlite`))
     await new BackupService(restored).import(portablePath)
 
-    expect(restored.schemaVersion()).toBe(27)
+    expect(restored.schemaVersion()).toBe(29)
     expect(restored.prepare("SELECT COUNT(*) AS count FROM telegram_output_ownership").get()).toEqual({ count: 0 })
     expect(restored.prepare("PRAGMA foreign_key_check").all()).toEqual([])
   })

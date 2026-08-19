@@ -6980,6 +6980,70 @@ a:focus-visible {
 .runtime-settings-form { display: grid; gap: 22px; margin-top: 22px; }
 .runtime-toggle-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
 .runtime-toggle-grid .toggle-row { width: 100%; min-height: 54px; padding: 12px 14px; border: 1px solid var(--border); border-radius: 15px; background: var(--surface-muted); }
+
+.page-heading-row {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.access-panel {
+  display: grid;
+  gap: 0;
+  overflow: hidden;
+  padding: 0;
+}
+
+.access-tabs { width: max-content; max-width: 100%; }
+
+.access-menu-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 9px;
+}
+
+.access-menu-option {
+  display: flex;
+  min-height: 42px;
+  align-items: center;
+  gap: 9px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-muted);
+  padding: 9px 11px;
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.access-menu-option:has(input:checked) { border-color: color-mix(in srgb, var(--accent) 42%, var(--border)); color: var(--text); }
+.access-menu-option input { accent-color: var(--accent); }
+.access-menu-option:has(input:disabled) { cursor: not-allowed; opacity: .72; }
+
+.access-account {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 14px;
+  padding: 17px 20px;
+}
+
+.access-account + .access-account { border-top: 1px solid var(--border); }
+.access-account__icon { display: grid; width: 42px; height: 42px; place-items: center; border-radius: 13px; background: var(--surface-muted); color: var(--accent); }
+.access-account__icon svg { width: 19px; height: 19px; }
+.access-account__copy { min-width: 0; }
+.access-account__heading { display: flex; align-items: center; gap: 8px; }
+.access-account__name { overflow: hidden; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+.access-account__meta { margin: 4px 0 0; color: var(--text-tertiary); font-size: 10px; }
+
+@media (max-width: 700px) {
+  .page-heading-row { align-items: stretch; flex-direction: column; }
+  .page-heading-row > .button { align-self: flex-start; }
+  .access-account { grid-template-columns: 38px minmax(0, 1fr) auto; padding: 15px; }
+  .access-account > .badge { display: none; }
+  .access-account__meta { white-space: normal; }
+  .access-menu-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
 .runtime-settings-form__note { margin: 0; color: var(--text-tertiary); font-size: 12px; }
 
 @media (max-width: 900px) {
@@ -7927,4 +7991,58 @@ a:focus-visible {
     padding-top: 11px;
     padding-bottom: 11px;
   }
+}
+/* 登录页只展示进入控制台所需的信息，不暴露内部权限模型。 */
+.login-screen {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background:
+    radial-gradient(circle at 20% 10%, color-mix(in srgb, var(--accent, #5b5bd6) 14%, transparent), transparent 36%),
+    var(--page, #f5f5f7);
+}
+
+.login-screen[hidden], .app-shell[hidden] { display: none !important; }
+
+.login-card {
+  width: min(100%, 420px);
+  display: grid;
+  gap: 18px;
+  padding: 38px;
+  border: 1px solid var(--border, #d9d9df);
+  border-radius: 24px;
+  background: var(--surface, #fff);
+  box-shadow: 0 24px 80px rgb(0 0 0 / 12%);
+}
+
+.login-card__brand {
+  width: 48px;
+  height: 48px;
+  display: grid;
+  place-items: center;
+  border-radius: 15px;
+  color: white;
+  background: var(--accent, #5b5bd6);
+  font-size: 24px;
+  font-weight: 800;
+}
+
+.login-card__eyebrow {
+  margin: 0 0 -12px;
+  color: var(--accent, #5b5bd6);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+
+.login-card h1 { margin: 0; font-size: clamp(26px, 5vw, 34px); }
+.login-card__description { margin: -10px 0 2px; color: var(--text-secondary, #666); }
+.login-card__error { min-height: 20px; margin: -4px 0; }
+.login-card__submit { width: 100%; justify-content: center; min-height: 44px; }
+
+@media (max-width: 520px) {
+  .login-screen { padding: 14px; }
+  .login-card { padding: 28px 22px; border-radius: 20px; }
 }

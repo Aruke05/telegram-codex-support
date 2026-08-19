@@ -91,6 +91,45 @@ afterEach(async () => {
 })
 
 describe("白名单群批量更新 API", () => {
+  it("原子批量开启客服群学习模式并持久化运行模式", async () => {
+    const { app, database, supportA, supportB } = await createHarness()
+
+    const response = await app.inject({
+      method: "PATCH",
+      url: "/api/telegram/groups",
+      payload: { ids: [supportA.id, supportB.id], patch: { operationMode: "learning" } },
+    })
+
+    expect(response.statusCode).toBe(200)
+    expect(response.json().groups).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: supportA.id, operationMode: "learning" }),
+      expect.objectContaining({ id: supportB.id, operationMode: "learning" }),
+    ]))
+    expect(database.prepare("SELECT id,operation_mode FROM telegram_groups WHERE id IN (?,?) ORDER BY id")
+      .all(supportA.id, supportB.id)).toEqual(expect.arrayContaining([
+      { id: supportA.id, operation_mode: "learning" },
+      { id: supportB.id, operation_mode: "learning" },
+    ]))
+  })
+
+  it("批量学习模式混入技术告警群时整批回滚", async () => {
+    const { app, database, supportA, technical } = await createHarness()
+
+    const response = await app.inject({
+      method: "PATCH",
+      url: "/api/telegram/groups",
+      payload: { ids: [supportA.id, technical.id], patch: { operationMode: "learning" } },
+    })
+
+    expect(response.statusCode).toBe(400)
+    expect(response.json().error).toContain("技术告警群不能开启学习模式")
+    expect(database.prepare("SELECT id,operation_mode FROM telegram_groups WHERE id IN (?,?) ORDER BY id")
+      .all(supportA.id, technical.id)).toEqual(expect.arrayContaining([
+      { id: supportA.id, operation_mode: "live" },
+      { id: technical.id, operation_mode: "live" },
+    ]))
+  })
+
   it("原子批量启停并返回持久化后的群状态", async () => {
     const { app, database, supportA, supportB } = await createHarness()
 
@@ -119,6 +158,27 @@ describe("白名单群批量更新 API", () => {
     expect(disabled.statusCode).toBe(200)
     expect(database.prepare("SELECT enabled FROM telegram_groups WHERE id IN (?,?) ORDER BY id").all(supportA.id, supportB.id))
       .toEqual([{ enabled: 0 }, { enabled: 0 }])
+  })
+
+  it("批量启停不重置未提交的学习模式和回复方式", async () => {
+    const { app, admin, database, supportA } = await createHarness()
+    await admin.updateGroup(supportA.id, { operationMode: "learning", replyStyle: "human" })
+
+    const response = await app.inject({
+      method: "PATCH",
+      url: "/api/telegram/groups",
+      payload: { ids: [supportA.id], patch: { enabled: true } },
+    })
+
+    expect(response.statusCode).toBe(200)
+    expect(response.json().groups[0]).toMatchObject({
+      id: supportA.id,
+      enabled: true,
+      operationMode: "learning",
+      replyStyle: "human",
+    })
+    expect(database.prepare("SELECT enabled,operation_mode,reply_style FROM telegram_groups WHERE id=?").get(supportA.id))
+      .toEqual({ enabled: 1, operation_mode: "learning", reply_style: "human" })
   })
 
   it("批量修改接入和回复方式但保留归属用途模型与触发规则", async () => {

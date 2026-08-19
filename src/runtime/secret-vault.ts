@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto"
+import { createCipheriv, createDecipheriv, createHmac, randomBytes } from "node:crypto"
 import { mkdir, readFile, writeFile } from "node:fs/promises"
 import path from "node:path"
 
@@ -65,5 +65,9 @@ export class LocalSecretVault {
       if (error instanceof Error && error.message === "本机敏感配置无法解密") throw error
       throw new Error("本机敏感配置格式错误")
     }
+  }
+
+  mac(scope: string, value: string): Buffer {
+    return createHmac("sha256", this.key).update(scope, "utf8").update("\0", "utf8").update(value, "utf8").digest()
   }
 }

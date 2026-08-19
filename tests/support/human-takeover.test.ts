@@ -350,6 +350,213 @@ function createWorker(harness: BaseHarness, input: {
 }
 
 describe("人工接管与发送边界", () => {
+  it("学习线程固定使用创建时模式并只保存影子回答", async () => {
+    const harness = await createBaseHarness()
+    harness.database.prepare("UPDATE telegram_groups SET operation_mode='learning' WHERE id=?")
+      .run(harness.group.id)
+    const { thread } = createQuestion(harness, "shadow-101", "这笔订单为什么一直处理中")
+    expect(thread.answerOperationMode).toBe("learning")
+
+    harness.database.prepare("UPDATE telegram_groups SET operation_mode='live' WHERE id=?")
+      .run(harness.group.id)
+    const snapshot = seedCodeSnapshot(harness)
+    const sendMessage = vi.fn(async () => "must-not-send")
+    const sendSupportAlert = vi.fn(async () => ({ status: "sent" as const, summary: "sent", errorType: null }))
+    const worker = createWorker(harness, {
+      readCurrentSnapshot: () => snapshot,
+      decision: answerDecision(),
+      sendMessage,
+      sendSupportAlert,
+    })
+
+    await worker.runDueOnce(new Date())
+
+    expect(sendMessage).not.toHaveBeenCalled()
+    expect(sendSupportAlert).not.toHaveBeenCalled()
+    const result = harness.database.prepare(`SELECT outcome_status,decision,answer,simulated_action
+      FROM shadow_answer_results WHERE thread_id=? AND input_revision=?`).get(thread.id, thread.revision)
+    expect(result).toEqual({
+      outcome_status: "completed",
+      decision: "reply",
+      answer: answerDecision().answer,
+      simulated_action: "reply",
+    })
+    const reply = harness.database.readReplies("WHERE r.thread_id=?", [thread.id])[0]
+    expect(reply).toMatchObject({ status: "ignored", operatorDeliveryStatus: null })
+    expect(harness.database.prepare("SELECT COUNT(*) AS count FROM telegram_output_ownership WHERE thread_id=?")
+      .get(thread.id)).toEqual({ count: 0 })
+    expect(harness.store.getThread(thread.id).status).toBe("answered")
+  })
+
+  it("学习线程模拟技术升级但不发送运营回复或技术告警", async () => {
+    const harness = await createBaseHarness()
+    harness.database.prepare("UPDATE telegram_groups SET operation_mode='learning' WHERE id=?")
+      .run(harness.group.id)
+    const { thread } = createQuestion(harness, "shadow-102", "这个映射缺失帮忙处理")
+    const snapshot = seedCodeSnapshot(harness)
+    const sendMessage = vi.fn(async () => "must-not-send")
+    const sendSupportAlert = vi.fn(async () => ({ status: "sent" as const, summary: "sent", errorType: null }))
+    const worker = createWorker(harness, {
+      readCurrentSnapshot: () => snapshot,
+      decision: escalationDecision(),
+      sendMessage,
+      sendSupportAlert,
+    })
+
+    await worker.runDueOnce(new Date())
+
+    expect(sendMessage).not.toHaveBeenCalled()
+    expect(sendSupportAlert).not.toHaveBeenCalled()
+    expect(harness.database.prepare(`SELECT outcome_status,decision,answer,simulated_action
+      FROM shadow_answer_results WHERE thread_id=?`).get(thread.id)).toEqual({
+      outcome_status: "completed",
+      decision: "escalate",
+      answer: escalationDecision().answer,
+      simulated_action: "technical_alert_and_reply",
+    })
+    expect(harness.database.prepare("SELECT COUNT(*) AS count FROM support_reply_alert_deliveries")
+      .get()).toEqual({ count: 0 })
+  })
+
+  it("学习线程不创建或发送进度与超时通知", async () => {
+    const harness = await createBaseHarness()
+    harness.database.prepare("UPDATE telegram_groups SET operation_mode='learning' WHERE id=?")
+      .run(harness.group.id)
+    const { thread } = createQuestion(harness, "shadow-103", "帮忙查一下订单")
+    const now = new Date().toISOString()
+    harness.store.claimDue(now, 0)
+    const sendMessage = vi.fn(async () => "must-not-send")
+    const cancellation = { cancel: vi.fn(() => false), cancelClosed: vi.fn(() => 0) }
+    const deadline = new SupportDeadlineService({
+      database: harness.database,
+      store: harness.store,
+      redactor: harness.redactor,
+      cancellation,
+      transport: { sendMessage },
+    })
+
+    await deadline.runOnce(new Date(now))
+    harness.database.prepare("UPDATE support_threads SET hard_deadline_at=? WHERE id=?")
+      .run(now, thread.id)
+    await deadline.runOnce(new Date(now))
+
+    expect(sendMessage).not.toHaveBeenCalled()
+    expect(harness.database.prepare("SELECT COUNT(*) AS count FROM support_thread_notifications WHERE thread_id=?")
+      .get(thread.id)).toEqual({ count: 0 })
+    expect(harness.database.prepare("SELECT COUNT(*) AS count FROM telegram_output_ownership WHERE thread_id=?")
+      .get(thread.id)).toEqual({ count: 0 })
+  })
+
+  it("学习线程会终止升级前遗留的待发送超时通知", async () => {
+    const harness = await createBaseHarness()
+    harness.database.prepare("UPDATE telegram_groups SET operation_mode='learning' WHERE id=?")
+      .run(harness.group.id)
+    const { thread } = createQuestion(harness, "shadow-timeout-legacy", "帮忙查一下订单")
+    const timestamp = new Date().toISOString()
+    harness.database.prepare(`INSERT INTO support_thread_notifications(
+      id,thread_id,input_revision,kind,status,due_at,telegram_message_id,error_message,created_at,updated_at
+    ) VALUES (?,?,?,?,?,?,?,?,?,?)`).run(
+      randomUUID(), thread.id, thread.revision, "timeout_operator", "pending", timestamp,
+      null, null, timestamp, timestamp,
+    )
+    const sendMessage = vi.fn(async () => "must-not-send")
+    const deadline = new SupportDeadlineService({
+      database: harness.database,
+      store: harness.store,
+      redactor: harness.redactor,
+      cancellation: { cancel: () => false, cancelClosed: () => 0 },
+      transport: { sendMessage },
+    })
+
+    await deadline.runOnce(new Date(timestamp))
+
+    expect(sendMessage).not.toHaveBeenCalled()
+    expect(harness.database.prepare("SELECT status,error_message FROM support_thread_notifications").get())
+      .toEqual({ status: "failed", error_message: "学习模式禁止 Telegram 输出" })
+  })
+
+  it("学习线程会收口升级前准备好的技术升级且不发送任何消息", async () => {
+    const harness = await createBaseHarness()
+    harness.database.prepare("UPDATE telegram_groups SET operation_mode='learning' WHERE id=?")
+      .run(harness.group.id)
+    const { thread } = createQuestion(harness, "shadow-prepared-legacy", "这个映射缺失帮忙处理")
+    const claimed = harness.store.claimDue(new Date().toISOString())!
+    const reply = seedGeneratingReply(harness, claimed.thread)
+    expect(harness.replies.prepareTechnicalEscalation(reply.id, {
+      answer: "已经通知技术处理",
+      decisionReason: "[已确认技术处理] 技术告警：发送中",
+      decisionConfidence: 1,
+    })).not.toBeNull()
+    harness.store.retryGeneration(thread.id, thread.revision)
+    const sendMessage = vi.fn(async () => "must-not-send")
+    const sendSupportAlert = vi.fn(async () => ({ status: "sent" as const, summary: "sent", errorType: null }))
+    const worker = createWorker(harness, {
+      readCurrentSnapshot: () => seedCodeSnapshot(harness), sendMessage, sendSupportAlert,
+    })
+
+    await worker.runDueOnce(new Date(Date.now() + 1_000))
+
+    expect(sendMessage).not.toHaveBeenCalled()
+    expect(sendSupportAlert).not.toHaveBeenCalled()
+    expect(harness.replies.getDetail(reply.id)).toMatchObject({
+      status: "failed", errorCode: "shadow_legacy_delivery_suppressed",
+    })
+    expect(harness.database.prepare("SELECT error_code FROM shadow_answer_results WHERE reply_id=?").get(reply.id))
+      .toEqual({ error_code: "shadow_legacy_delivery_suppressed" })
+  })
+
+  it("学习线程的代码快照失败只记录影子失败且不通知技术群", async () => {
+    const harness = await createBaseHarness()
+    harness.database.prepare("UPDATE telegram_groups SET operation_mode='learning' WHERE id=?")
+      .run(harness.group.id)
+    const { thread } = createQuestion(harness, "shadow-104", "帮忙查一下订单")
+    const sendMessage = vi.fn(async () => "must-not-send")
+    const sendCodeSyncFailure = vi.fn(async () => ({ status: "sent" as const, summary: "sent", errorType: null }))
+    const worker = createWorker(harness, {
+      readCurrentSnapshot: () => { throw new ProjectCodeSyncUnavailableError(randomUUID(), codeSyncFailure()) },
+      sendMessage,
+      sendCodeSyncFailure,
+    })
+
+    await worker.runDueOnce(new Date())
+
+    expect(sendMessage).not.toHaveBeenCalled()
+    expect(sendCodeSyncFailure).not.toHaveBeenCalled()
+    expect(harness.database.prepare(`SELECT outcome_status,error_code,simulated_action
+      FROM shadow_answer_results WHERE thread_id=?`).get(thread.id)).toEqual({
+      outcome_status: "failed",
+      error_code: "investigation_runtime_failure",
+      simulated_action: "none",
+    })
+  })
+
+  it("学习线程的回答模型失败只记录影子失败且不发送任何消息", async () => {
+    const harness = await createBaseHarness()
+    harness.database.prepare("UPDATE telegram_groups SET operation_mode='learning' WHERE id=?")
+      .run(harness.group.id)
+    const { thread } = createQuestion(harness, "shadow-105", "帮忙查一下订单")
+    const snapshot = seedCodeSnapshot(harness)
+    const sendMessage = vi.fn(async () => "must-not-send")
+    const sendSupportAlert = vi.fn(async () => ({ status: "sent" as const, summary: "sent", errorType: null }))
+    const worker = createWorker(harness, {
+      readCurrentSnapshot: () => snapshot,
+      decision: async () => { throw new Error("model unavailable") },
+      sendMessage,
+      sendSupportAlert,
+    })
+
+    await worker.runDueOnce(new Date())
+
+    expect(sendMessage).not.toHaveBeenCalled()
+    expect(sendSupportAlert).not.toHaveBeenCalled()
+    expect(harness.database.prepare(`SELECT outcome_status,error_code,simulated_action
+      FROM shadow_answer_results WHERE thread_id=?`).get(thread.id)).toEqual({
+      outcome_status: "failed",
+      error_code: "answer_model_failed",
+      simulated_action: "none",
+    })
+  })
+
   it("收集期催促进度回复独立持久化且不改变原线程版本和计时", async () => {
     const harness = await createBaseHarness()
     const { event, thread } = createQuestion(harness, "9001", "帮我查这笔订单")
@@ -928,6 +1135,34 @@ describe("人工接管与发送边界", () => {
       expect.objectContaining({ status: "failed", errorCode: "structured_output_invalid" }),
       expect.objectContaining({ status: "replied", errorCode: null }),
     ])
+  })
+
+  it("学习线程的结构化输出错误同样自动重试一次再保存影子结果", async () => {
+    const harness = await createBaseHarness()
+    harness.database.prepare("UPDATE telegram_groups SET operation_mode='learning' WHERE id=?")
+      .run(harness.group.id)
+    const { thread } = createQuestion(harness, "shadow-structured", "帮我查这笔初始化订单")
+    const snapshot = seedCodeSnapshot(harness)
+    const sendMessage = vi.fn(async () => "must-not-send")
+    let attempts = 0
+    const worker = createWorker(harness, {
+      readCurrentSnapshot: () => snapshot,
+      decision: async () => {
+        attempts += 1
+        if (attempts === 1) throw new ModelExecutionError("structured_output_invalid", "answerClaims 字段无效")
+        return answerDecision()
+      },
+      sendMessage,
+    })
+
+    await worker.runDueOnce(new Date())
+    expect(harness.store.getThread(thread.id).status).toBe("collecting")
+    await worker.runDueOnce(new Date(Date.now() + 1_000))
+
+    expect(attempts).toBe(2)
+    expect(sendMessage).not.toHaveBeenCalled()
+    expect(harness.database.prepare("SELECT outcome_status FROM shadow_answer_results WHERE thread_id=?").get(thread.id))
+      .toEqual({ outcome_status: "completed" })
   })
 
   it("回答 prompt 使用规范化副本而事件与 question_fragment 保留原始空白", async () => {

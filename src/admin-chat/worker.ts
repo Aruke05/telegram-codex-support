@@ -357,10 +357,12 @@ export class AdminChatWorker {
   }
 
   private publish(turn: AdminChatTurn): void {
+    const session = this.deps.store.getSession(turn.sessionId).session
     this.deps.events.publish({
       kind: "admin-chat-turn",
       id: turn.id,
       sessionId: turn.sessionId,
+      ownerUserId: session.createdByUserId,
       status: turn.status,
       updatedAt: turn.updatedAt,
     })

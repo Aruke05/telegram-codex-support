@@ -13,9 +13,10 @@ import type {
   MemoryStatus,
   MemoryView,
   OperatorStyleVersion,
+  ShadowLearningReport,
 } from "../types.js"
 
-type MemoryTab = MemoryStatus | "observations" | "styles" | "directives"
+type MemoryTab = MemoryStatus | "observations" | "styles" | "directives" | "reports"
 type Notify = (message: string) => void
 
 const labels: Record<MemoryTab, string> = {
@@ -27,6 +28,19 @@ const labels: Record<MemoryTab, string> = {
   observations: "学习观察",
   styles: "风格版本",
   directives: "固定规则",
+  reports: "学习报告",
+}
+
+function reportCard(report: ShadowLearningReport): HTMLElement {
+  const row = element("article", "memory-card")
+  const title = element("div", "memory-card__title-row")
+  title.append(element("h3", "memory-card__title", report.triggerType === "scheduled" ? "首份学习报告" : "手动学习报告"),
+    badge(report.status === "completed" ? "已完成" : report.status === "failed" ? "失败" : report.status === "running" ? "生成中" : "等待生成",
+      report.status === "completed" ? "success" : report.status === "failed" ? "danger" : "warning"))
+  row.append(title, element("p", "memory-card__content", `截止 ${formatDateTime(report.cutoffAt)} · ${report.sampleCount} 个拆分问题`))
+  if (report.renderedMarkdown) row.append(element("pre", "memory-card__content", report.renderedMarkdown))
+  if (report.errorMessage) row.append(element("p", "form-error", report.errorMessage))
+  return row
 }
 
 function memoryStatus(memory: MemoryView): ReturnType<typeof badge> {
@@ -372,7 +386,7 @@ export function renderMemories(container: HTMLElement, notify: Notify, onChanged
 
   const renderTabs = () => {
     tabs.replaceChildren()
-    ;(["active", "candidate", "conflict", "superseded", "disabled", "observations", "styles", "directives"] as MemoryTab[]).forEach((value) => {
+    ;(["active", "candidate", "conflict", "superseded", "disabled", "observations", "reports", "styles", "directives"] as MemoryTab[]).forEach((value) => {
       const button = element("button", `segmented__item${active === value ? " is-active" : ""}`, labels[value])
       button.type = "button"; button.setAttribute("aria-pressed", String(active === value))
       button.addEventListener("click", () => { active = value; renderTabs(); void refresh() })
@@ -381,14 +395,18 @@ export function renderMemories(container: HTMLElement, notify: Notify, onChanged
   }
   const refresh = async () => {
     replaceChildren(list, loadingState(4))
-    searchWrap.hidden = active === "observations" || active === "styles" || active === "directives"
+    searchWrap.hidden = active === "observations" || active === "reports" || active === "styles" || active === "directives"
     add.hidden = active === "observations" || active === "styles"
+    add.textContent = active === "reports" ? "立即生成报告" : "新增记忆"
     if (active === "directives") {
       const result = await api.getDirectives()
       replaceChildren(list, ...(result.directives.length ? result.directives.map((item) => directiveRow(item, notify, refresh)) : [emptyState("还没有固定规则", "安全边界和必须遵守的规则放在这里。", "shield")]))
     } else if (active === "observations") {
       const result = await api.getLearningObservations({ limit: 200 })
       replaceChildren(list, ...(result.items.length ? result.items.map(observationCard) : [emptyState("还没有学习观察", "授权来源的回复只会显示分类、关联和学习结果。", "memory")]))
+    } else if (active === "reports") {
+      const result = await api.getLearningReports()
+      replaceChildren(list, ...(result.items.length ? result.items.map(reportCard) : [emptyState("还没有学习报告", "首份报告将在 2026-08-20 23:00 自动生成，也可以通过接口手动生成。", "memory")]))
     } else if (active === "styles") {
       const result = await api.getOperatorStyleVersions()
       replaceChildren(list, ...(result.items.length ? result.items.map(styleVersionCard) : [emptyState("当前使用基线风格", "形成足够、有效的授权样本后会生成候选风格版本。", "sparkles")]))
@@ -400,7 +418,18 @@ export function renderMemories(container: HTMLElement, notify: Notify, onChanged
   }
   let timer = 0
   search.addEventListener("input", () => { window.clearTimeout(timer); timer = window.setTimeout(() => { void refresh() }, 250) })
-  add.addEventListener("click", () => addMemoryDialog(active, notify, refresh))
+  add.addEventListener("click", () => {
+    if (active !== "reports") {
+      addMemoryDialog(active, notify, refresh)
+      return
+    }
+    setButtonBusy(add, true)
+    void api.createLearningReport().then(async () => {
+      notify("学习报告已生成，不会自动更新记忆或回复规则")
+      await refresh()
+    }).catch((error: unknown) => notify(error instanceof Error ? error.message : "报告生成失败"))
+      .finally(() => setButtonBusy(add, false))
+  })
   renderTabs()
   void refresh().catch((error: unknown) => replaceChildren(list, emptyState("加载失败", error instanceof Error ? error.message : "请稍后重试", "refresh")))
 }

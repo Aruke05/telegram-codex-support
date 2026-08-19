@@ -84,7 +84,7 @@ export type SupportThreadCoordinatorDependencies = {
   }): Promise<{ replyId: string | null }>
   correct?(input: CorrectionInput): Promise<void>
   alert?(group: RuntimeGroup, reason: string, event: SupportMessageEvent): Promise<void>
-  learningSourceObserver?: Pick<LearningSourceObserver, "observe">
+  learningSourceObserver?: Pick<LearningSourceObserver, "observe" | "reconcilePending">
   sendPresenceReply?(input: {
     group: RuntimeGroup
     event: SupportMessageEvent
@@ -328,6 +328,7 @@ export class SupportThreadCoordinator {
   }
 
   recover(): number {
+    this.deps.learningSourceObserver?.reconcilePending()
     const recovered = this.deps.store.listUnroutedEvents()
     const batches = new Map<string, Omit<PendingBatch, "timer">>()
     const unassigned = new Map<string, { id: string; latestAt: number }>()
@@ -435,7 +436,9 @@ export class SupportThreadCoordinator {
     this.activeBatches.set(batch.id, batch)
     const groupId = batch.group.id
     const previous = this.routeChains.get(groupId) ?? Promise.resolve()
-    const current = previous.catch(() => undefined).then(() => this.routeBatch(batch))
+    const current = previous.catch(() => undefined).then(() => this.routeBatch(batch)).finally(() => {
+      this.deps.learningSourceObserver?.reconcilePending()
+    })
     this.routeChains.set(groupId, current)
     this.track(current.finally(() => {
       this.inFlightBatches.delete(batch.id)
@@ -501,7 +504,7 @@ export class SupportThreadCoordinator {
     const group = this.deps.database.readGroups().find((candidate) => (
       candidate.id === current.groupId && candidate.enabled && candidate.purpose === "support" && candidate.telegramChatId
     ))
-    if (!group || !this.deps.sendPresenceReply) {
+    if (!group || group.operationMode === "learning" || !this.deps.sendPresenceReply) {
       this.deps.store.updateEventRoute(current.id, "ignored", "在线确认快捷回复发送条件不可用")
       return
     }
@@ -738,7 +741,8 @@ export class SupportThreadCoordinator {
         this.deps.wake()
         return
       }
-      if (decision.action === "uncertain" && decision.clarificationReply && this.deps.sendRouteClarification) {
+      if (decision.action === "uncertain" && decision.clarificationReply
+        && batch.group.operationMode !== "learning" && this.deps.sendRouteClarification) {
         try {
           const sent = await this.deps.sendRouteClarification({
             group: batch.group, service: batch.service, event: latestEvent, clarification: pending,
@@ -820,7 +824,7 @@ export class SupportThreadCoordinator {
         })),
         createdAt: latestEvent.createdAt,
       })
-      if (this.deps.sendRouteClarification) {
+      if (batch.group.operationMode !== "learning" && this.deps.sendRouteClarification) {
         try {
           const sent = await this.deps.sendRouteClarification({
             group: batch.group, service: batch.service, event: latestEvent, clarification,
@@ -1026,7 +1030,7 @@ export class SupportThreadCoordinator {
     const latestEvent = events.at(-1)!
     let reason = "仅询问当前排查进度，不改变排查输入"
     try {
-      if (text && this.deps.sendStatusUpdate) {
+      if (thread.answerOperationMode !== "learning" && text && this.deps.sendStatusUpdate) {
         await this.deps.sendStatusUpdate({
           group: batch.group,
           service: batch.service,

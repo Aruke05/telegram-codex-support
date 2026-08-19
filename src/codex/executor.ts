@@ -13,7 +13,7 @@ import { ModelGateway } from "../models/model-gateway.js"
 import type { ModelImageInput } from "../models/types.js"
 import { ReadonlyAgentToolBroker } from "../diagnostics/readonly-agent-tool-broker.js"
 
-export type CodexAccessMode = "read-only" | "diagnostic" | "reference-classifier"
+export type CodexAccessMode = "read-only" | "diagnostic" | "reference-classifier" | "shadow-report"
 
 export type CodexInvocation = {
   cwd: string
@@ -71,6 +71,7 @@ export type CodexCommandRunner = {
 type ProcessResult = { code: number; stdout: string; stderr: string }
 
 const REFERENCE_CLASSIFIER_PROFILE = "reference-classifier"
+const SHADOW_REPORT_PROFILE = "shadow-report"
 const REFERENCE_CLASSIFIER_DISABLED_FEATURES = [
   "apps",
   "browser_use",
@@ -230,6 +231,22 @@ function referenceClassifierConfig(readableRoots: string[]): string[] {
   ]
 }
 
+function shadowReportConfig(cwd: string): string[] {
+  const filesystem = [
+    [":root", "deny"],
+    [":minimal", "read"],
+    [":tmpdir", "deny"],
+    ...(process.platform === "win32" ? [] : [[":slash_tmp", "deny"]]),
+    [cwd, "read"],
+  ].map(([key, access]) => `${JSON.stringify(key)}=${JSON.stringify(access)}`).join(",")
+  return [
+    `default_permissions=${JSON.stringify(SHADOW_REPORT_PROFILE)}`,
+    `permissions.${SHADOW_REPORT_PROFILE}.filesystem={${filesystem}}`,
+    `permissions.${SHADOW_REPORT_PROFILE}.network.enabled=false`,
+    "web_search=\"disabled\"",
+  ]
+}
+
 function runProcess(
   command: string,
   args: string[],
@@ -367,24 +384,29 @@ export async function verifyReferenceClassifierSandboxCapabilities(
 export function buildCodexArgs(invocation: CodexInvocation, schemaFile: string, outputFile: string): string[] {
   const diagnostic = invocation.accessMode === "diagnostic"
   const referenceClassifier = invocation.accessMode === "reference-classifier"
+  const shadowReport = invocation.accessMode === "shadow-report"
+  const strictProfile = referenceClassifier || shadowReport
   const commandPath = process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
   return [
     "--ask-for-approval", "never", "exec", "--ephemeral", "--skip-git-repo-check",
-    ...(referenceClassifier ? ["--strict-config"] : []),
+    ...(strictProfile ? ["--strict-config"] : []),
     "--json",
-    ...(referenceClassifier ? [] : ["--sandbox", diagnostic ? "danger-full-access" : "read-only"]),
+    ...(strictProfile ? [] : ["--sandbox", diagnostic ? "danger-full-access" : "read-only"]),
     "--ignore-user-config", "--ignore-rules",
-    ...(referenceClassifier
+    ...(strictProfile
       ? REFERENCE_CLASSIFIER_DISABLED_FEATURES.flatMap((feature) => ["--disable", feature])
       : []),
     ...(referenceClassifier
       ? referenceClassifierConfig(invocation.readableRoots ?? []).flatMap((override) => ["-c", override])
       : []),
+    ...(shadowReport
+      ? shadowReportConfig(invocation.cwd).flatMap((override) => ["-c", override])
+      : []),
     "-c", "shell_environment_policy.inherit=\"none\"",
     "-c", "shell_environment_policy.ignore_default_excludes=false",
     "-c", `shell_environment_policy.set.PATH=${JSON.stringify(commandPath)}`,
     "-c", `shell_environment_policy.set.HOME=${JSON.stringify(invocation.cwd)}`,
-    ...(referenceClassifier ? [] : (invocation.imagePaths ?? []).flatMap((imagePath) => ["--image", imagePath])),
+    ...(strictProfile ? [] : (invocation.imagePaths ?? []).flatMap((imagePath) => ["--image", imagePath])),
     "--output-schema", schemaFile, "--output-last-message", outputFile, "-C", invocation.cwd, "-m", invocation.model,
     "-c", `model_reasoning_effort=${JSON.stringify(invocation.reasoningEffort)}`,
     ...(invocation.serviceTier === "fast" ? ["-c", "service_tier=\"fast\""] : []),

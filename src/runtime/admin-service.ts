@@ -64,6 +64,7 @@ const groupInputFields = {
   purpose: z.enum(["support", "technical_alert"]).default("support"),
   aiModelInstanceId: z.string().uuid().nullable().default(null),
   replyStyle: z.enum(["human", "unrestricted"]).default("unrestricted"),
+  operationMode: z.enum(["live", "learning"]).default("live"),
 } as const
 
 function validateGroupInput(
@@ -80,6 +81,7 @@ function validateGroupInput(
   if (group.purpose === "support" && (!group.projectId || !group.serviceId)) context.addIssue({ code: "custom", path: ["serviceId"], message: "客服群必须绑定项目和服务" })
   if (group.purpose === "technical_alert" && (group.projectId || group.serviceId)) context.addIssue({ code: "custom", path: ["serviceId"], message: "技术告警群不绑定固定服务" })
   if (group.purpose === "support" && group.aiModelInstanceId) context.addIssue({ code: "custom", path: ["aiModelInstanceId"], message: "客服群使用回答模型配置" })
+  if (group.purpose === "technical_alert" && group.operationMode === "learning") context.addIssue({ code: "custom", path: ["operationMode"], message: "技术告警群不能开启学习模式" })
 }
 
 const createGroupSchema = z.object(groupInputFields).strict().superRefine(validateGroupInput)
@@ -106,13 +108,15 @@ const updateGroupSchema = z.object({
   purpose: z.enum(["support", "technical_alert"]).optional(),
   aiModelInstanceId: z.string().uuid().nullable().optional(),
   replyStyle: z.enum(["human", "unrestricted"]).optional(),
+  operationMode: z.enum(["live", "learning"]).optional(),
 }).strict()
 
 const batchGroupPatchSchema = z.object({
   enabled: groupInputFields.enabled.optional(),
   accessMode: groupInputFields.accessMode.optional(),
   accountId: z.string().uuid().optional(),
-  replyStyle: groupInputFields.replyStyle.optional(),
+  replyStyle: z.enum(["human", "unrestricted"]).optional(),
+  operationMode: z.enum(["live", "learning"]).optional(),
 }).strict().refine((patch) => Object.keys(patch).length > 0, "至少选择一项批量修改")
 
 const batchGroupUpdateSchema = z.object({
@@ -165,6 +169,7 @@ const safeBatchGroupErrors = new Set([
   "客服群必须判断每条文字",
   "技术告警群不处理群内消息",
   "只能配置一个技术告警群",
+  "技术告警群不能开启学习模式",
   "配置包含敏感信息",
 ])
 
@@ -209,6 +214,7 @@ export class RuntimeAdminService {
       purpose: "support",
       aiModelInstanceId: null,
       replyStyle: "unrestricted",
+      operationMode: "live",
       createdAt: now,
       updatedAt: now,
     }))
@@ -232,6 +238,7 @@ export class RuntimeAdminService {
       purpose: "technical_alert",
       aiModelInstanceId: "00000000-0000-4000-8000-000000000001",
       replyStyle: "unrestricted",
+      operationMode: "live",
       createdAt: now,
       updatedAt: now,
     })
@@ -394,8 +401,9 @@ export class RuntimeAdminService {
     })
     this.database.transaction(() => updated.forEach((group) => {
       this.database.prepare(`UPDATE telegram_groups SET
-        enabled=?,access_mode=?,account_id=?,reply_style=?,updated_at=? WHERE id=?`).run(
-        Number(group.enabled), group.accessMode, group.accountId, group.replyStyle, group.updatedAt, group.id,
+        enabled=?,access_mode=?,account_id=?,reply_style=?,operation_mode=?,updated_at=? WHERE id=?`).run(
+        Number(group.enabled), group.accessMode, group.accountId, group.replyStyle,
+        group.operationMode ?? "live", group.updatedAt, group.id,
       )
     }))
     return updated.map((group) => this.publicGroup(group))
@@ -425,6 +433,7 @@ export class RuntimeAdminService {
       purpose: parsed.purpose ?? found.purpose,
       aiModelInstanceId: parsed.aiModelInstanceId === undefined ? found.aiModelInstanceId : parsed.aiModelInstanceId,
       replyStyle: parsed.replyStyle ?? found.replyStyle,
+      operationMode: parsed.operationMode ?? found.operationMode ?? "live",
     })
     assertConfigurationSafe([merged.key, merged.name, merged.platform, merged.branch, merged.serverAlias, merged.databaseAlias, merged.knowledgeScope])
     this.validateGroupAccount(merged.accountId, merged.accessMode, merged.enabled)
@@ -436,10 +445,11 @@ export class RuntimeAdminService {
 
   private updateGroupRow(updated: RuntimeGroup): void {
     this.database.prepare(`UPDATE telegram_groups SET
-      group_key=?,name=?,telegram_chat_id=?,account_id=?,project_id=?,service_id=?,enabled=?,access_mode=?,trigger_mode=?,platform=?,repositories=?,branch=?,server_alias=?,database_alias=?,knowledge_scope=?,purpose=?,ai_model_instance_id=?,reply_style=?,updated_at=? WHERE id=?`).run(
+      group_key=?,name=?,telegram_chat_id=?,account_id=?,project_id=?,service_id=?,enabled=?,access_mode=?,trigger_mode=?,platform=?,repositories=?,branch=?,server_alias=?,database_alias=?,knowledge_scope=?,purpose=?,ai_model_instance_id=?,reply_style=?,operation_mode=?,updated_at=? WHERE id=?`).run(
       updated.key, updated.name, updated.telegramChatId, updated.accountId, updated.projectId, updated.serviceId, Number(updated.enabled), updated.accessMode,
       updated.triggerMode, updated.platform, JSON.stringify(updated.repositories), updated.branch, updated.serverAlias,
-      updated.databaseAlias, updated.knowledgeScope, updated.purpose, updated.aiModelInstanceId, updated.replyStyle, updated.updatedAt, updated.id,
+      updated.databaseAlias, updated.knowledgeScope, updated.purpose, updated.aiModelInstanceId, updated.replyStyle,
+      updated.operationMode ?? "live", updated.updatedAt, updated.id,
     )
   }
 

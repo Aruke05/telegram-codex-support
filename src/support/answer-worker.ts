@@ -28,6 +28,7 @@ import { routeSupportMessage } from "./routing.js"
 import type { TechnicalAlertDelivery, TechnicalAlertService } from "./technical-alert-service.js"
 import type { SupportThreadStore } from "./thread-store.js"
 import type { TrustedDatabaseQueryRequest } from "./trusted-command-observation.js"
+import { ShadowLearningStore } from "./shadow-learning-store.js"
 
 type CodeSyncPort = {
   readCurrentSnapshot(serviceId: string): ProjectCodeSnapshot
@@ -92,6 +93,7 @@ function deliveryState(error: unknown): "failed" | "uncertain" {
 export class SupportAnswerWorker {
   readonly replies: ReplyService
   private readonly investigation: SupportInvestigationService
+  private readonly shadowLearning: ShadowLearningStore
   private readonly active = new Set<Promise<void>>()
   private readonly controllers = new Map<string, AbortController>()
   private readonly processingWaiters: Array<{ maximum: number; resume: () => void }> = []
@@ -104,6 +106,7 @@ export class SupportAnswerWorker {
   constructor(private readonly deps: SupportAnswerWorkerDependencies) {
     this.replies = deps.replies
     this.investigation = new SupportInvestigationService(deps)
+    this.shadowLearning = new ShadowLearningStore(deps.database)
   }
 
   start(): void {
@@ -202,6 +205,24 @@ export class SupportAnswerWorker {
     }
     const preparedEscalation = this.deps.replies.findPreparedTechnicalEscalation(thread.id, inputRevision)
     if (preparedEscalation) {
+      if (thread.answerOperationMode === "learning") {
+        this.deps.database.transaction(() => {
+          this.shadowLearning.fail({
+            replyId: preparedEscalation.id,
+            threadId: thread.id,
+            inputRevision,
+            errorCode: "shadow_legacy_delivery_suppressed",
+            reason: "学习模式已阻止历史技术升级与运营回复投递",
+            codeRevision: preparedEscalation.codeRevision,
+          })
+          this.deps.replies.transition(preparedEscalation.id, "failed", {
+            errorCode: "shadow_legacy_delivery_suppressed",
+            decisionReason: "学习模式已阻止历史技术升级与运营回复投递",
+          })
+          this.deps.store.finishGeneration(thread.id, inputRevision, "closed")
+        })
+        return
+      }
       await this.resumePreparedTechnicalEscalation(preparedEscalation.id, thread, inputRevision, group)
       return
     }
@@ -294,12 +315,22 @@ export class SupportAnswerWorker {
         }
         if (error instanceof ProjectCodeSyncUnavailableError) {
           if (!this.current(thread.id, inputRevision)) return this.supersede(reply.id)
+          if (thread.answerOperationMode === "learning") {
+            return this.failShadow(
+              reply.id, thread, inputRevision, "code_snapshot_unavailable", "当前已发布代码快照不可用",
+            )
+          }
           const currentService = this.deps.database.readProjectServices("WHERE id=? AND enabled=1", [service.id])[0]
           return await this.failWithoutSnapshot(
             reply.id, thread, inputRevision, group, currentService?.branch ?? service.branch, error,
           )
         }
         if (error instanceof SupportCodeSyncRuntimeError) {
+          if (thread.answerOperationMode === "learning") {
+            return this.failShadow(
+              reply.id, thread, inputRevision, "investigation_runtime_failure", error.message,
+            )
+          }
           return await this.failInvestigationRuntime(reply.id, thread, inputRevision, group, error.message)
         }
         throw error
@@ -343,6 +374,32 @@ export class SupportAnswerWorker {
             ?? (error instanceof ModelExecutionError
               ? `${error.name}(${error.code})：${this.deps.redactor.redact(error.message).text}`
               : `回答模型执行失败：${error instanceof Error ? error.name : "unknown"}`)
+        if (thread.answerOperationMode === "learning") {
+          if (structuredOutputInvalid) {
+            this.deps.replies.transition(reply.id, "failed", {
+              errorCode,
+              decisionReason: `学习模式影子结构化输出失败：${failureReason}`.slice(0, 2000),
+              decisionConfidence: 0,
+            })
+            if (this.structuredOutputFailureCount(thread.id, inputRevision) < 2
+              && this.deps.store.retryGeneration(thread.id, inputRevision)) {
+              this.wake()
+              return
+            }
+            this.deps.database.transaction(() => {
+              this.shadowLearning.fail({
+                replyId: reply.id,
+                threadId: thread.id,
+                inputRevision,
+                errorCode,
+                reason: failureReason,
+              })
+              this.deps.store.finishGeneration(thread.id, inputRevision, "answered")
+            })
+            return
+          }
+          return this.failShadow(reply.id, thread, inputRevision, errorCode, failureReason)
+        }
         if (await this.handoffClaimedHumanPriority(
           reply.id, thread, inputRevision, group, failureReason, errorCode,
         )) return
@@ -577,6 +634,42 @@ export class SupportAnswerWorker {
     allowedMemoryIds: Set<string>,
     originText: string,
   ): Promise<void> {
+    if (thread.answerOperationMode === "learning") {
+      if (!this.current(thread.id, inputRevision)) return this.supersede(replyId)
+      const redactedAnswer = this.deps.redactor.redact(decision.answer)
+      const redactedQuote = decision.quote === null ? null : this.deps.redactor.redact(decision.quote).text
+      const memoryVersionRefs = decision.usedMemoryVersionIds.filter((id) => allowedMemoryIds.has(id))
+      const simulatedAction = decision.decision === "reply"
+        ? "reply"
+        : decision.decision === "ignore"
+          ? "no_action"
+          : decision.escalationType === "feature_request"
+            ? "feature_request_alert_and_reply"
+            : "technical_alert_and_reply"
+      this.deps.database.transaction(() => {
+        this.shadowLearning.complete({
+          replyId,
+          threadId: thread.id,
+          inputRevision,
+          decision: decision.decision,
+          answer: redactedAnswer.text,
+          quote: redactedQuote,
+          reason: this.deps.redactor.redact(decision.reason).text,
+          confidence: decision.confidence,
+          codeRevision,
+          memoryVersionRefs,
+          simulatedAction,
+          outputRedacted: redactedAnswer.changed,
+        })
+        this.deps.replies.transition(replyId, "ignored", {
+          codeRevision,
+          decisionReason: `学习模式影子结果：${decision.reason}`.slice(0, 2000),
+          decisionConfidence: decision.confidence,
+        })
+        this.deps.store.finishGeneration(thread.id, inputRevision, "answered")
+      })
+      return
+    }
     if (decision.decision === "ignore") {
       if (await this.handoffClaimedHumanPriority(
         replyId,
@@ -641,6 +734,34 @@ export class SupportAnswerWorker {
     )
     this.deps.store.finishGeneration(thread.id, inputRevision, "answered")
     this.deps.learning.enqueue(replyId)
+  }
+
+  private failShadow(
+    replyId: string,
+    thread: SupportThread,
+    inputRevision: number,
+    errorCode: string,
+    reason: string,
+    codeRevision: string | null = null,
+  ): void {
+    if (!this.current(thread.id, inputRevision)) return this.supersede(replyId)
+    const safeReason = this.deps.redactor.redact(reason).text.slice(0, 2000)
+    this.deps.database.transaction(() => {
+      this.shadowLearning.fail({
+        replyId,
+        threadId: thread.id,
+        inputRevision,
+        errorCode,
+        reason: safeReason,
+        codeRevision,
+      })
+      this.deps.replies.transition(replyId, "failed", {
+        errorCode,
+        decisionReason: `学习模式影子执行失败：${safeReason}`.slice(0, 2000),
+        decisionConfidence: 0,
+      })
+      this.deps.store.finishGeneration(thread.id, inputRevision, "answered")
+    })
   }
 
   private async forwardFeatureRequest(

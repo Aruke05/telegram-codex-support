@@ -5,6 +5,31 @@ export type HealthStatus = {
   schemaVersion: number
 }
 
+export type MenuKey = "overview" | "projects" | "connections" | "replies" | "chat" | "memories" | "docs" | "models" | "runtime" | "transfer" | "settings" | "access"
+export type AuthContext = { menus: MenuKey[]; csrfToken: string }
+
+export type AccessRole = {
+  id: string
+  name: string
+  menus: MenuKey[]
+  menusEditable: boolean
+}
+
+export type AccessUser = {
+  id: string
+  username: string
+  enabled: boolean
+  roleIds: string[]
+  createdAt: string
+  updatedAt: string
+}
+
+export type AccessControlState = {
+  currentUserId: string
+  users: AccessUser[]
+  roles: AccessRole[]
+}
+
 export type ModelPurpose = "answer" | "memory"
 export type ModelProvider = "openai" | "deepseek" | "anthropic" | "glm"
 export type ModelTransport = "codex_cli" | "direct_api"
@@ -192,6 +217,7 @@ export type TelegramGroup = {
   purpose: "support" | "technical_alert"
   aiModelInstanceId: string | null
   replyStyle: "human" | "unrestricted"
+  operationMode: "live" | "learning"
   createdAt: string
   updatedAt: string
 }
@@ -201,6 +227,20 @@ export type BatchGroupPatch = {
   accessMode?: TelegramGroup["accessMode"]
   accountId?: string
   replyStyle?: TelegramGroup["replyStyle"]
+  operationMode?: TelegramGroup["operationMode"]
+}
+
+export type ShadowLearningReport = {
+  id: string
+  triggerType: "scheduled" | "manual"
+  dueAt: string
+  cutoffAt: string
+  status: "pending" | "running" | "completed" | "failed"
+  sampleCount: number
+  renderedMarkdown: string | null
+  errorMessage: string | null
+  createdAt: string
+  updatedAt: string
 }
 
 export type BatchGroupUpdateInput = {
@@ -550,6 +590,7 @@ export type AdminChatSession = {
   projectId: string
   serviceId: string
   title: string
+  createdByUsername: string
   createdAt: string
   updatedAt: string
   latestTurnStatus: AdminChatTurn["status"] | null
@@ -648,4 +689,4 @@ export type InterfaceDocumentSearch = {
 export type SensitiveCategory = "private-key" | "connection-string" | "absolute-url" | "credential" | "business-identifier" | "email" | "ip-address" | "bank-card"
 
 export type ThemePreference = "system" | "light" | "dark"
-export type RouteKey = "overview" | "projects" | "connections" | "replies" | "chat" | "memories" | "docs" | "models" | "runtime" | "transfer" | "settings"
+export type RouteKey = "overview" | "projects" | "connections" | "replies" | "chat" | "memories" | "docs" | "models" | "runtime" | "transfer" | "settings" | "access"

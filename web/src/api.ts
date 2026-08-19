@@ -1,12 +1,17 @@
 import type {
+  AccessControlState,
+  AccessRole,
+  AccessUser,
   AdminChatSession,
   AdminChatSessionDetail,
   AdminChatTurn,
+  AuthContext,
   Directive,
   HealthStatus,
   InterfaceDocumentSearch,
   InterfaceDocumentSummary,
   MagicBookStatus,
+  MenuKey,
   ModelCatalogResult,
   ModelInstance,
   ModelProfile,
@@ -38,9 +43,19 @@ import type {
   RuntimeSettings,
   RuntimeModelBinding,
   RuntimeStatus,
+  ShadowLearningReport,
 } from "./types.js"
 
 type Fetcher = typeof fetch
+let csrfToken = ""
+let unauthorizedHandler: (() => void) | null = null
+
+function secured(init?: RequestInit): RequestInit | undefined {
+  if (!init || !init.method || ["GET", "HEAD", "OPTIONS"].includes(init.method.toUpperCase()) || !csrfToken) return init
+  const headers = new Headers(init.headers)
+  headers.set("X-CSRF-Token", csrfToken)
+  return { ...init, headers }
+}
 
 async function responseError(response: Response): Promise<Error> {
   try {
@@ -55,13 +70,15 @@ async function responseError(response: Response): Promise<Error> {
 }
 
 async function requestJson<T>(fetcher: Fetcher, url: string, init?: RequestInit): Promise<T> {
-  const response = await fetcher(url, init)
+  const response = await fetcher(url, secured(init))
+  if (response.status === 401 && url !== "/api/auth/login") unauthorizedHandler?.()
   if (!response.ok) throw await responseError(response)
   return response.json() as Promise<T>
 }
 
 async function requestVoid(fetcher: Fetcher, url: string, init?: RequestInit): Promise<void> {
-  const response = await fetcher(url, init)
+  const response = await fetcher(url, secured(init))
+  if (response.status === 401 && url !== "/api/auth/login") unauthorizedHandler?.()
   if (!response.ok) throw await responseError(response)
 }
 
@@ -88,6 +105,28 @@ function queryString(values: Record<string, string | number | boolean | undefine
 
 export function createApiClient(fetcher: Fetcher = globalThis.fetch.bind(globalThis)) {
   return {
+    onUnauthorized: (handler: () => void) => { unauthorizedHandler = handler },
+    getAuthContext: async () => {
+      const context = await requestJson<AuthContext>(fetcher, "/api/auth/me")
+      csrfToken = context.csrfToken
+      return context
+    },
+    login: async (username: string, password: string) => {
+      const context = await requestJson<AuthContext>(fetcher, "/api/auth/login", json("POST", { username, password }))
+      csrfToken = context.csrfToken
+      return context
+    },
+    logout: async () => {
+      await requestVoid(fetcher, "/api/auth/logout", { method: "POST" })
+      csrfToken = ""
+    },
+    getAccessControl: () => requestJson<AccessControlState>(fetcher, "/api/access-control"),
+    createAccessUser: (input: { username: string; password: string; roleId: string; enabled: boolean }) =>
+      requestJson<AccessUser>(fetcher, "/api/access-control/users", json("POST", input)),
+    updateAccessUser: (id: string, input: { username?: string; password?: string; roleId?: string; enabled?: boolean }) =>
+      requestJson<AccessUser>(fetcher, `/api/access-control/users/${encodeURIComponent(id)}`, json("PATCH", input)),
+    updateAccessRole: (id: string, input: { name: string; menus: MenuKey[] }) =>
+      requestJson<AccessRole>(fetcher, `/api/access-control/roles/${encodeURIComponent(id)}`, json("PATCH", input)),
     getHealth: () => requestJson<HealthStatus>(fetcher, "/health"),
     getAccounts: () => requestJson<TelegramAccountsResponse>(fetcher, "/api/telegram/accounts"),
     createAccount: (input: Record<string, unknown>) => requestJson<TelegramAccount>(fetcher, "/api/telegram/accounts", json("POST", input)),
@@ -109,12 +148,17 @@ export function createApiClient(fetcher: Fetcher = globalThis.fetch.bind(globalT
     updateGroup: (id: string, input: Record<string, unknown>) => requestJson<TelegramGroup>(fetcher, `/api/telegram/groups/${encodeURIComponent(id)}`, json("PATCH", input)),
     deleteGroup: (id: string) => requestVoid(fetcher, `/api/telegram/groups/${encodeURIComponent(id)}`, { method: "DELETE" }),
 
+    getLearningReports: () => requestJson<{ items: ShadowLearningReport[] }>(fetcher, "/api/learning-reports"),
+    getLearningReport: (id: string) => requestJson<{ report: ShadowLearningReport; comparisons: Array<Record<string, unknown>> }>(fetcher, `/api/learning-reports/${encodeURIComponent(id)}`),
+    createLearningReport: () => requestJson<ShadowLearningReport>(fetcher, "/api/learning-reports", { method: "POST" }),
+
     getRoles: () => requestJson<{ roles: TelegramRole[] }>(fetcher, "/api/telegram/roles"),
     createRole: (input: TelegramRoleInput) => requestJson<TelegramRole>(fetcher, "/api/telegram/roles", json("POST", input)),
     updateRole: (id: string, input: Partial<TelegramRoleInput>) => requestJson<TelegramRole>(fetcher, `/api/telegram/roles/${encodeURIComponent(id)}`, json("PATCH", input)),
     deleteRole: (id: string) => requestVoid(fetcher, `/api/telegram/roles/${encodeURIComponent(id)}`, { method: "DELETE" }),
 
     getProjects: () => requestJson<{ projects: ProjectView[] }>(fetcher, "/api/projects"),
+    getAdminChatServices: () => requestJson<{ projects: ProjectView[] }>(fetcher, "/api/admin-chat/services"),
 
     getAdminChatSessions: (serviceId?: string) => requestJson<{ sessions: AdminChatSession[] }>(
       fetcher,

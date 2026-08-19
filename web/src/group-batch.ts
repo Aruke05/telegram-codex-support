@@ -5,6 +5,7 @@ export type BatchGroupFormState = {
   accessMode: "" | TelegramGroup["accessMode"]
   accountId: string
   replyStyle: "" | TelegramGroup["replyStyle"]
+  operationMode?: "" | TelegramGroup["operationMode"]
 }
 
 export type BatchPatchResult =
@@ -92,6 +93,12 @@ export function buildBatchGroupPatch(
     patch.accountId = account.id
   }
   if (form.replyStyle) patch.replyStyle = form.replyStyle
+  if (form.operationMode) {
+    if (form.operationMode === "learning" && form.groups.some((group) => group.purpose === "technical_alert")) {
+      return { ok: false, error: "技术告警群不能开启学习模式" }
+    }
+    patch.operationMode = form.operationMode
+  }
   if (Object.keys(patch).length === 0) return { ok: false, error: "至少选择一项批量修改" }
   return { ok: true, patch }
 }

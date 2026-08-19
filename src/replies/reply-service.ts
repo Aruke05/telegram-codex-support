@@ -364,9 +364,10 @@ export class ReplyService {
   }
 
   findPendingEscalationDeliveryFailure(): ReplyRecord | null {
-    const row = this.database.prepare(`SELECT r.id FROM support_replies r
+      const row = this.database.prepare(`SELECT r.id FROM support_replies r
       JOIN support_threads thread ON thread.id=r.thread_id
       WHERE r.status='failed' AND r.decision='escalate' AND thread.status='escalated'
+        AND thread.answer_operation_mode='live'
         AND r.operator_delivery_status IN ('failed','uncertain')
         AND EXISTS(SELECT 1 FROM support_reply_alert_deliveries delivery
           WHERE delivery.reply_id=r.id AND delivery.alert_kind='escalation')
