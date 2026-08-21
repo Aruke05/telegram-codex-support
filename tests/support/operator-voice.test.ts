@@ -401,7 +401,7 @@ describe("运营参考回复风格", () => {
           pinnedTone: true, baselineTone: false,
         },
       ])
-      expect(prompts.every((prompt) => prompt.includes("技术证据只放内部依据，不得当作运营答案。"))).toBe(true)
+      expect(prompts.every((prompt) => prompt.includes("技术证据只放内部依据，不得当作运营答案"))).toBe(true)
       expect(prompts.every((prompt) => prompt.includes("结构化业务值"))).toBe(true)
       expect(prompts[0]).not.toContain("上一次 answer 未通过发送要求")
       expect(execute.mock.calls.map((call) => call[1]?.modelSnapshot)).toEqual([modelSnapshot])
