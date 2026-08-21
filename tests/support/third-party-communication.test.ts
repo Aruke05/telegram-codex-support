@@ -173,6 +173,8 @@ describe("第三方沟通成品通用情景", () => {
     const composePrompt = String(execute.mock.calls[0]?.[1]?.prompt)
     const reviewPrompt = String(execute.mock.calls[1]?.[1]?.prompt)
     expect(composePrompt).toContain("必须保留会改变结论的条件")
+    expect(composePrompt).toContain("对方无法独立复核或本题不需要的请求体/响应体哈希、字节数")
     expect(reviewPrompt).toContain("禁止把有条件行为审核成无条件规则")
+    expect(reviewPrompt).toContain("无关诊断元数据堆砌都不能 approve")
   })
 })
