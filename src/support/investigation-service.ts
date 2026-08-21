@@ -348,6 +348,9 @@ export class SupportInvestigationService {
     if (!baseline.evidencePacket || !this.deps.agent.composeReply || !this.deps.agent.reviewReply) {
       return { decision: baseline, audit: legacyAudit("调查模型或运行适配器尚未提供多阶段交接") }
     }
+    if (baseline.evidencePacket.communication.intent !== "copyable_message") {
+      return { decision: baseline, audit: legacyAudit("当前诉求不需要独立沟通成稿，保留调查模型基线") }
+    }
     const packet = this.trustEvidencePacket(baseline.evidencePacket, baseline.investigation)
     const baseReviewInput = {
       request,

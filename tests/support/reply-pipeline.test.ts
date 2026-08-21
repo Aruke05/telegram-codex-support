@@ -192,6 +192,7 @@ async function harness(agent: SupportDecisionAgentPort) {
 }
 
 function agent(options: {
+  decide?: () => Promise<AnswerDecision>
   compose?: (input: SupportReplyCompositionInput) => Promise<ComposedReply>
   review?: (input: SupportReplyReviewInput) => Promise<ReplyReview>
 } = {}): SupportDecisionAgentPort {
@@ -200,7 +201,7 @@ function agent(options: {
     { outcome: "approve", issues: [], reason: "候选不弱于基线" }
   ))
   return {
-    decide: vi.fn(async () => baselineDecision()),
+    decide: vi.fn(options.decide ?? (async () => baselineDecision())),
     composeReply,
     reviewReply,
   }
@@ -292,6 +293,33 @@ describe("证据收集、独立成稿和质量审核流水线", () => {
     try {
       await investigation.investigate(input, new AbortController().signal)
       expect(compose).toHaveBeenCalledOnce()
+    } finally {
+      database.close()
+    }
+  })
+
+  it("普通解释场景保留原基线，不增加独立成稿和审核时延", async () => {
+    const baseline = baselineDecision()
+    baseline.evidencePacket = {
+      ...baseline.evidencePacket!,
+      communication: {
+        intent: "direct_answer",
+        recipient: null,
+        desiredOutcome: "直接解释当前状态",
+      },
+    }
+    const runningAgent = agent({ decide: async () => baseline })
+    const { database, investigation, input } = await harness(runningAgent)
+    try {
+      const result = await investigation.investigate(input, new AbortController().signal)
+      expect(result.decision.answer).toBe(baseline.answer)
+      expect(result.pipelineAudit).toMatchObject({
+        mode: "legacy",
+        finalSource: "baseline",
+        fallbackReason: "当前诉求不需要独立沟通成稿，保留调查模型基线",
+      })
+      expect(runningAgent.composeReply).not.toHaveBeenCalled()
+      expect(runningAgent.reviewReply).not.toHaveBeenCalled()
     } finally {
       database.close()
     }
