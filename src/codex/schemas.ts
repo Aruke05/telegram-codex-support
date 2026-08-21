@@ -52,6 +52,41 @@ export const responsibilityAssessmentSchema = z.object({
 
 export type ResponsibilityAssessment = z.infer<typeof responsibilityAssessmentSchema>
 
+export const evidenceFactSchema = z.object({
+  id: z.string().regex(/^F(?:[1-9]|1\d|2[0-4])$/u),
+  statement: z.string().trim().min(1).max(1000),
+  provenance: answerClaimSchema.shape.provenance,
+  evidenceSource: investigationStepSchema.shape.source,
+  evidence: z.string().trim().max(1000),
+  certainty: z.enum(["confirmed", "reported", "inferred"]),
+  outboundSafe: z.boolean(),
+}).strict()
+
+export const evidencePacketSchema = z.object({
+  version: z.literal("1"),
+  communication: z.object({
+    intent: z.enum(["direct_answer", "copyable_message", "minimal_clarification", "handoff", "ignore"]),
+    recipient: z.string().trim().min(1).max(120).nullable(),
+    desiredOutcome: z.string().trim().min(1).max(500),
+  }).strict(),
+  facts: z.array(evidenceFactSchema).max(24),
+  requiredAnswerPoints: z.array(z.string().trim().min(1).max(500)).max(12),
+  unknowns: z.array(z.string().trim().min(1).max(500)).max(12),
+  handlingNotes: z.array(z.string().trim().min(1).max(500)).max(12),
+  reviewLevel: z.enum(["standard", "strict"]),
+}).strict().superRefine((value, context) => {
+  const ids = value.facts.map((fact) => fact.id)
+  if (new Set(ids).size !== ids.length) {
+    context.addIssue({ code: "custom", path: ["facts"], message: "证据事实 ID 不能重复" })
+  }
+  if (value.communication.intent === "copyable_message" && !value.communication.recipient) {
+    context.addIssue({ code: "custom", path: ["communication", "recipient"], message: "可转发沟通必须说明接收方" })
+  }
+})
+
+export type EvidenceFact = z.infer<typeof evidenceFactSchema>
+export type EvidencePacket = z.infer<typeof evidencePacketSchema>
+
 const humanOperationSchema = z.object({
   action: z.string().trim().min(1).max(300),
   identifiers: z.array(z.string().trim().min(1).max(300)).min(1).max(20),
@@ -73,6 +108,8 @@ export const answerDecisionSchema = z.object({
   // 兼容升级前的持久记录和测试夹具；正式模型 JSON Schema 始终要求提供。
   interaction: customerInteractionSchema.optional(),
   investigation: investigationTraceSchema,
+  // 兼容升级前的持久记录和测试夹具；正式调查模型 JSON Schema 始终要求提供。
+  evidencePacket: evidencePacketSchema.optional(),
 }).strict().superRefine((value, context) => {
   if ((value.decision === "reply" || value.decision === "escalate") && !value.answer.trim()) {
     context.addIssue({ code: "custom", path: ["answer"], message: "回复内容不能为空" })
@@ -89,9 +126,50 @@ export const answerDecisionSchema = z.object({
   if (value.escalationType !== "human_operation" && value.humanOperation) {
     context.addIssue({ code: "custom", path: ["humanOperation"], message: "非专人操作不能携带专人操作信息" })
   }
+  if (value.decision !== "ignore" && value.evidencePacket?.requiredAnswerPoints.length === 0) {
+    context.addIssue({
+      code: "custom",
+      path: ["evidencePacket", "requiredAnswerPoints"],
+      message: "需要回复或升级时必须列出至少一个必答要点",
+    })
+  }
 }).transform((value) => value.decision === "ignore" ? { ...value, answer: "", quote: null } : value)
 
 export type AnswerDecision = z.infer<typeof answerDecisionSchema>
+
+export const composedReplySchema = z.object({
+  answer: z.string().max(12000),
+  quote: z.string().max(1000).nullable(),
+  claims: z.array(z.object({
+    factId: evidenceFactSchema.shape.id,
+    statement: z.string().trim().min(1).max(1000),
+  }).strict()).max(24),
+  usedMemoryVersionIds: z.array(z.string().uuid()).max(30),
+}).strict().superRefine((value, context) => {
+  if (!value.answer.trim()) context.addIssue({ code: "custom", path: ["answer"], message: "回复内容不能为空" })
+  const ids = value.claims.map((claim) => claim.factId)
+  if (new Set(ids).size !== ids.length) {
+    context.addIssue({ code: "custom", path: ["claims"], message: "事实引用不能重复" })
+  }
+  value.claims.forEach((claim, index) => {
+    if (!value.answer.includes(claim.statement)) {
+      context.addIssue({ code: "custom", path: ["claims", index, "statement"], message: "事实声明必须逐字出现在回复中" })
+    }
+  })
+})
+
+export const replyReviewSchema = z.object({
+  outcome: z.enum(["approve", "revise", "prefer_baseline"]),
+  issues: z.array(z.string().trim().min(1).max(500)).max(12),
+  reason: z.string().trim().min(1).max(1000),
+}).strict().superRefine((value, context) => {
+  if (value.outcome === "revise" && value.issues.length === 0) {
+    context.addIssue({ code: "custom", path: ["issues"], message: "要求重写时必须说明问题" })
+  }
+})
+
+export type ComposedReply = z.infer<typeof composedReplySchema>
+export type ReplyReview = z.infer<typeof replyReviewSchema>
 
 export const learningProposalSchema = z.object({
   action: z.enum(["add", "reinforce", "conflict", "noop"]),
@@ -238,10 +316,52 @@ export const threadRouteResultSchema = z.object({
 export type ThreadRouteAction = z.infer<typeof threadRouteActionSchema>
 export type ThreadRouteResult = z.infer<typeof threadRouteResultSchema>
 
+const evidenceFactJsonSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["id", "statement", "provenance", "evidenceSource", "evidence", "certainty", "outboundSafe"],
+  properties: {
+    id: { type: "string", pattern: "^F(?:[1-9]|1[0-9]|2[0-4])$" },
+    statement: { type: "string", minLength: 1, maxLength: 1000 },
+    provenance: {
+      type: "string",
+      enum: ["user_report", "display", "request", "response", "callback", "runtime", "code", "document", "inference", "recommendation"],
+    },
+    evidenceSource: { type: "string", enum: ["message", "document", "code", "server", "log", "database", "redis", "inference"] },
+    evidence: { type: "string", maxLength: 1000 },
+    certainty: { type: "string", enum: ["confirmed", "reported", "inferred"] },
+    outboundSafe: { type: "boolean" },
+  },
+} as const
+
+const evidencePacketJsonSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["version", "communication", "facts", "requiredAnswerPoints", "unknowns", "handlingNotes", "reviewLevel"],
+  properties: {
+    version: { type: "string", enum: ["1"] },
+    communication: {
+      type: "object",
+      additionalProperties: false,
+      required: ["intent", "recipient", "desiredOutcome"],
+      properties: {
+        intent: { type: "string", enum: ["direct_answer", "copyable_message", "minimal_clarification", "handoff", "ignore"] },
+        recipient: { anyOf: [{ type: "string", minLength: 1, maxLength: 120 }, { type: "null" }] },
+        desiredOutcome: { type: "string", minLength: 1, maxLength: 500 },
+      },
+    },
+    facts: { type: "array", maxItems: 24, items: evidenceFactJsonSchema },
+    requiredAnswerPoints: { type: "array", maxItems: 12, items: { type: "string", minLength: 1, maxLength: 500 } },
+    unknowns: { type: "array", maxItems: 12, items: { type: "string", minLength: 1, maxLength: 500 } },
+    handlingNotes: { type: "array", maxItems: 12, items: { type: "string", minLength: 1, maxLength: 500 } },
+    reviewLevel: { type: "string", enum: ["standard", "strict"] },
+  },
+} as const
+
 export const answerDecisionJsonSchema = {
   type: "object",
   additionalProperties: false,
-  required: ["decision", "escalationType", "humanOperation", "answer", "quote", "reason", "confidence", "usedMemoryVersionIds", "answerClaims", "responsibility", "interaction", "investigation"],
+  required: ["decision", "escalationType", "humanOperation", "answer", "quote", "reason", "confidence", "usedMemoryVersionIds", "answerClaims", "responsibility", "interaction", "investigation", "evidencePacket"],
   properties: {
     decision: { type: "string", enum: ["reply", "ignore", "escalate"] },
     escalationType: { type: "string", enum: ["none", "code_defect", "technical_change", "feature_request", "service_handoff", "human_operation"] },
@@ -337,6 +457,42 @@ export const answerDecisionJsonSchema = {
         },
       },
     },
+    evidencePacket: evidencePacketJsonSchema,
+  },
+} as const
+
+export const composedReplyJsonSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["answer", "quote", "claims", "usedMemoryVersionIds"],
+  properties: {
+    answer: { type: "string", minLength: 1, maxLength: 12000 },
+    quote: { anyOf: [{ type: "string", maxLength: 1000 }, { type: "null" }] },
+    claims: {
+      type: "array",
+      maxItems: 24,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["factId", "statement"],
+        properties: {
+          factId: evidenceFactJsonSchema.properties.id,
+          statement: { type: "string", minLength: 1, maxLength: 1000 },
+        },
+      },
+    },
+    usedMemoryVersionIds: { type: "array", maxItems: 30, items: { type: "string" } },
+  },
+} as const
+
+export const replyReviewJsonSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["outcome", "issues", "reason"],
+  properties: {
+    outcome: { type: "string", enum: ["approve", "revise", "prefer_baseline"] },
+    issues: { type: "array", maxItems: 12, items: { type: "string", minLength: 1, maxLength: 500 } },
+    reason: { type: "string", minLength: 1, maxLength: 1000 },
   },
 } as const
 

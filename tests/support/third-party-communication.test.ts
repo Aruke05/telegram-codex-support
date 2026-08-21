@@ -130,4 +130,49 @@ describe("第三方沟通成品通用情景", () => {
     expect(prompt).toContain("不堆砌全部内部排查记录")
     expect(prompt).toContain("不得输出密钥 签名 完整报文 连接信息 内部路径")
   })
+
+  it("独立成稿与审核都保留会改变结论的代码条件", async () => {
+    const execute = vi.fn()
+      .mockResolvedValueOnce({
+        answer: "自动处理开关开启并取得终态时，主动查单可更新订单状态。",
+        quote: null,
+        claims: [{ factId: "F1", statement: "自动处理开关开启并取得终态时，主动查单可更新订单状态。" }],
+        usedMemoryVersionIds: [],
+      })
+      .mockResolvedValueOnce({ outcome: "approve", issues: [], reason: "关键条件完整" })
+    const agent = new CodexSupportDecisionAgent({ execute } as never)
+    const request = input("主动查单会不会更新状态")
+    const decision = { decision: "reply" as const, escalationType: "none" as const }
+    const evidencePacket = {
+      version: "1" as const,
+      communication: { intent: "direct_answer" as const, recipient: null, desiredOutcome: "解释查单状态更新条件" },
+      facts: [{
+        id: "F1" as const,
+        statement: "自动处理开关开启并取得终态时，主动查单可更新订单状态。",
+        provenance: "code" as const,
+        evidenceSource: "code" as const,
+        evidence: "当前发布代码中的条件分支",
+        certainty: "confirmed" as const,
+        outboundSafe: true,
+      }],
+      requiredAnswerPoints: ["说明状态更新的开关和结果条件"],
+      unknowns: [],
+      handlingNotes: ["不得概括成主动查单绝不会修改状态"],
+      reviewLevel: "strict" as const,
+    }
+    const candidate = await agent.composeReply({ request, decision, evidencePacket })
+    await agent.reviewReply({
+      request,
+      decision,
+      evidencePacket,
+      baseline: { answer: "基线", quote: null, answerClaims: [], usedMemoryVersionIds: [] },
+      candidate,
+      attempt: 1,
+    })
+
+    const composePrompt = String(execute.mock.calls[0]?.[1]?.prompt)
+    const reviewPrompt = String(execute.mock.calls[1]?.[1]?.prompt)
+    expect(composePrompt).toContain("必须保留会改变结论的条件")
+    expect(reviewPrompt).toContain("禁止把有条件行为审核成无条件规则")
+  })
 })

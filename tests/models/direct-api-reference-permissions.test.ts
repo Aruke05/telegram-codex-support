@@ -90,7 +90,7 @@ function providerScript(
   })
 }
 
-function executionInput(accessMode?: "reference-classifier" | "diagnostic") {
+function executionInput(accessMode?: "reference-classifier" | "diagnostic" | "text-only") {
   return {
     prompt: "classify",
     outputSchema: {
@@ -107,6 +107,26 @@ function executionInput(accessMode?: "reference-classifier" | "diagnostic") {
 }
 
 describe("Direct API reference classifier permissions", () => {
+  it.each(["openai", "anthropic", "deepseek"] as const)(
+    "%s 纯文本回复阶段不开放任何诊断工具",
+    async (provider) => {
+      const advertised: string[][] = []
+      const requestBodies: string[] = []
+      const broker: AgentToolBroker = {
+        definitions: vi.fn(() => [...productionDiagnosticTools, genericCommandTool]),
+        execute: vi.fn(async () => ({ content: "database secret" })),
+      }
+      const adapter = new DirectApiAdapter(providerScript(provider, advertised, requestBodies), broker)
+
+      await expect(adapter.execute(directModel(provider), executionInput("text-only"))).resolves.toEqual({
+        value: { ok: true },
+        toolCallCount: 1,
+      })
+      expect(advertised).toEqual([["submit_result"], ["submit_result"]])
+      expect(broker.execute).not.toHaveBeenCalled()
+    },
+  )
+
   it.each(["openai", "anthropic", "deepseek"] as const)(
     "%s reference-classifier 只 advertise snapshot tools 且执行层拒绝越权 database call",
     async (provider) => {

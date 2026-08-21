@@ -1,2 +1,2 @@
 export const APP_VERSION = "2.2.2"
-export const DATABASE_SCHEMA_VERSION = 31
+export const DATABASE_SCHEMA_VERSION = 32

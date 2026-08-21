@@ -160,6 +160,23 @@ describe("Reference classifier Codex permissions", () => {
       && override.includes(`${JSON.stringify(cwd)}=\"read\"`))).toBe(true)
   })
 
+  it("回复组合与审核使用无网络、无工作目录读取能力的纯文本权限", () => {
+    const cwd = "/private/tmp/reply-composer"
+    const args = executorModule.buildCodexArgs(
+      { ...referenceClassifierInvocation(cwd, []), accessMode: "text-only" },
+      "/private/tmp/schema.json",
+      "/private/tmp/result.json",
+    )
+    const overrides = configOverrides(args)
+    expect(args).toContain("--strict-config")
+    expect(sandboxMode(args)).toBeNull()
+    expect(overrides).toContain('default_permissions="text-only"')
+    expect(overrides).toContain("permissions.text-only.network.enabled=false")
+    expect(overrides.some((override) => override.startsWith("permissions.text-only.filesystem=")
+      && override.includes('\":root\"=\"deny\"')
+      && !override.includes(`${JSON.stringify(cwd)}=\"read\"`))).toBe(true)
+  })
+
   it("uses a strict inline permission profile without the legacy sandbox flag", () => {
     const cwd = "/safe/current-snapshot"
     const repository = "/safe/current-snapshot/java-project"

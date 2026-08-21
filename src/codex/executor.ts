@@ -13,7 +13,7 @@ import { ModelGateway } from "../models/model-gateway.js"
 import type { ModelImageInput } from "../models/types.js"
 import { ReadonlyAgentToolBroker } from "../diagnostics/readonly-agent-tool-broker.js"
 
-export type CodexAccessMode = "read-only" | "diagnostic" | "reference-classifier" | "shadow-report"
+export type CodexAccessMode = "read-only" | "diagnostic" | "reference-classifier" | "shadow-report" | "text-only"
 
 export type CodexInvocation = {
   cwd: string
@@ -72,6 +72,7 @@ type ProcessResult = { code: number; stdout: string; stderr: string }
 
 const REFERENCE_CLASSIFIER_PROFILE = "reference-classifier"
 const SHADOW_REPORT_PROFILE = "shadow-report"
+const TEXT_ONLY_PROFILE = "text-only"
 const REFERENCE_CLASSIFIER_DISABLED_FEATURES = [
   "apps",
   "browser_use",
@@ -247,6 +248,21 @@ function shadowReportConfig(cwd: string): string[] {
   ]
 }
 
+function textOnlyConfig(): string[] {
+  const filesystem = [
+    [":root", "deny"],
+    [":minimal", "read"],
+    [":tmpdir", "deny"],
+    ...(process.platform === "win32" ? [] : [[":slash_tmp", "deny"]]),
+  ].map(([key, access]) => `${JSON.stringify(key)}=${JSON.stringify(access)}`).join(",")
+  return [
+    `default_permissions=${JSON.stringify(TEXT_ONLY_PROFILE)}`,
+    `permissions.${TEXT_ONLY_PROFILE}.filesystem={${filesystem}}`,
+    `permissions.${TEXT_ONLY_PROFILE}.network.enabled=false`,
+    "web_search=\"disabled\"",
+  ]
+}
+
 function runProcess(
   command: string,
   args: string[],
@@ -385,7 +401,8 @@ export function buildCodexArgs(invocation: CodexInvocation, schemaFile: string, 
   const diagnostic = invocation.accessMode === "diagnostic"
   const referenceClassifier = invocation.accessMode === "reference-classifier"
   const shadowReport = invocation.accessMode === "shadow-report"
-  const strictProfile = referenceClassifier || shadowReport
+  const textOnly = invocation.accessMode === "text-only"
+  const strictProfile = referenceClassifier || shadowReport || textOnly
   const commandPath = process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
   return [
     "--ask-for-approval", "never", "exec", "--ephemeral", "--skip-git-repo-check",
@@ -401,6 +418,9 @@ export function buildCodexArgs(invocation: CodexInvocation, schemaFile: string, 
       : []),
     ...(shadowReport
       ? shadowReportConfig(invocation.cwd).flatMap((override) => ["-c", override])
+      : []),
+    ...(textOnly
+      ? textOnlyConfig().flatMap((override) => ["-c", override])
       : []),
     "-c", "shell_environment_policy.inherit=\"none\"",
     "-c", "shell_environment_policy.ignore_default_excludes=false",

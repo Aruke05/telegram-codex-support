@@ -88,7 +88,7 @@ describe("影子学习模式数据库结构", () => {
 
     const migrated = await RuntimeDatabase.open(file)
     try {
-      expect(migrated.schemaVersion()).toBe(31)
+      expect(migrated.schemaVersion()).toBe(32)
       const tables = new Set((migrated.prepare(`SELECT name FROM sqlite_master
         WHERE type='table' AND name LIKE 'shadow_%'`).all() as Array<{ name: string }>).map((row) => row.name))
       expect(tables).toEqual(new Set([
@@ -130,7 +130,7 @@ describe("影子学习模式数据库结构", () => {
 
     const migrated = await RuntimeDatabase.open(file)
     try {
-      expect(migrated.schemaVersion()).toBe(31)
+      expect(migrated.schemaVersion()).toBe(32)
       expect(migrated.prepare(`SELECT id,status FROM shadow_learning_reports
         WHERE trigger_type='scheduled'`).all()).toEqual([
         { id: "00000000-0000-4000-8000-000000000028", status: "pending" },

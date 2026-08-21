@@ -58,6 +58,33 @@ describe("技术升级由模型语义和通用记忆判断", () => {
     }).success).toBe(false)
   })
 
+  it("忽略消息允许空必答要点，但需要回复时必须至少有一项", () => {
+    const evidencePacket = {
+      version: "1" as const,
+      communication: { intent: "ignore" as const, recipient: null, desiredOutcome: "无需回复" },
+      facts: [],
+      requiredAnswerPoints: [],
+      unknowns: [],
+      handlingNotes: [],
+      reviewLevel: "standard" as const,
+    }
+    expect(answerDecisionSchema.safeParse({
+      ...base,
+      decision: "ignore",
+      escalationType: "none",
+      evidencePacket,
+    }).success).toBe(true)
+    expect(answerDecisionSchema.safeParse({
+      ...base,
+      decision: "reply",
+      escalationType: "none",
+      evidencePacket: {
+        ...evidencePacket,
+        communication: { ...evidencePacket.communication, intent: "direct_answer" as const },
+      },
+    }).success).toBe(false)
+  })
+
   it("故障升级边界由统一提示词说明而非正则验句", () => {
     const prompt = systemDirectivesPrompt()
     expect(prompt).toContain("只有已确认唯一根源且必须由技术修改代码 生产配置 通道映射或后台业务数据时才升级故障")

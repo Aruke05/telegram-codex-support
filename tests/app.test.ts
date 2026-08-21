@@ -82,7 +82,7 @@ describe("GET /health", () => {
       status: "ok",
       service: "telegram-codex-support",
       version: "2.2.2",
-      schemaVersion: 31,
+      schemaVersion: 32,
     })
     expect(response.body).not.toContain("TOKEN")
   })

@@ -317,6 +317,18 @@ export class SupportAnswerWorker {
           },
         }, controller.signal)
         service = result.service
+        this.deps.database.recordReplyGenerationAudit({
+          supportReplyId: reply.id,
+          pipelineVersion: result.pipelineAudit.version,
+          mode: result.pipelineAudit.mode,
+          evidencePacket: result.pipelineAudit.evidencePacket,
+          baselineAnswer: result.pipelineAudit.baselineAnswer,
+          firstCandidateAnswer: result.pipelineAudit.firstCandidateAnswer,
+          revisedCandidateAnswer: result.pipelineAudit.revisedCandidateAnswer,
+          reviews: result.pipelineAudit.reviews,
+          finalSource: result.pipelineAudit.finalSource,
+          fallbackReason: result.pipelineAudit.fallbackReason,
+        })
         await this.waitForPendingRouting(thread.id, inputRevision, controller.signal)
         if (this.hardDeadlineReached(thread.id, inputRevision)) return
         if (!this.current(thread.id, inputRevision)) return this.supersede(reply.id)

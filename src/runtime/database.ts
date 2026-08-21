@@ -47,6 +47,20 @@ import {
 type SqlRow = Record<string, unknown>
 type SqlParameter = string | number | null
 
+export type ReplyGenerationAuditInput = {
+  supportReplyId?: string
+  adminChatTurnId?: string
+  pipelineVersion: string
+  mode: "legacy" | "multi_stage"
+  evidencePacket: unknown | null
+  baselineAnswer: string
+  firstCandidateAnswer: string | null
+  revisedCandidateAnswer: string | null
+  reviews: unknown[]
+  finalSource: "baseline" | "first_candidate" | "revised_candidate"
+  fallbackReason: string | null
+}
+
 const baselineOperatorStyleProfileJson = JSON.stringify(baselineOperatorStyleProfile).replaceAll("'", "''")
 
 const learningSourceObservationsV22TableDefinition = `(
@@ -1049,6 +1063,25 @@ CREATE TABLE IF NOT EXISTS support_reply_payloads (
   quote_text TEXT,
   has_attachment INTEGER NOT NULL DEFAULT 0 CHECK (has_attachment IN (0, 1))
 );
+
+CREATE TABLE IF NOT EXISTS reply_generation_audits (
+  id TEXT PRIMARY KEY,
+  support_reply_id TEXT UNIQUE REFERENCES support_replies(id) ON DELETE CASCADE,
+  admin_chat_turn_id TEXT UNIQUE REFERENCES admin_chat_turns(id) ON DELETE CASCADE,
+  pipeline_version TEXT NOT NULL,
+  mode TEXT NOT NULL CHECK(mode IN ('legacy','multi_stage')),
+  evidence_packet_json TEXT,
+  baseline_answer TEXT NOT NULL,
+  first_candidate_answer TEXT,
+  revised_candidate_answer TEXT,
+  reviews_json TEXT NOT NULL,
+  final_source TEXT NOT NULL CHECK(final_source IN ('baseline','first_candidate','revised_candidate')),
+  fallback_reason TEXT,
+  created_at TEXT NOT NULL,
+  CHECK((support_reply_id IS NOT NULL) <> (admin_chat_turn_id IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS reply_generation_audits_created_idx
+  ON reply_generation_audits(created_at,id);
 
 CREATE TABLE IF NOT EXISTS shadow_answer_results (
   id TEXT PRIMARY KEY,
@@ -3450,6 +3483,37 @@ function migrateV30ToV31(connection: DatabaseSync): void {
   }
 }
 
+function migrateV31ToV32(connection: DatabaseSync): void {
+  connection.exec("BEGIN IMMEDIATE")
+  try {
+    connection.exec(`
+      CREATE TABLE IF NOT EXISTS reply_generation_audits (
+        id TEXT PRIMARY KEY,
+        support_reply_id TEXT UNIQUE REFERENCES support_replies(id) ON DELETE CASCADE,
+        admin_chat_turn_id TEXT UNIQUE REFERENCES admin_chat_turns(id) ON DELETE CASCADE,
+        pipeline_version TEXT NOT NULL,
+        mode TEXT NOT NULL CHECK(mode IN ('legacy','multi_stage')),
+        evidence_packet_json TEXT,
+        baseline_answer TEXT NOT NULL,
+        first_candidate_answer TEXT,
+        revised_candidate_answer TEXT,
+        reviews_json TEXT NOT NULL,
+        final_source TEXT NOT NULL CHECK(final_source IN ('baseline','first_candidate','revised_candidate')),
+        fallback_reason TEXT,
+        created_at TEXT NOT NULL,
+        CHECK((support_reply_id IS NOT NULL) <> (admin_chat_turn_id IS NOT NULL))
+      );
+      CREATE INDEX IF NOT EXISTS reply_generation_audits_created_idx
+        ON reply_generation_audits(created_at,id);
+      UPDATE metadata SET value='32' WHERE key='schema_version';
+    `)
+    connection.exec("COMMIT")
+  } catch (error) {
+    try { connection.exec("ROLLBACK") } catch { /* 事务已结束时无需处理。 */ }
+    throw error
+  }
+}
+
 function ensureAdminChatConversationExtensions(connection: DatabaseSync): void {
   connection.exec("DROP INDEX IF EXISTS admin_chat_turns_one_active_idx")
   connection.exec(adminChatConversationExtensionSchema)
@@ -3542,6 +3606,7 @@ export class RuntimeDatabase {
       if (current === 28) { migrateV28ToV29(connection); current = 29 }
       if (current === 29) { migrateV29ToV30(connection); current = 30 }
       if (current === 30) { migrateV30ToV31(connection); current = 31 }
+      if (current === 31) { migrateV31ToV32(connection); current = 32 }
       if (current !== DATABASE_SCHEMA_VERSION) {
         connection.close()
         throw new Error("运行数据库版本不兼容")
@@ -3619,6 +3684,7 @@ export class RuntimeDatabase {
       if (current === 28) { migrateV28ToV29(connection); current = 29 }
       if (current === 29) { migrateV29ToV30(connection); current = 30 }
       if (current === 30) { migrateV30ToV31(connection); current = 31 }
+      if (current === 31) { migrateV31ToV32(connection); current = 32 }
       if (current !== DATABASE_SCHEMA_VERSION) {
         connection.close()
         throw new Error("迁移数据库版本不兼容")
@@ -3979,6 +4045,29 @@ export class RuntimeDatabase {
     )
   }
 
+  recordReplyGenerationAudit(input: ReplyGenerationAuditInput): string {
+    if (Boolean(input.supportReplyId) === Boolean(input.adminChatTurnId)) {
+      throw new Error("回复生成审计必须且只能关联一种回复记录")
+    }
+    const id = randomUUID()
+    const row = this.prepare(`INSERT INTO reply_generation_audits(
+      id,support_reply_id,admin_chat_turn_id,pipeline_version,mode,evidence_packet_json,baseline_answer,
+      first_candidate_answer,revised_candidate_answer,reviews_json,final_source,fallback_reason,created_at
+    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO UPDATE SET
+      pipeline_version=excluded.pipeline_version,mode=excluded.mode,evidence_packet_json=excluded.evidence_packet_json,
+      baseline_answer=excluded.baseline_answer,first_candidate_answer=excluded.first_candidate_answer,
+      revised_candidate_answer=excluded.revised_candidate_answer,reviews_json=excluded.reviews_json,
+      final_source=excluded.final_source,fallback_reason=excluded.fallback_reason,created_at=excluded.created_at
+      RETURNING id`).get(
+      id, input.supportReplyId ?? null, input.adminChatTurnId ?? null, input.pipelineVersion, input.mode,
+      input.evidencePacket === null ? null : JSON.stringify(input.evidencePacket), input.baselineAnswer,
+      input.firstCandidateAnswer, input.revisedCandidateAnswer, JSON.stringify(input.reviews), input.finalSource,
+      input.fallbackReason, new Date().toISOString(),
+    ) as { id: string } | undefined
+    if (!row) throw new Error("回复生成审计写入后未返回记录")
+    return row.id
+  }
+
   insertGroup(group: RuntimeGroup): void {
     this.prepare(`INSERT INTO telegram_groups
       (id,group_key,name,telegram_chat_id,account_id,project_id,service_id,enabled,access_mode,trigger_mode,platform,repositories,branch,server_alias,database_alias,knowledge_scope,purpose,ai_model_instance_id,reply_style,operation_mode,created_at,updated_at)
@@ -4102,6 +4191,7 @@ export class RuntimeDatabase {
         DELETE FROM service_code_sync_batches;
         DELETE FROM service_code_snapshots;
         DELETE FROM service_code_sync_schedule;
+        DELETE FROM reply_generation_audits;
         DELETE FROM admin_chat_turns;
         DELETE FROM admin_chat_sessions;
         DELETE FROM reply_memory_refs;

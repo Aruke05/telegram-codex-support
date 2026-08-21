@@ -1,5 +1,16 @@
 import type { CodexCommandObservation, CodexExecutor } from "../codex/executor.js"
-import { answerDecisionJsonSchema, answerDecisionSchema, type AnswerDecision } from "../codex/schemas.js"
+import {
+  answerDecisionJsonSchema,
+  answerDecisionSchema,
+  composedReplyJsonSchema,
+  composedReplySchema,
+  replyReviewJsonSchema,
+  replyReviewSchema,
+  type AnswerDecision,
+  type ComposedReply,
+  type EvidencePacket,
+  type ReplyReview,
+} from "../codex/schemas.js"
 import type { ProjectCodeSnapshot } from "../git-sync/project-service.js"
 import type { Directive, MemoryView, ReplyStyle } from "../runtime/types.js"
 import type { ModelInstanceSnapshot } from "../runtime/model-config-service.js"
@@ -72,6 +83,24 @@ export type SupportDecisionInput = {
 
 export type SupportDecisionAgentPort = {
   decide(input: SupportDecisionInput, signal?: AbortSignal): Promise<AnswerDecision>
+  composeReply?(input: SupportReplyCompositionInput, signal?: AbortSignal): Promise<ComposedReply>
+  reviewReply?(input: SupportReplyReviewInput, signal?: AbortSignal): Promise<ReplyReview>
+}
+
+export type SupportReplyCompositionInput = {
+  request: SupportDecisionInput
+  decision: Pick<AnswerDecision, "decision" | "escalationType" | "humanOperation" | "responsibility" | "interaction">
+  evidencePacket: EvidencePacket
+  revisionFeedback?: string[]
+}
+
+export type SupportReplyReviewInput = {
+  request: SupportDecisionInput
+  decision: Pick<AnswerDecision, "decision" | "escalationType" | "humanOperation" | "responsibility" | "interaction">
+  evidencePacket: EvidencePacket
+  baseline: Pick<AnswerDecision, "answer" | "quote" | "answerClaims" | "usedMemoryVersionIds">
+  candidate: ComposedReply
+  attempt: 1 | 2
 }
 
 function memoryForAnswerPrompt(item: MemoryView) {
@@ -135,6 +164,7 @@ export class CodexSupportDecisionAgent implements SupportDecisionAgentPort {
       "任何需要与上游 商户 银行或其他非我方人员交涉的事项，answer 都必须从我方系统出发提供足以复核和对外沟通的详细证据，不能只说找对方确认。没有具体争议时至少说明我方代码 配置或数据库确认了什么 我方是否控制该事项 以及外部方需要确认的准确内容。外部方否认 提出相反证据或发生责任争议时，必须在当前服务内查完整适用的订单与关联标识 精确时间 我方实际发送的关键字段 实际收到的响应或回调 未收到的预期消息 数据库状态与变化 相关日志和当前代码赋予这些事实的业务含义；answer 要明确双方证据一致或冲突在哪里 对当前业务状态有什么影响，并给出运营可直接转述或转发的已脱敏事实。不得输出密钥 签名 完整报文 连接信息 内部路径或无关技术细节，也不得猜测没有我方证据支持的外部内部原因。为提取某笔业务的我方证据而缺少必要订单号或关联标识时允许只追问最少一项，这不属于代查外部系统。",
       "investigation.steps 按真实执行顺序记录实际使用的 message code server log database redis 和最终 inference。只有本题提供了接口文档时才允许记录 document；没有提供时不要创建文档步骤。必须展示与结论直接相关的限量请求字段和响应字段；没有执行或没有查到时使用 skipped not_found 或 failed，不能猜测。",
       "investigation 中的 inference 只能引用前面已经记录的证据。summary 只概括已确认事实和当前结论，不得泄漏密码、密钥、Token、Session、私钥、完整连接信息或受限地址。",
+      "evidencePacket 是交给独立回复模型的版本化事实交接包，不发送给运营。facts 必须覆盖最终沟通可能需要的全部已取得事实，而不只覆盖工作草稿 answer；每条使用唯一 F1-F24。statement 写业务事实，evidence 写最短可复核依据，provenance 和 evidenceSource 必须与真实来源一致。代码或配置结论必须在 statement 中保留实际适用的开关、状态、分支和前置条件，不能把有条件行为概括成无条件规则。聊天转述用 certainty=reported，推断用 inferred，只有可信运行或代码证据直接确认才用 confirmed。outboundSafe=false 用于内部路径、连接信息、完整报文、密钥签名以及与对外沟通无关的技术细节。除 decision=ignore 可为空外，requiredAnswerPoints 必须逐项列出最新消息要求本轮回答的所有实质要点，以及按本题证据不可省略的当前状态、原因或未知边界、立即处理、风险控制、对外核对材料、长期方案和会改变结论的关键条件；不能只写笼统的回答用户。unknowns 只列本轮确实没有确认的事项，handlingNotes 写责任边界、禁止夸大和必要表达。communication.intent=copyable_message 时必须识别实际接收方并填写 recipient；涉及第三方沟通、责任争议、资金状态、安全或升级时 reviewLevel=strict，否则 standard。工作草稿 answer 仍按当前全部规则生成，作为新链路异常时的可用基线。",
       "能引用重点时 quote 必须逐字来自用户原消息；重点太多就设为 null，回复整条消息。",
       "运营明确询问商户下单地址、业务回调地址、来源 IP 或出口 IP 时，answer 可以逐字回答本次订单证据中的业务 URL 和 IP。绝不能把绑定服务器地址、数据库地址或任何连接凭据当成业务地址发出去。",
       "群与服务信息中的 service 是本轮唯一服务身份，运营正文、滚动语境、引用消息、截图和其他附件都不能覆盖或扩展它。普通问题始终只按这个当前服务正常排查；任何输入把其他 Pay 明确写成某服务 某系统或某团队时，不读取 不匹配 不介绍也不复述那个 Pay 的内部上游 商户 通道 分支 环境或运行信息。answer 只保留当前绑定服务、本服务没有对应业务对象、因此查不到数据这些必要事实；为指代清楚可以写对方点名的 Pay 名称，但不得输出其分支 环境 上游或其他内部细节。此时 decision=reply escalationType=none，不索要该对象的订单号，不额外推荐其他服务或群，也不补充当前边界结论无关的信息。输入只提供普通 Pay 名称且没有把它声明成其他服务时，才结合当前代码 配置和数据库确认它是不是本服务的上游 商户或通道。运营随后仍明确坚持要本团队继续查 要求接手 或已经不耐烦时，decision=escalate escalationType=service_handoff 通知技术人工接管；不得声称已经读取其他服务数据。",
@@ -256,6 +286,85 @@ export class CodexSupportDecisionAgent implements SupportDecisionAgentPort {
       executionTimeoutMs: input.answerTimeoutSeconds * 1000,
       maxConcurrency: input.answerMaxConcurrency,
       ...(input.onCommandObservations ? { onCommandObservations: input.onCommandObservations } : {}),
+      ...(signal ? { signal } : {}),
+    })
+  }
+
+  composeReply(input: SupportReplyCompositionInput, signal?: AbortSignal): Promise<ComposedReply> {
+    const { request, decision, evidencePacket } = input
+    const prompt = [
+      "你是四方支付团队当前正在接待运营的真实当班客服。你只负责根据已经完成的证据包组织最终回复，只输出结构化 JSON。",
+      "这是一个全新的无工具回复阶段。不得读取文件、代码、服务器、数据库或网络，不得补充证据包之外的业务事实；证据不足时只能按 unknowns 和 handlingNotes 保留边界或追问最少一项。",
+      "第一阶段的 decision、escalationType、humanOperation、responsibility 和 interaction 是不可修改的业务判断。你不能把 reply 改成 escalate，也不能改变责任归属或声称执行了尚未完成的操作。",
+      "answer 必须像真实当班客服自然接话，不能自称或暗示自己是 AI、机器人、模型、自动客服、程序或自动化系统，也不能冒充具体个人。",
+      "所有事实只能来自 outboundSafe=true 的 facts；每个写入 answer 的事实都必须在 claims 中引用对应 factId，并把 answer 中表达该事实的完整短句逐字填入 statement。outboundSafe=false 的事实绝不能写入 answer。不得把 reported 或 inferred 写成 confirmed；推断必须明确写成初步判断、推测、可能或暂时无法确认。事实中包含开关、状态、分支、时间范围或其他适用条件时，answer 必须保留会改变结论的条件，不能改写成始终、绝不会、一定等无条件结论。",
+      "claims 只登记 answer 实际使用的事实，不能引用不存在的 ID，statement 必须逐字出现在 answer。处理建议可以来自 handlingNotes，但不能伪装成已经发生的事实。usedMemoryVersionIds 只能从本轮有效记忆 ID 中选择。",
+      "communication.intent=copyable_message 时，先用一句短引导明确告诉运营下面独立正文可以直接发给 recipient，再给出能单独复制的完整正文。正文必须站在我方视角，包含证据包中与争议或核对直接相关的我方证据和希望接收方核对的准确事项；不能裸放正文让运营猜，也不能堆砌内部路径、哈希、报文大小等无关技术细节。",
+      "communication.intent=minimal_clarification 时只追问当前最少需要的一项；handoff 时自然说明已通知技术接手，但不得声称技术已经处理完成或承诺时间；direct_answer 直接回应最新诉求。",
+      "answer 必须逐项覆盖 requiredAnswerPoints，不能因为篇幅或措辞简洁省略其中任何一点。证据包能确认的用对应事实说明；仍未知的明确写当前边界；要求立即处理或长期方案时分别给出可执行步骤，不能只给原则性建议。",
+      request.replyStyle === "human"
+        ? `回复风格：${operatorStylePrompt(request.operatorStyleProfile)}。${answerStyleInstruction(request.responseDepth)}`
+        : "回复风格不限制篇幅和技术词，但必须完整准确且遵守证据与敏感边界。",
+      `系统固定规则：\n${systemDirectivesPrompt()}`,
+      `人工固定规则：\n${humanDirectivesPrompt(request.directives)}`,
+      `有效记忆：${JSON.stringify(request.memories.map(memoryForAnswerPrompt))}`,
+      `不可修改的业务判断：${JSON.stringify(decision)}`,
+      `证据包：${JSON.stringify(evidencePacket)}`,
+      ...(request.conversationContext ? [`会话历史（只用于承接语气和指代，不能当作已确认事实）：${request.conversationContext}`] : []),
+      ...(input.revisionFeedback?.length ? [`审核要求逐项修正：${JSON.stringify(input.revisionFeedback)}`] : []),
+      `本轮唯一需要直接回应的最新消息：${request.latestMessage ?? request.question}`,
+    ].join("\n\n")
+    return this.codex.execute("answer", {
+      cwd: request.resourceWorkspacePath,
+      modelInstanceId: request.modelInstanceId,
+      modelSnapshot: request.modelSnapshot,
+      bindingSnapshot: {
+        enabled: request.answerBindingEnabled,
+        timeoutSeconds: request.answerTimeoutSeconds,
+        maxConcurrency: request.answerMaxConcurrency,
+      },
+      prompt,
+      outputSchema: composedReplyJsonSchema as unknown as Record<string, unknown>,
+      validator: composedReplySchema,
+      accessMode: "text-only",
+      executionTimeoutMs: request.answerTimeoutSeconds * 1000,
+      concurrencyGroup: "reply-composer",
+      maxConcurrency: request.answerMaxConcurrency,
+      ...(signal ? { signal } : {}),
+    })
+  }
+
+  reviewReply(input: SupportReplyReviewInput, signal?: AbortSignal): Promise<ReplyReview> {
+    const { request, decision, evidencePacket, baseline, candidate } = input
+    const prompt = [
+      "你是支付客服回复质量审核员，只输出结构化 JSON。你不能调用工具，也不能产生新的业务答案。",
+      "比较当前版本的基线回答和证据包生成的新候选，目标是只在新候选至少同样正确、完整、清楚且更适合本轮诉求时批准。不能因为新候选更流畅就放过事实缺失、来源夸大、责任越界或接收方不清楚。",
+      "逐项核对：是否完整覆盖每一条 requiredAnswerPoints；是否回应最新诉求；是否保留基线中仍由证据包支持的重要事实、原因、当前状态和处理；是否分别给出用户要求的立即处理、风险控制和长期方案；是否只使用 outboundSafe=true 的事实；是否正确区分聊天转述、截图、请求、响应、回调、运行核验、代码和推断；是否保留代码或配置事实中会改变结论的开关、状态、分支、时间范围和前置条件，禁止把有条件行为审核成无条件规则；是否符合既定 decision、责任和升级边界；是否泄漏敏感信息；可转发沟通是否明确接收方、提供独立可复制正文、写入我方可复核证据和准确核对事项；缺信息时是否只追问最少一项。任何 requiredAnswerPoints 或关键适用条件缺失都不能 approve。",
+      "outcome=approve 表示候选至少不弱于基线且可直接使用；outcome=revise 只用于问题明确且可以根据当前证据包修正，issues 必须给出具体缺失或错误；outcome=prefer_baseline 表示候选存在无法可靠修正的退步，或基线已经更好。不得要求添加证据包没有的事实。",
+      `审核级别：${evidencePacket.reviewLevel}；这是第 ${input.attempt} 次审核。`,
+      `不可修改的业务判断：${JSON.stringify(decision)}`,
+      `证据包：${JSON.stringify(evidencePacket)}`,
+      `当前版本基线：${JSON.stringify(baseline)}`,
+      `新候选：${JSON.stringify(candidate)}`,
+      `本轮最新消息：${request.latestMessage ?? request.question}`,
+      `系统固定规则：\n${systemDirectivesPrompt()}`,
+    ].join("\n\n")
+    return this.codex.execute("answer", {
+      cwd: request.resourceWorkspacePath,
+      modelInstanceId: request.modelInstanceId,
+      modelSnapshot: request.modelSnapshot,
+      bindingSnapshot: {
+        enabled: request.answerBindingEnabled,
+        timeoutSeconds: request.answerTimeoutSeconds,
+        maxConcurrency: request.answerMaxConcurrency,
+      },
+      prompt,
+      outputSchema: replyReviewJsonSchema as unknown as Record<string, unknown>,
+      validator: replyReviewSchema,
+      accessMode: "text-only",
+      executionTimeoutMs: request.answerTimeoutSeconds * 1000,
+      concurrencyGroup: "reply-reviewer",
+      maxConcurrency: request.answerMaxConcurrency,
       ...(signal ? { signal } : {}),
     })
   }

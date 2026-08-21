@@ -1,4 +1,12 @@
-import type { AnswerDecision, InvestigationStep, InvestigationTrace } from "../codex/schemas.js"
+import type {
+  AnswerClaim,
+  AnswerDecision,
+  ComposedReply,
+  EvidencePacket,
+  InvestigationStep,
+  InvestigationTrace,
+  ReplyReview,
+} from "../codex/schemas.js"
 import type { CodexCommandObservation } from "../codex/executor.js"
 import {
   type ProjectCodeSnapshot,
@@ -12,6 +20,7 @@ import type { ConfiguredSecretRedactor } from "../security/dlp.js"
 import type {
   ResponseDepth,
   SupportAttachmentContext,
+  SupportDecisionInput,
   SupportDecisionAgentPort,
   SupportInvestigationCheckpoint,
   SupportResourceSummary,
@@ -65,6 +74,19 @@ export type SupportInvestigationResult = {
   snapshot: ProjectCodeSnapshot
   decision: AnswerDecision
   allowedMemoryIds: Set<string>
+  pipelineAudit: SupportReplyPipelineAudit
+}
+
+export type SupportReplyPipelineAudit = {
+  version: "evidence-compose-review-v1"
+  mode: "legacy" | "multi_stage"
+  evidencePacket: EvidencePacket | null
+  baselineAnswer: string
+  firstCandidateAnswer: string | null
+  revisedCandidateAnswer: string | null
+  reviews: ReplyReview[]
+  finalSource: "baseline" | "first_candidate" | "revised_candidate"
+  fallbackReason: string | null
 }
 
 export type SupportInvestigationServiceDependencies = {
@@ -164,6 +186,7 @@ export class SupportInvestigationService {
     }))
     const resourceWorkspace = await this.deps.resourceWorkspace.open(service.id, snapshot)
     let decision: AnswerDecision | null = null
+    let pipelineAudit: SupportReplyPipelineAudit | null = null
     const observations: CodexCommandObservation[] = []
     const databaseSteps: InvestigationStep[] = []
     const observationKeys = new Set<string>()
@@ -171,7 +194,7 @@ export class SupportInvestigationService {
     let databaseVerificationCount = 0
     let databaseLimitRecorded = false
     try {
-      const generated = await this.deps.agent.decide({
+      const decisionInput: SupportDecisionInput = {
           service: service.key,
           groupName: input.groupName,
           question: input.question,
@@ -248,7 +271,8 @@ export class SupportInvestigationService {
               workspacePath: resourceWorkspace.path,
             }))
           },
-        }, signal)
+        }
+      const generated = await this.deps.agent.decide(decisionInput, signal)
       decision = this.redactDecision({
         ...generated,
         investigation: this.trustedInvestigation({
@@ -265,6 +289,9 @@ export class SupportInvestigationService {
           workspacePath: resourceWorkspace.path,
         }),
       }, allowedMemoryIds)
+      const pipeline = await this.runReplyPipeline(decisionInput, decision, allowedMemoryIds, signal)
+      decision = pipeline.decision
+      pipelineAudit = pipeline.audit
       await this.publishProgress(input, snapshot, decision.investigation)
       const outbound = decision.decision !== "ignore" ? this.deps.redactor.assertSafeOutbound(decision.answer) : null
       const unsafeOutbound = Boolean(outbound && (!outbound.allowed || !outbound.safeText.trim() || garbled(outbound.safeText)))
@@ -292,11 +319,215 @@ export class SupportInvestigationService {
       await resourceWorkspace.cleanup()
     }
     if (!decision) throw new Error("回答模型未形成结果")
+    if (!pipelineAudit) throw new Error("回答流水线未形成审计结果")
     await this.publishProgress(input, snapshot, decision.investigation)
     const currentService = this.deps.codeSync.currentServiceForSnapshot(snapshot)
     if (!currentService) throw new SupportCodeConfigurationChangedError()
     service = currentService
-    return { service, snapshot, decision, allowedMemoryIds }
+    return { service, snapshot, decision, allowedMemoryIds, pipelineAudit }
+  }
+
+  private async runReplyPipeline(
+    request: SupportDecisionInput,
+    baseline: AnswerDecision,
+    allowedMemoryIds: Set<string>,
+    signal: AbortSignal,
+  ): Promise<{ decision: AnswerDecision; audit: SupportReplyPipelineAudit }> {
+    const legacyAudit = (fallbackReason: string | null): SupportReplyPipelineAudit => ({
+      version: "evidence-compose-review-v1",
+      mode: "legacy",
+      evidencePacket: baseline.evidencePacket ?? null,
+      baselineAnswer: baseline.answer,
+      firstCandidateAnswer: null,
+      revisedCandidateAnswer: null,
+      reviews: [],
+      finalSource: "baseline",
+      fallbackReason,
+    })
+    if (baseline.decision === "ignore") return { decision: baseline, audit: legacyAudit("ignore 不生成对外回复") }
+    if (!baseline.evidencePacket || !this.deps.agent.composeReply || !this.deps.agent.reviewReply) {
+      return { decision: baseline, audit: legacyAudit("调查模型或运行适配器尚未提供多阶段交接") }
+    }
+    const packet = this.trustEvidencePacket(baseline.evidencePacket, baseline.investigation)
+    const baseReviewInput = {
+      request,
+      decision: {
+        decision: baseline.decision,
+        escalationType: baseline.escalationType,
+        humanOperation: baseline.humanOperation,
+        responsibility: baseline.responsibility,
+        interaction: baseline.interaction,
+      },
+      evidencePacket: packet,
+      baseline: {
+        answer: baseline.answer,
+        quote: baseline.quote,
+        answerClaims: baseline.answerClaims,
+        usedMemoryVersionIds: baseline.usedMemoryVersionIds,
+      },
+    } as const
+    let first: ComposedReply | null = null
+    let revised: ComposedReply | null = null
+    const reviews: ReplyReview[] = []
+    try {
+      first = this.safeComposedReply(
+        await this.deps.agent.composeReply({
+          request: baseReviewInput.request,
+          decision: baseReviewInput.decision,
+          evidencePacket: packet,
+        }, signal),
+        packet,
+        allowedMemoryIds,
+      )
+      const firstReview = this.redactReview(await this.deps.agent.reviewReply({
+        ...baseReviewInput,
+        candidate: first,
+        attempt: 1,
+      }, signal))
+      reviews.push(firstReview)
+      if (firstReview.outcome === "approve") {
+        return this.pipelineResult(baseline, packet, first, null, reviews, "first_candidate", null)
+      }
+      if (firstReview.outcome === "prefer_baseline") {
+        return this.pipelineResult(baseline, packet, first, null, reviews, "baseline", firstReview.reason)
+      }
+      revised = this.safeComposedReply(
+        await this.deps.agent.composeReply({
+          request: baseReviewInput.request,
+          decision: baseReviewInput.decision,
+          evidencePacket: packet,
+          revisionFeedback: firstReview.issues,
+        }, signal),
+        packet,
+        allowedMemoryIds,
+      )
+      const secondReview = this.redactReview(await this.deps.agent.reviewReply({
+        ...baseReviewInput,
+        candidate: revised,
+        attempt: 2,
+      }, signal))
+      reviews.push(secondReview)
+      if (secondReview.outcome === "approve") {
+        return this.pipelineResult(baseline, packet, first, revised, reviews, "revised_candidate", null)
+      }
+      return this.pipelineResult(baseline, packet, first, revised, reviews, "baseline", secondReview.reason)
+    } catch (error) {
+      if (signal.aborted) throw error
+      const reason = error instanceof Error
+        ? `多阶段回复未完成，保留调查模型基线：${error.name}`
+        : "多阶段回复未完成，保留调查模型基线"
+      return this.pipelineResult(baseline, packet, first, revised, reviews, "baseline", reason)
+    }
+  }
+
+  private pipelineResult(
+    baseline: AnswerDecision,
+    packet: EvidencePacket,
+    first: ComposedReply | null,
+    revised: ComposedReply | null,
+    reviews: ReplyReview[],
+    finalSource: SupportReplyPipelineAudit["finalSource"],
+    fallbackReason: string | null,
+  ): { decision: AnswerDecision; audit: SupportReplyPipelineAudit } {
+    const selected = finalSource === "first_candidate" ? first : finalSource === "revised_candidate" ? revised : null
+    const decision = selected ? this.applyComposedReply(baseline, selected, packet) : baseline
+    return {
+      decision,
+      audit: {
+        version: "evidence-compose-review-v1",
+        mode: "multi_stage",
+        evidencePacket: packet,
+        baselineAnswer: baseline.answer,
+        firstCandidateAnswer: first?.answer ?? null,
+        revisedCandidateAnswer: revised?.answer ?? null,
+        reviews,
+        finalSource,
+        fallbackReason,
+      },
+    }
+  }
+
+  private applyComposedReply(baseline: AnswerDecision, composed: ComposedReply, packet: EvidencePacket): AnswerDecision {
+    const facts = new Map(packet.facts.map((fact) => [fact.id, fact]))
+    const claims: AnswerClaim[] = composed.claims.map((claim) => {
+      const fact = facts.get(claim.factId)
+      if (!fact || !fact.outboundSafe) throw new Error("回复引用了不存在或不可出站的证据事实")
+      return {
+        statement: claim.statement,
+        provenance: fact.provenance,
+        evidenceSource: fact.evidenceSource,
+        evidence: fact.evidence,
+      }
+    })
+    return {
+      ...baseline,
+      answer: composed.answer,
+      quote: composed.quote,
+      answerClaims: claims,
+      usedMemoryVersionIds: composed.usedMemoryVersionIds,
+      evidencePacket: packet,
+    }
+  }
+
+  private safeComposedReply(
+    reply: ComposedReply,
+    packet: EvidencePacket,
+    allowedMemoryIds: Set<string>,
+  ): ComposedReply {
+    const outbound = this.deps.redactor.assertSafeOutbound(reply.answer)
+    if (!outbound.allowed || !outbound.safeText.trim() || garbled(outbound.safeText)) {
+      throw new SupportModelOutputRejectedError(["组合回复为空、乱码或触发敏感信息出站拦截"])
+    }
+    const safeQuote = reply.quote ? this.deps.redactor.assertSafeOutbound(reply.quote).safeText.slice(0, 1000) : null
+    const knownFacts = new Map(packet.facts.map((fact) => [fact.id, fact]))
+    const claims = reply.claims.map((claim) => {
+      const fact = knownFacts.get(claim.factId)
+      if (!fact?.outboundSafe) throw new Error("组合回复引用了不可用事实")
+      const statement = this.deps.redactor.assertSafeOutbound(claim.statement).safeText.slice(0, 1000)
+      if (!outbound.safeText.includes(statement)) throw new Error("组合回复事实声明未出现在最终正文")
+      return { factId: claim.factId, statement }
+    })
+    return {
+      answer: outbound.safeText.slice(0, 12000),
+      quote: safeQuote,
+      claims,
+      usedMemoryVersionIds: reply.usedMemoryVersionIds.filter((id) => allowedMemoryIds.has(id)),
+    }
+  }
+
+  private trustEvidencePacket(packet: EvidencePacket, trace: InvestigationTrace): EvidencePacket {
+    const availableSources = new Set(trace.steps
+      .filter((step) => step.status === "confirmed")
+      .map((step) => step.source))
+    availableSources.add("inference")
+    const redact = (value: string, maximum: number) => this.deps.redactor.redact(value).text.slice(0, maximum)
+    return {
+      ...packet,
+      communication: {
+        ...packet.communication,
+        recipient: packet.communication.recipient ? redact(packet.communication.recipient, 120) : null,
+        desiredOutcome: redact(packet.communication.desiredOutcome, 500),
+      },
+      facts: packet.facts
+        .filter((fact) => availableSources.has(fact.evidenceSource))
+        .map((fact) => ({
+          ...fact,
+          statement: redact(fact.statement, 1000),
+          evidence: redact(fact.evidence, 1000),
+        })),
+      requiredAnswerPoints: packet.requiredAnswerPoints.map((item) => redact(item, 500)),
+      unknowns: packet.unknowns.map((item) => redact(item, 500)),
+      handlingNotes: packet.handlingNotes.map((item) => redact(item, 500)),
+    }
+  }
+
+  private redactReview(review: ReplyReview): ReplyReview {
+    const redact = (value: string, maximum: number) => this.deps.redactor.redact(value).text.slice(0, maximum)
+    return {
+      ...review,
+      issues: review.issues.map((issue) => redact(issue, 500)),
+      reason: redact(review.reason, 1000),
+    }
   }
 
   private async syncStableCode(
@@ -529,6 +760,26 @@ export class SupportInvestigationService {
         interaction: {
           ...decision.interaction,
           underlyingNeed: redact(decision.interaction.underlyingNeed, 300),
+        },
+      } : {}),
+      ...(decision.evidencePacket ? {
+        evidencePacket: {
+          ...decision.evidencePacket,
+          communication: {
+            ...decision.evidencePacket.communication,
+            recipient: decision.evidencePacket.communication.recipient
+              ? redact(decision.evidencePacket.communication.recipient, 120)
+              : null,
+            desiredOutcome: redact(decision.evidencePacket.communication.desiredOutcome, 500),
+          },
+          facts: decision.evidencePacket.facts.map((fact) => ({
+            ...fact,
+            statement: redact(fact.statement, 1000),
+            evidence: redact(fact.evidence, 1000),
+          })),
+          requiredAnswerPoints: decision.evidencePacket.requiredAnswerPoints.map((item) => redact(item, 500)),
+          unknowns: decision.evidencePacket.unknowns.map((item) => redact(item, 500)),
+          handlingNotes: decision.evidencePacket.handlingNotes.map((item) => redact(item, 500)),
         },
       } : {}),
       investigation,

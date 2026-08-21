@@ -61,6 +61,7 @@ const portableTables = [
   "admin_chat_turns",
   "admin_chat_attachments",
   "admin_chat_corrections",
+  "reply_generation_audits",
   "memory_maintenance_runs",
   "model_instances",
   "model_catalog_entries",
@@ -79,7 +80,7 @@ const sensitiveScanTables = [
   "telegram_outgoing_candidates",
   "support_message_attachments", "support_replies", "support_reply_payloads", "reply_memory_refs",
   "shadow_answer_results", "shadow_human_answer_links", "shadow_learning_reports", "shadow_comparisons",
-  "admin_chat_attachments", "admin_chat_corrections",
+  "admin_chat_attachments", "admin_chat_corrections", "reply_generation_audits",
   "memory_maintenance_runs", "knowledge_documents",
   "model_profiles", "model_instances", "runtime_model_bindings", "runtime_settings", "daily_group_shutdown_schedule",
 ] as const
@@ -355,6 +356,7 @@ export class BackupService {
     let portableHasTelegramOutgoingCandidates = false
     let portableHasAdminChatAttachments = false
     let portableHasAdminChatCorrections = false
+    let portableHasReplyGenerationAudits = false
     let portableHasThreadLinks = false
     let portableHasSenderFocus = false
     let portableHasDailyGroupShutdownSchedule = false
@@ -457,6 +459,9 @@ export class BackupService {
       ).get())
       portableHasAdminChatCorrections = Boolean(portableStructure.prepare(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='admin_chat_corrections'",
+      ).get())
+      portableHasReplyGenerationAudits = Boolean(portableStructure.prepare(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='reply_generation_audits'",
       ).get())
       portableHasThreadLinks = Boolean(portableStructure.prepare(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='support_thread_links'",
@@ -768,6 +773,11 @@ export class BackupService {
           copy("admin_chat_attachments", "id,turn_id,file_name,mime_type,file_size,kind,storage_path,extracted_text,created_at")
           copy("admin_chat_corrections", "id,turn_id,corrected_answer,reason,corrected_by,created_at")
         }
+        if (portableHasReplyGenerationAudits) {
+          copy("reply_generation_audits", `id,support_reply_id,admin_chat_turn_id,pipeline_version,mode,
+            evidence_packet_json,baseline_answer,first_candidate_answer,revised_candidate_answer,reviews_json,
+            final_source,fallback_reason,created_at`)
+        }
         copy(
           "runtime_settings",
           "id,telegram_enabled,code_sync_enabled,auto_learning_enabled,learning_interval_seconds,learning_batch_size,message_debounce_ms,progress_notification_seconds,updated_at",
@@ -804,7 +814,7 @@ export class BackupService {
     const integrity = portable.prepare("PRAGMA integrity_check").all() as Array<{ integrity_check: string }>
     if (integrity.length !== 1 || integrity[0]?.integrity_check !== "ok") throw new Error("迁移数据库完整性检查失败")
     const schemaVersion = portable.schemaVersion()
-    if (![12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31].includes(schemaVersion)) {
+    if (![12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32].includes(schemaVersion)) {
       throw new Error("迁移数据库版本不兼容")
     }
     const existing = new Set((portable.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>).map((row) => row.name))

@@ -32,7 +32,7 @@ describe("sender focus schema v24", () => {
   it("creates the v24 sender focus and route clarification tables", async () => {
     const database = await openTemporaryDatabase()
 
-    expect(database.schemaVersion()).toBe(31)
+    expect(database.schemaVersion()).toBe(32)
     expect(database.prepare(`SELECT name FROM sqlite_master
       WHERE type='table' AND name IN ('support_sender_focus','support_route_clarifications')
       ORDER BY name`).all()).toEqual([
@@ -52,7 +52,7 @@ describe("sender focus schema v24", () => {
     const migrated = await RuntimeDatabase.open(filePath)
     openDatabases.push(migrated)
 
-    expect(migrated.schemaVersion()).toBe(31)
+    expect(migrated.schemaVersion()).toBe(32)
     expect(migrated.prepare(`SELECT name FROM sqlite_master
       WHERE type='table' AND name IN ('support_sender_focus','support_route_clarifications')
       ORDER BY name`).all()).toHaveLength(2)
@@ -69,7 +69,7 @@ describe("sender focus schema v24", () => {
     const portable = RuntimeDatabase.openPortable(filePath)
     openDatabases.push(portable)
 
-    expect(portable.schemaVersion()).toBe(31)
+    expect(portable.schemaVersion()).toBe(32)
     expect(portable.prepare(`SELECT name,sql FROM sqlite_master
       WHERE type='index' AND name IN (
         'support_sender_focus_expiry_idx',

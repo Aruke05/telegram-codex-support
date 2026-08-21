@@ -746,7 +746,7 @@ describe("人工参考消息保留期", () => {
     const databasePath = path.join(directory, "portable.sqlite")
     let database: RuntimeDatabase | null = await RuntimeDatabase.open(databasePath)
     try {
-      expect(database.schemaVersion()).toBe(31)
+      expect(database.schemaVersion()).toBe(32)
       database.prepare("DROP INDEX IF EXISTS support_message_events_retention_idx").run()
       database.prepare("DROP TABLE telegram_outgoing_candidates").run()
       database.prepare("DROP TABLE telegram_output_ownership").run()
@@ -755,7 +755,7 @@ describe("人工参考消息保留期", () => {
       database = null
       database = RuntimeDatabase.openPortable(databasePath)
 
-      expect(database.schemaVersion()).toBe(31)
+      expect(database.schemaVersion()).toBe(32)
       expect(database.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name=?")
         .get("support_message_events_retention_idx")).toEqual({ name: "support_message_events_retention_idx" })
     } finally {

@@ -17,7 +17,7 @@ import type { AdminChatStore } from "./store.js"
 
 type AdminChatWorkerDependencies = {
   store: AdminChatStore
-  database: Pick<RuntimeDatabase, "readProjects" | "readActiveOperatorStyle">
+  database: Pick<RuntimeDatabase, "readProjects" | "readActiveOperatorStyle" | "recordReplyGenerationAudit">
   config: Pick<ModelConfigService, "getProfile" | "getBinding" | "getModelInstanceSnapshot">
   investigation: Pick<SupportInvestigationService, "investigate">
   redactor: ConfiguredSecretRedactor
@@ -317,6 +317,18 @@ export class AdminChatWorker {
       }, controller.signal)
       const redact = (value: string) => this.deps.redactor.redact(value).text
       const decision = result.decision
+      this.deps.database.recordReplyGenerationAudit({
+        adminChatTurnId: turn.id,
+        pipelineVersion: result.pipelineAudit.version,
+        mode: result.pipelineAudit.mode,
+        evidencePacket: result.pipelineAudit.evidencePacket,
+        baselineAnswer: result.pipelineAudit.baselineAnswer,
+        firstCandidateAnswer: result.pipelineAudit.firstCandidateAnswer,
+        revisedCandidateAnswer: result.pipelineAudit.revisedCandidateAnswer,
+        reviews: result.pipelineAudit.reviews,
+        finalSource: result.pipelineAudit.finalSource,
+        fallbackReason: result.pipelineAudit.fallbackReason,
+      })
       const completed = this.deps.store.completeTurn(turn.id, {
         answer: redact(decision.answer),
         decision: decision.decision,
