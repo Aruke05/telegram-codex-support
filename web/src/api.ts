@@ -151,6 +151,11 @@ export function createApiClient(fetcher: Fetcher = globalThis.fetch.bind(globalT
     getLearningReports: () => requestJson<{ items: ShadowLearningReport[] }>(fetcher, "/api/learning-reports"),
     getLearningReport: (id: string) => requestJson<{ report: ShadowLearningReport; comparisons: Array<Record<string, unknown>> }>(fetcher, `/api/learning-reports/${encodeURIComponent(id)}`),
     createLearningReport: () => requestJson<ShadowLearningReport>(fetcher, "/api/learning-reports", { method: "POST" }),
+    retryLearningReport: (id: string) => requestJson<ShadowLearningReport>(
+      fetcher,
+      `/api/learning-reports/${encodeURIComponent(id)}/retry`,
+      { method: "POST" },
+    ),
 
     getRoles: () => requestJson<{ roles: TelegramRole[] }>(fetcher, "/api/telegram/roles"),
     createRole: (input: TelegramRoleInput) => requestJson<TelegramRole>(fetcher, "/api/telegram/roles", json("POST", input)),

@@ -707,7 +707,7 @@ describe("人工接管与发送边界", () => {
     expect(harness.store.claimDue(dueAt)?.thread.id).toBe(thread.id)
   })
 
-  it("人工优先已发稍等后模型失败会真实转人工并发送终态", async () => {
+  it("人工优先已发稍等后模型失败只转技术且不发送固定终态", async () => {
     const harness = await createBaseHarness()
     const { event, thread } = createQuestion(harness, "priority-model-failure")
     markHumanPriorityClaimed(harness, thread, event.id)
@@ -724,53 +724,48 @@ describe("人工接管与发送边界", () => {
     await worker.runDueOnce(new Date())
 
     expect(sendSupportAlert).toHaveBeenCalledTimes(1)
-    expect(sendMessage).toHaveBeenCalledWith(
-      harness.group.accountId,
-      harness.group.telegramChatId,
-      "这边没处理完，我帮你转给技术继续跟进",
-      thread.anchorMessageId,
-      undefined,
-      expect.objectContaining({ threadId: thread.id, kind: "support_reply" }),
-    )
-    expect(harness.store.getThread(thread.id).status).toBe("escalated")
-    expect(harness.database.readReplies("WHERE r.thread_id=?", [thread.id])).toEqual([
-      expect.objectContaining({ status: "escalated", decision: "escalate", errorCode: "answer_model_failed" }),
-    ])
-  })
-
-  it("人工优先已发稍等后模型选择 ignore 也转人工而不静默关闭", async () => {
-    const harness = await createBaseHarness()
-    const { event, thread } = createQuestion(harness, "priority-ignore")
-    markHumanPriorityClaimed(harness, thread, event.id)
-    const snapshot = seedCodeSnapshot(harness)
-    const sendMessage = vi.fn(async () => "handoff-message")
-    const worker = createWorker(harness, {
-      readCurrentSnapshot: () => snapshot,
-      decision: { ...answerDecision(), decision: "ignore", answer: "", reason: "判断为无需回复" },
-      sendMessage,
-    })
-
-    await worker.runDueOnce(new Date())
-
-    expect(sendMessage).toHaveBeenCalledWith(
-      harness.group.accountId,
-      harness.group.telegramChatId,
-      "这边没处理完，我帮你转给技术继续跟进",
-      thread.anchorMessageId,
-      undefined,
-      expect.objectContaining({ threadId: thread.id, kind: "support_reply" }),
-    )
+    expect(sendMessage).not.toHaveBeenCalled()
     expect(harness.store.getThread(thread.id).status).toBe("escalated")
     expect(harness.database.readReplies("WHERE r.thread_id=?", [thread.id])).toEqual([
       expect.objectContaining({
         status: "escalated",
         decision: "escalate",
+        answer: "",
+        errorCode: "answer_model_failed",
+      }),
+    ])
+  })
+
+  it("人工优先已发稍等后模型选择 ignore 时只转技术且不发送固定终态", async () => {
+    const harness = await createBaseHarness()
+    const { event, thread } = createQuestion(harness, "priority-ignore")
+    markHumanPriorityClaimed(harness, thread, event.id)
+    const snapshot = seedCodeSnapshot(harness)
+    const sendMessage = vi.fn(async () => "handoff-message")
+    const sendSupportAlert = vi.fn(async () => ({ status: "sent" as const, summary: "sent", errorType: null }))
+    const worker = createWorker(harness, {
+      readCurrentSnapshot: () => snapshot,
+      decision: { ...answerDecision(), decision: "ignore", answer: "", reason: "判断为无需回复" },
+      sendMessage,
+      sendSupportAlert,
+    })
+
+    await worker.runDueOnce(new Date())
+
+    expect(sendSupportAlert).toHaveBeenCalledTimes(1)
+    expect(sendMessage).not.toHaveBeenCalled()
+    expect(harness.store.getThread(thread.id).status).toBe("escalated")
+    expect(harness.database.readReplies("WHERE r.thread_id=?", [thread.id])).toEqual([
+      expect.objectContaining({
+        status: "escalated",
+        decision: "escalate",
+        answer: "",
         errorCode: "answer_ignored_after_human_priority",
       }),
     ])
   })
 
-  it("人工优先已发稍等后代码资源不可用会转人工而不静默关闭", async () => {
+  it("人工优先已发稍等后代码资源不可用只转技术且不发送固定终态", async () => {
     const harness = await createBaseHarness()
     const { event, thread } = createQuestion(harness, "priority-snapshot-failure")
     markHumanPriorityClaimed(harness, thread, event.id)
@@ -788,16 +783,80 @@ describe("人工接管与发送边界", () => {
 
     expect(sendSupportAlert).toHaveBeenCalledTimes(1)
     expect(sendCodeSyncFailure).not.toHaveBeenCalled()
-    expect(sendMessage).toHaveBeenCalledWith(
-      harness.group.accountId,
-      harness.group.telegramChatId,
-      "这边没处理完，我帮你转给技术继续跟进",
-      thread.anchorMessageId,
-      undefined,
-      expect.objectContaining({ threadId: thread.id, kind: "support_reply" }),
-    )
+    expect(sendMessage).not.toHaveBeenCalled()
     expect(harness.database.readReplies("WHERE r.thread_id=?", [thread.id])).toEqual([
-      expect.objectContaining({ status: "escalated", decision: "escalate", errorCode: "investigation_runtime_failed" }),
+      expect.objectContaining({
+        status: "escalated",
+        decision: "escalate",
+        answer: "",
+        errorCode: "investigation_runtime_failed",
+      }),
+    ])
+  })
+
+  it("人工优先后的正常答复会消费待接管状态且后续致谢保持静默", async () => {
+    const harness = await createBaseHarness()
+    const { event, thread } = createQuestion(harness, "priority-replied-thanks")
+    markHumanPriorityClaimed(harness, thread, event.id)
+    const snapshot = seedCodeSnapshot(harness)
+    const firstSendMessage = vi.fn(async () => "answer-message")
+    const firstWorker = createWorker(harness, {
+      readCurrentSnapshot: () => snapshot,
+      decision: answerDecision(),
+      sendMessage: firstSendMessage,
+    })
+
+    await firstWorker.runDueOnce(new Date())
+
+    expect(firstSendMessage).toHaveBeenCalledTimes(1)
+    expect(harness.database.prepare(`SELECT status,human_priority_state FROM support_threads WHERE id=?`)
+      .get(thread.id)).toEqual({ status: "answered", human_priority_state: "none" })
+
+    const thanks = harness.store.recordEvent({
+      groupId: harness.group.id,
+      accountId: harness.group.accountId,
+      telegramMessageId: "priority-replied-thanks-followup",
+      replyToMessageId: "answer-message",
+      messageThreadId: null,
+      senderUserId: event.senderUserId,
+      senderUsername: null,
+      senderDisplayName: "运营",
+      senderRole: null,
+      text: "好的 谢谢",
+      attachmentSummary: "",
+      routeStatus: "received",
+      skipReason: null,
+    }).event
+    const reopened = harness.store.appendMessage({
+      threadId: thread.id,
+      eventId: thanks.id,
+      relation: "reopen",
+      questionFragment: thanks.safeText,
+      settleAt: new Date(Date.now() - 1_000).toISOString(),
+    })
+    expect(reopened).toMatchObject({ status: "collecting" })
+    expect(harness.database.prepare(`SELECT human_priority_state FROM support_threads WHERE id=?`)
+      .get(thread.id)).toEqual({ human_priority_state: "none" })
+
+    const followupSendMessage = vi.fn(async () => "must-not-send")
+    const sendSupportAlert = vi.fn(async () => ({ status: "sent" as const, summary: "sent", errorType: null }))
+    const followupWorker = createWorker(harness, {
+      readCurrentSnapshot: () => snapshot,
+      decision: { ...answerDecision(), decision: "ignore", answer: "", reason: "运营仅确认收到并致谢" },
+      sendMessage: followupSendMessage,
+      sendSupportAlert,
+    })
+
+    await followupWorker.runDueOnce(new Date())
+
+    expect(followupSendMessage).not.toHaveBeenCalled()
+    expect(sendSupportAlert).not.toHaveBeenCalled()
+    expect(harness.store.getThread(thread.id)).toMatchObject({ status: "closed" })
+    expect(harness.database.prepare(`SELECT human_priority_state FROM support_threads WHERE id=?`)
+      .get(thread.id)).toEqual({ human_priority_state: "none" })
+    expect(harness.database.readReplies("WHERE r.thread_id=? ORDER BY r.created_at", [thread.id])).toEqual([
+      expect.objectContaining({ status: "replied", decision: "reply" }),
+      expect.objectContaining({ status: "ignored", decision: "ignore", answer: "" }),
     ])
   })
 

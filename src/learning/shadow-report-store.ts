@@ -69,6 +69,22 @@ function sanitizeResult(result: ShadowReportResult): ShadowReportResult {
   }
 }
 
+function unique(values: string[]): string[] {
+  return [...new Set(values)].slice(0, 20)
+}
+
+function mergeSummary(
+  current: ShadowReportResult["summary"] | null,
+  incoming: ShadowReportResult["summary"],
+): ShadowReportResult["summary"] {
+  return {
+    headline: incoming.headline,
+    strengths: unique([...(current?.strengths ?? []), ...incoming.strengths]),
+    gaps: unique([...(current?.gaps ?? []), ...incoming.gaps]),
+    recommendations: unique([...(current?.recommendations ?? []), ...incoming.recommendations]),
+  }
+}
+
 export class ShadowReportStore {
   constructor(private readonly database: RuntimeDatabase) {}
 
@@ -144,6 +160,17 @@ export class ShadowReportStore {
     })
   }
 
+  retryFailed(id: string, now = new Date()): ClaimedShadowReport | null {
+    const timestamp = now.toISOString()
+    return this.database.transaction(() => {
+      const changed = this.database.prepare(`UPDATE shadow_learning_reports SET status='pending',claim_token=NULL,
+        error_message='上次生成失败，已继续生成',started_at=NULL,completed_at=NULL,updated_at=?
+        WHERE id=? AND status='failed'`).run(timestamp, id)
+      if (Number(changed.changes) !== 1) return null
+      return this.claimDue(now, id)
+    })
+  }
+
   samples(cutoffAt: string): ShadowReportSample[] {
     const results = this.database.prepare(`SELECT result.*,payload.question FROM shadow_answer_results result
       JOIN support_threads thread ON thread.id=result.thread_id AND thread.answer_operation_mode='learning'
@@ -167,12 +194,35 @@ export class ShadowReportStore {
     })
   }
 
-  complete(claim: ClaimedShadowReport, samples: ShadowReportSample[], result: ShadowReportResult, now = new Date()): ShadowLearningReport {
+  comparedSampleIds(reportId: string): Set<string> {
+    return new Set((this.database.prepare(`SELECT shadow_result_id FROM shadow_comparisons
+      WHERE report_id=? AND shadow_result_id IS NOT NULL`).all(reportId) as Array<{ shadow_result_id: string }>)
+      .map((row) => row.shadow_result_id))
+  }
+
+  appendBatch(
+    claim: ClaimedShadowReport,
+    samples: ShadowReportSample[],
+    result: ShadowReportResult,
+    now = new Date(),
+  ): void {
     result = sanitizeResult(result)
+    const expected = new Set(samples.map((sample) => sample.sampleId))
+    const actual = result.comparisons.map((comparison) => comparison.sampleId)
+    if (actual.length !== expected.size || new Set(actual).size !== actual.length
+      || actual.some((id) => !expected.has(id))) {
+      throw new Error("影子学习报告没有完整覆盖本批问题单元")
+    }
     const timestamp = now.toISOString()
-    const markdown = render(result, samples)
     this.database.transaction(() => {
-      const insert = this.database.prepare(`INSERT INTO shadow_comparisons(
+      const row = this.database.prepare(`SELECT summary_json FROM shadow_learning_reports
+        WHERE id=? AND status='running' AND claim_token=?`).get(claim.id, claim.claimToken) as SqlRow | undefined
+      if (!row) throw new Error("学习报告 claim 已失效")
+      const currentSummary = row.summary_json === null
+        ? null
+        : JSON.parse(String(row.summary_json)) as ShadowReportResult["summary"]
+      const summary = mergeSummary(currentSummary, result.summary)
+      const insert = this.database.prepare(`INSERT OR IGNORE INTO shadow_comparisons(
         id,report_id,shadow_result_id,thread_id,input_revision,question_snapshot,shadow_answer_snapshot,
         human_answers_json,human_message_event_ids_json,comparison_json,created_at
       ) VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
@@ -184,14 +234,55 @@ export class ShadowReportStore {
           sample.question, sample.shadowAnswer, JSON.stringify(sample.humanAnswers),
           JSON.stringify(sample.humanAnswers.map((answer) => answer.messageEventId)), JSON.stringify(comparison), timestamp)
       })
-      const changed = this.database.prepare(`UPDATE shadow_learning_reports SET status='completed',claim_token=NULL,
-        sample_count=?,summary_json=?,rendered_markdown=?,completed_at=?,updated_at=?
+      const sampleCount = Number((this.database.prepare(`SELECT COUNT(*) AS count FROM shadow_comparisons
+        WHERE report_id=?`).get(claim.id) as { count: number }).count)
+      const changed = this.database.prepare(`UPDATE shadow_learning_reports SET sample_count=?,summary_json=?,updated_at=?
         WHERE id=? AND status='running' AND claim_token=?`).run(
-        samples.length, JSON.stringify(result.summary), markdown, timestamp, timestamp, claim.id, claim.claimToken,
+        sampleCount, JSON.stringify(summary), timestamp, claim.id, claim.claimToken,
+      )
+      if (Number(changed.changes) !== 1) throw new Error("学习报告 claim 已失效")
+    })
+  }
+
+  finalize(
+    claim: ClaimedShadowReport,
+    samples: ShadowReportSample[],
+    headline: string,
+    now = new Date(),
+  ): ShadowLearningReport {
+    const timestamp = now.toISOString()
+    this.database.transaction(() => {
+      const report = this.database.prepare(`SELECT summary_json FROM shadow_learning_reports
+        WHERE id=? AND status='running' AND claim_token=?`).get(claim.id, claim.claimToken) as SqlRow | undefined
+      if (!report) throw new Error("学习报告 claim 已失效")
+      const rows = this.database.prepare(`SELECT comparison_json FROM shadow_comparisons
+        WHERE report_id=? ORDER BY created_at,id`).all(claim.id) as SqlRow[]
+      const comparisons = rows.map((row) => JSON.parse(String(row.comparison_json)) as ShadowReportResult["comparisons"][number])
+      const expected = new Set(samples.map((sample) => sample.sampleId))
+      const actual = comparisons.map((comparison) => comparison.sampleId)
+      if (actual.length !== expected.size || new Set(actual).size !== actual.length
+        || actual.some((id) => !expected.has(id))) {
+        throw new Error("学习报告尚有未完成的问题单元")
+      }
+      const partial = report.summary_json === null
+        ? { headline, strengths: [], gaps: [], recommendations: [] }
+        : JSON.parse(String(report.summary_json)) as ShadowReportResult["summary"]
+      const summary = { ...partial, headline: redactText(headline).text }
+      const result = { summary, comparisons }
+      const markdown = render(result, samples)
+      const changed = this.database.prepare(`UPDATE shadow_learning_reports SET status='completed',claim_token=NULL,
+        sample_count=?,summary_json=?,rendered_markdown=?,error_message=NULL,completed_at=?,updated_at=?
+        WHERE id=? AND status='running' AND claim_token=?`).run(
+        samples.length, JSON.stringify(summary), markdown, timestamp, timestamp, claim.id, claim.claimToken,
       )
       if (Number(changed.changes) !== 1) throw new Error("学习报告 claim 已失效")
     })
     return this.get(claim.id)
+  }
+
+  complete(claim: ClaimedShadowReport, samples: ShadowReportSample[], result: ShadowReportResult, now = new Date()): ShadowLearningReport {
+    this.appendBatch(claim, samples, result, now)
+    return this.finalize(claim, samples, result.summary.headline, now)
   }
 
   fail(claim: ClaimedShadowReport, error: unknown, now = new Date()): void {

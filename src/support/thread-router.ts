@@ -36,6 +36,15 @@ export type ThreadRouteInput = {
   group: RuntimeGroup
   service: ProjectServiceRecord
   messages: SupportMessageEvent[]
+  attachments?: Array<{
+    eventId: string
+    name: string
+    kind: "text" | "image" | "video" | "archive" | "pdf" | "other"
+    mimeType: string
+    size: number
+    extractedText: string
+    localPath: string | null
+  }>
   focus: SenderRouteFocusContext | null
   pending: SenderRoutePendingContext | null
   ambiguity: SenderRoutePendingContext | null
@@ -53,6 +62,7 @@ export class CodexSupportThreadRouter implements SupportThreadRouterPort {
     const timeout = setTimeout(() => controller.abort(), 300_000)
     timeout.unref()
     try {
+      const attachments = input.attachments ?? []
       const result = await this.codex.execute<ThreadRouteResult>("answer", {
         cwd: process.cwd(),
         prompt: [
@@ -68,6 +78,7 @@ export class CodexSupportThreadRouter implements SupportThreadRouterPort {
           "最高优先级身份要求：所有发给运营的文字都由真实的当班客服自然接话，绝不能自称或暗示是 AI、机器人、模型、自动客服或程序，也不能讨论这些身份。",
           "investigationEffect=status_only 时 progressReply 必须现场生成一到两句热情、亲切、成熟的客服回复：先请对方稍等，再自然说明为了准确判断，除了核对当前服务本身，还要逐项核对数据库、服务器记录和应用后端日志，所以需要一些时间；只能说明仍在核对，不能假装已经查完，不能承诺完成时间。其他情况 progressReply 必须为 null。不要照抄固定模板，要结合本轮语境自然表达。",
           "只有待确认回答模式中的 pending 才允许选择 candidate_1/candidate_2。分类模式中的 ambiguity 只用于决定 follow_up、new_thread 或发起 uncertain 确认，不能直接选择候选。",
+          "存在多个合理指代或解释时，先判断是不是都能在当前服务、当前消息、图片和会话语境内可靠回答。只要各候选都有答案且并列回答不会触发错误操作、越权、资金或安全风险，就不要 uncertain，不要让运营二选一；使用 new_thread 保留完整问题，交给回答模型一次说明各候选分别对应的答案。只有至少一个候选缺少必要信息、候选会触发不同操作或权限边界、并列回答可能误导时才 uncertain。",
           "uncertain 且存在两个候选时，clarificationReply 必须用当班客服自然口吻在一句话里点出两个具体事项。禁止提 AI、机器人、模型、程序、线程、上下文，也禁止空泛问‘你问的是哪项’。其他 action 的 clarificationReply 必须为 null。",
           "questionFragment 保留本次排查所需原文，URL、订单号、金额、百分比、时间和错误标识逐字保留。",
           `群绑定：${JSON.stringify({ group: input.group.name, service: input.service.key, branch: input.service.branch })}`,
@@ -82,7 +93,21 @@ export class CodexSupportThreadRouter implements SupportThreadRouterPort {
             attachments: message.attachmentSummary,
             time: message.createdAt,
           })))}`,
+          `最新消息附件：${JSON.stringify(attachments.map((attachment) => ({
+            eventId: attachment.eventId,
+            name: attachment.name,
+            kind: attachment.kind,
+            mimeType: attachment.mimeType,
+            size: attachment.size,
+            extractedText: attachment.extractedText,
+            visualInputAttached: attachment.kind === "image" && Boolean(attachment.localPath),
+          })))}`,
         ].join("\n\n"),
+        images: attachments.flatMap((attachment) => (
+          attachment.kind === "image" && attachment.localPath
+            ? [{ path: attachment.localPath, mimeType: attachment.mimeType, name: attachment.name }]
+            : []
+        )),
         outputSchema: (input.mode === "classify"
           ? classifyThreadRouteResultJsonSchema
           : resolveThreadRouteResultJsonSchema) as unknown as Record<string, unknown>,

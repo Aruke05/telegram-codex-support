@@ -723,8 +723,63 @@ export class SupportThreadStore {
   }
 
   markRouteClarificationPrompt(id: string, promptReplyId: string | null, updatedAt = new Date().toISOString()): boolean {
-    return Number(this.database.prepare(`UPDATE support_route_clarifications SET prompt_reply_id=?,updated_at=?
-      WHERE id=? AND status='pending'`).run(promptReplyId, updatedAt, id).changes) === 1
+    if (!promptReplyId) return false
+    const clarification = this.database.prepare(
+      "SELECT message_event_id FROM support_route_clarifications WHERE id=?",
+    ).get(id) as SqlRow | undefined
+    if (!clarification) return false
+    const claim = this.claimRouteClarificationPrompt(
+      id,
+      promptReplyId,
+      String(clarification.message_event_id),
+      updatedAt,
+    )
+    return claim.claimed || claim.promptReplyId === promptReplyId
+  }
+
+  claimRouteClarificationPrompt(
+    id: string,
+    promptReplyId: string,
+    messageEventId: string,
+    updatedAt = new Date().toISOString(),
+  ): { claimed: boolean; promptReplyId: string | null } {
+    return this.database.transaction(() => {
+      const row = this.database.prepare(`SELECT status,prompt_reply_id,message_event_id
+        FROM support_route_clarifications WHERE id=?`).get(id) as SqlRow | undefined
+      if (!row || String(row.message_event_id) !== messageEventId || String(row.status) !== "pending") {
+        return {
+          claimed: false,
+          promptReplyId: row?.prompt_reply_id === null || row?.prompt_reply_id === undefined
+            ? null
+            : String(row.prompt_reply_id),
+        }
+      }
+      const existing = row.prompt_reply_id === null ? null : String(row.prompt_reply_id)
+      if (existing) {
+        this.setEventRoute(messageEventId, "routed", "待归属确认已进入发送链路")
+        return { claimed: false, promptReplyId: existing }
+      }
+      const changed = Number(this.database.prepare(`UPDATE support_route_clarifications
+        SET prompt_reply_id=?,updated_at=?
+        WHERE id=? AND status='pending' AND prompt_reply_id IS NULL`).run(
+        promptReplyId,
+        updatedAt,
+        id,
+      ).changes) === 1
+      if (!changed) {
+        const current = this.database.prepare(
+          "SELECT prompt_reply_id FROM support_route_clarifications WHERE id=?",
+        ).get(id) as SqlRow | undefined
+        return {
+          claimed: false,
+          promptReplyId: current?.prompt_reply_id === null || current?.prompt_reply_id === undefined
+            ? null
+            : String(current.prompt_reply_id),
+        }
+      }
+      this.setEventRoute(messageEventId, "routed", "待归属确认已进入发送链路")
+      return { claimed: true, promptReplyId }
+    })
   }
 
   resolveRouteClarification(input: ResolveRouteClarificationInput): SupportThread | null {
@@ -833,12 +888,19 @@ export class SupportThreadStore {
       )
       if (!inserted) return current
       const now = new Date().toISOString()
+      const reopensFinishedGeneration = current.status === "answered"
+        || current.status === "escalated"
+        || current.status === "closed"
       this.database.prepare(`UPDATE support_threads SET
-        revision=revision+1,status='collecting',settle_at=CASE
+        revision=revision+1,status='collecting',
+        human_priority_state=CASE
+          WHEN ?=1 AND human_priority_state='claimed' THEN 'none' ELSE human_priority_state END,
+        settle_at=CASE
           WHEN human_priority_state='waiting' AND human_priority_due_at>? THEN human_priority_due_at ELSE ? END,
         latest_message_at=?,
         generation_started_at=NULL,progress_due_at=NULL,hard_deadline_at=NULL,
         closed_at=NULL,closed_by=NULL,closed_reason=NULL,updated_at=? WHERE id=?`).run(
+        reopensFinishedGeneration ? 1 : 0,
         input.settleAt,
         input.settleAt,
         event.createdAt,
@@ -1317,7 +1379,9 @@ export class SupportThreadStore {
     status: "answered" | "escalated" | "closed",
     now = new Date().toISOString(),
   ): boolean {
-    const result = this.database.prepare(`UPDATE support_threads SET status=?,updated_at=?
+    const result = this.database.prepare(`UPDATE support_threads SET status=?,
+      human_priority_state=CASE WHEN human_priority_state='claimed' THEN 'none' ELSE human_priority_state END,
+      updated_at=?
       WHERE id=? AND revision=? AND status='generating'`).run(status, now, threadId, revision)
     return Number(result.changes) === 1
   }
@@ -1859,6 +1923,11 @@ export class SupportThreadStore {
     const row = this.database.prepare("SELECT * FROM support_message_events WHERE id=?").get(id) as SqlRow | undefined
     if (!row) throw new Error("客服消息事件不存在")
     return eventFromRow(row)
+  }
+
+  getEventAttachments(id: string): SupportMessageAttachment[] {
+    return (this.database.prepare(`SELECT * FROM support_message_attachments
+      WHERE message_event_id=? ORDER BY created_at,id`).all(id) as SqlRow[]).map(attachmentFromRow)
   }
 
   getEventByTelegramMessage(groupId: string, telegramMessageId: string): SupportMessageEvent | null {

@@ -504,6 +504,7 @@ export class TelegramRuntime {
       messageThreadId: message.message_thread_id === undefined ? null : String(message.message_thread_id),
       replyTargetIsBot: message.reply_to_message?.from?.is_bot ?? false,
       text: message.text ?? message.caption ?? "", attachments: descriptors.map((item) => this.attachments.describe(item)),
+      attachmentsPending: descriptors.length > 0,
       mediaGroupId: message.media_group_id ?? null,
       ...(message.date ? { createdAt: new Date(message.date * 1000).toISOString() } : {}),
     })
@@ -583,6 +584,7 @@ export class TelegramRuntime {
       messageThreadId: message.replyTo?.replyToTopId === undefined ? null : String(message.replyTo.replyToTopId),
       replyTargetIsBot,
       text: message.text ?? "", attachments: descriptors.map((item) => this.attachments.describe(item)),
+      attachmentsPending: descriptors.length > 0,
       mediaGroupId: message.groupedId?.toString() ?? null,
       ...(message.date ? { createdAt: new Date(message.date * 1000).toISOString() } : {}),
     })

@@ -11,8 +11,9 @@ import { ReplyEventBus } from "../../src/replies/reply-event-bus.js"
 import { ReplyService } from "../../src/replies/reply-service.js"
 import { BackupService } from "../../src/runtime/backup-service.js"
 import { RuntimeDatabase } from "../../src/runtime/database.js"
-import type { ProjectServiceRecord, RuntimeGroup } from "../../src/runtime/types.js"
+import type { ProjectServiceRecord, RuntimeGroup, SupportMessageEvent } from "../../src/runtime/types.js"
 import { ConfiguredSecretRedactor } from "../../src/security/dlp.js"
+import { systemDirectivesPrompt } from "../../src/support/system-directives.js"
 import { SupportThreadCoordinator } from "../../src/support/thread-coordinator.js"
 import { SupportThreadStore } from "../../src/support/thread-store.js"
 import { CodexSupportThreadRouter, type ThreadRouteInput } from "../../src/support/thread-router.js"
@@ -146,6 +147,28 @@ function startGenerating(
   })
   const reply = harness.replies.transition(pending.id, "generating")
   return { claim: claimed, reply }
+}
+
+function createUnthreadedReply(
+  harness: Awaited<ReturnType<typeof createHarness>>,
+  event: SupportMessageEvent,
+) {
+  return harness.replies.createPending({
+    threadId: null,
+    inputRevision: null,
+    groupId: harness.group.id,
+    accountId: harness.group.accountId,
+    projectId: harness.service.projectId,
+    serviceId: harness.service.id,
+    telegramMessageId: event.telegramMessageId,
+    senderUserId: event.senderUserId,
+    senderUsername: event.senderUsername,
+    senderDisplayName: event.senderDisplayName,
+    senderRole: event.senderRole,
+    service: harness.service.key,
+    serviceSource: "group_binding",
+    question: event.safeText || event.attachmentSummary,
+  })
 }
 
 describe("sender conversation focus store", () => {
@@ -463,6 +486,52 @@ describe("sender conversation focus store", () => {
       candidate_labels_json: JSON.stringify(["Aropay 新账号", "Aropay 密码重置"]),
     })
   })
+
+  it("claims a clarification prompt exactly once before delivery and keeps the source event routed", async () => {
+    const harness = await createHarness()
+    const account = createFocusedQuestion(harness, {
+      messageId: "561", senderUserId: "30001", text: "创建 Aropay 新账号",
+    })
+    const reset = createFocusedQuestion(harness, {
+      messageId: "562", senderUserId: "30001", text: "重置 Aropay 登录密码",
+    })
+    const ambiguous = recordQuestion(harness, {
+      messageId: "563", senderUserId: "30001", text: "这个好了没",
+    }).event
+    const clarification = harness.store.createRouteClarification({
+      groupId: harness.group.id,
+      serviceId: harness.service.id,
+      senderUserId: "30001",
+      messageEventId: ambiguous.id,
+      candidates: [
+        { threadId: account.thread.id, label: "Aropay 新账号" },
+        { threadId: reset.thread.id, label: "Aropay 密码重置" },
+      ],
+      createdAt: ambiguous.createdAt,
+    })
+    const firstReplyId = createUnthreadedReply(harness, ambiguous).id
+
+    expect(harness.store.claimRouteClarificationPrompt(
+      clarification.id, firstReplyId, ambiguous.id, ambiguous.createdAt,
+    )).toEqual({ claimed: true, promptReplyId: firstReplyId })
+
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      expect(harness.store.claimRouteClarificationPrompt(
+        clarification.id, randomUUID(), ambiguous.id, ambiguous.createdAt,
+      )).toEqual({ claimed: false, promptReplyId: firstReplyId })
+    }
+
+    expect(harness.database.prepare(`SELECT prompt_reply_id,status
+      FROM support_route_clarifications WHERE id=?`).get(clarification.id)).toEqual({
+      prompt_reply_id: firstReplyId,
+      status: "pending",
+    })
+    expect(harness.store.getEvent(ambiguous.id)).toMatchObject({
+      routeStatus: "routed",
+      skipReason: "待归属确认已进入发送链路",
+    })
+    expect(harness.store.listUnroutedEvents()).not.toContainEqual(expect.objectContaining({ id: ambiguous.id }))
+  })
 })
 
 describe("bounded sender route model contract", () => {
@@ -505,6 +574,69 @@ describe("bounded sender route model contract", () => {
     expect(prompt).toContain("不得仅因为它出现在排查期间就臆测成催促进度")
     expect(prompt).toContain("无法确认对方意图时也不得使用 status_only")
     expect(prompt).not.toContain("‘1’等短追问")
+  })
+
+  it("把图片作为真实视觉输入并要求可并列回答的歧义直接全部回答", async () => {
+    const harness = await createHarness()
+    const { event } = recordQuestion(harness, {
+      messageId: "571", senderUserId: "30001", text: "我们服务区用的哪个国家",
+    })
+    const imagePath = path.join(temporaryDirectories.at(-1)!, "region.png")
+    const executions: Array<{
+      prompt: string
+      images?: Array<{ path: string; mimeType: string; name: string }>
+    }> = []
+    const executableRouter = new CodexSupportThreadRouter({
+      execute: async (_purpose: unknown, input: {
+        prompt: string
+        images?: Array<{ path: string; mimeType: string; name: string }>
+      }) => {
+        executions.push(input)
+        return {
+          action: "new_thread",
+          questionFragment: event.safeText,
+          issues: null,
+          investigationEffect: "changes_input",
+          progressReply: null,
+          reason: "服务器所在地和业务地区都有可靠答案，应一次说明",
+          confidence: 1,
+          clarificationReply: null,
+        }
+      },
+    } as never)
+
+    await executableRouter.route({
+      mode: "classify",
+      group: harness.group,
+      service: harness.service,
+      messages: [event],
+      attachments: [{
+        eventId: event.id,
+        name: "region.png",
+        kind: "image",
+        mimeType: "image/png",
+        size: 123,
+        extractedText: "截图显示服务器区域",
+        localPath: imagePath,
+      }],
+      focus: null,
+      pending: null,
+      ambiguity: {
+        latestQuestion: event.safeText,
+        candidateLabels: ["服务器所在地", "业务地区"],
+      },
+    })
+
+    expect(executions).toHaveLength(1)
+    expect(executions[0]?.images).toEqual([{
+      path: imagePath,
+      mimeType: "image/png",
+      name: "region.png",
+    }])
+    expect(executions[0]?.prompt).toContain('"visualInputAttached":true')
+    expect(executions[0]?.prompt).toContain("只要各候选都有答案")
+    expect(executions[0]?.prompt).toContain("就不要 uncertain，不要让运营二选一")
+    expect(executions[0]?.prompt).toContain("一次说明各候选分别对应的答案")
   })
 
   it("accepts only bounded classifications without a target thread id", () => {
@@ -561,6 +693,14 @@ describe("bounded sender route model contract", () => {
       confidence: 0.5,
       clarificationReply: "Aropay 是要开账号，还是重置密码？",
     }).success).toBe(true)
+  })
+
+  it("最终回答模型被明确要求把所有可可靠回答的解释一次说全", () => {
+    const prompt = systemDirectivesPrompt()
+    expect(prompt).toContain("存在多个合理指代或解释")
+    expect(prompt).toContain("一次把各候选是什么和各自答案都说清楚")
+    expect(prompt).toContain("不得让运营先二选一")
+    expect(prompt).toContain("并列回答可能误导时，才追问当前最少需要的一项")
   })
 })
 
@@ -803,6 +943,211 @@ describe("sender-focused coordinator routing", () => {
     expect(routeInputs[2]?.focus?.summary).not.toContain("PopPay")
   })
 
+  it("waits for image extraction before routing and passes the persisted image to the route model", async () => {
+    const harness = await createHarness()
+    const routeInputs: ThreadRouteInput[] = []
+    const coordinator = new SupportThreadCoordinator({
+      database: harness.database,
+      store: harness.store,
+      router: {
+        route: async (input) => {
+          routeInputs.push(input)
+          return {
+            action: "new_thread",
+            questionFragment: "截图中的服务区信息",
+            reason: "图片已经解析完成",
+            confidence: 1,
+            clarificationReply: null,
+          }
+        },
+      },
+      batchWindowMs: 0,
+      wake: () => undefined,
+    })
+    const imagePath = path.join(temporaryDirectories.at(-1)!, "service-region.jpg")
+    const event = coordinator.accept({
+      groupId: harness.group.id,
+      messageId: "681",
+      senderId: "30001",
+      senderUsername: null,
+      senderDisplayName: "运营",
+      fromBot: false,
+      replyToMessageId: null,
+      messageThreadId: null,
+      replyTargetIsBot: false,
+      text: "我们服务区用的哪个国家",
+      attachments: [{
+        name: "service-region.jpg",
+        kind: "image",
+        mimeType: "image/jpeg",
+        size: 456,
+        extractedText: "",
+        localPath: null,
+      }],
+      attachmentsPending: true,
+      createdAt: new Date().toISOString(),
+    })!
+
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    expect(routeInputs).toHaveLength(0)
+    expect(harness.store.findThreadByEvent(event.id)).toBeNull()
+
+    coordinator.enrichAttachments(event.id, [{
+      name: "service-region.jpg",
+      kind: "image",
+      mimeType: "image/jpeg",
+      size: 456,
+      extractedText: "截图显示服务器部署区域为新加坡",
+      localPath: imagePath,
+    }])
+    await coordinator.drain()
+
+    expect(routeInputs).toHaveLength(1)
+    expect(routeInputs[0]?.messages[0]).toMatchObject({
+      id: event.id,
+      attachmentSummary: "service-region.jpg（image）\n截图显示服务器部署区域为新加坡",
+    })
+    expect(routeInputs[0]?.attachments).toEqual([{
+      eventId: event.id,
+      name: "service-region.jpg",
+      kind: "image",
+      mimeType: "image/jpeg",
+      size: 456,
+      extractedText: "截图显示服务器部署区域为新加坡",
+      localPath: imagePath,
+    }])
+    expect(harness.store.findThreadByEvent(event.id)).not.toBeNull()
+  })
+
+  it("recovers a crash before clarification delivery without self-answering or sending duplicate prompts", async () => {
+    const harness = await createHarness()
+    const account = createFocusedQuestion(harness, {
+      messageId: "691", senderUserId: "30001", text: "创建 Aropay 新账号",
+    })
+    const reset = createFocusedQuestion(harness, {
+      messageId: "692", senderUserId: "30001", text: "重置 Aropay 登录密码",
+    })
+    const ambiguous = recordQuestion(harness, {
+      messageId: "693", senderUserId: "30001", text: "这个好了没",
+    }).event
+    const clarification = harness.store.createRouteClarification({
+      groupId: harness.group.id,
+      serviceId: harness.service.id,
+      senderUserId: "30001",
+      messageEventId: ambiguous.id,
+      candidates: [
+        { threadId: account.thread.id, label: "Aropay 新账号" },
+        { threadId: reset.thread.id, label: "Aropay 密码重置" },
+      ],
+      createdAt: ambiguous.createdAt,
+    })
+    const routeModes: ThreadRouteInput["mode"][] = []
+    const sentReplyIds: string[] = []
+    const coordinator = new SupportThreadCoordinator({
+      database: harness.database,
+      store: harness.store,
+      router: {
+        route: async (input) => {
+          routeModes.push(input.mode)
+          return {
+            action: "uncertain",
+            questionFragment: ambiguous.safeText,
+            reason: "两个操作会产生不同结果，必须确认",
+            confidence: 0.6,
+            clarificationReply: "你问的是 Aropay 新账号，还是 Aropay 密码重置？",
+          }
+        },
+      },
+      batchWindowMs: 0,
+      wake: () => undefined,
+      sendRouteClarification: async ({ clarification: pendingClarification, event }) => {
+        const replyId = createUnthreadedReply(harness, event).id
+        const claim = harness.store.claimRouteClarificationPrompt(
+          pendingClarification.id, replyId, event.id, event.createdAt,
+        )
+        if (!claim.claimed) return { replyId: claim.promptReplyId }
+        sentReplyIds.push(replyId)
+        return { replyId }
+      },
+    })
+
+    for (let attempt = 0; attempt < 100; attempt += 1) coordinator.recover()
+    await coordinator.drain()
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      coordinator.recover()
+      await coordinator.drain()
+    }
+
+    expect(routeModes).toEqual(["classify"])
+    expect(sentReplyIds).toHaveLength(1)
+    expect(harness.database.prepare(`SELECT prompt_reply_id,status
+      FROM support_route_clarifications WHERE id=?`).get(clarification.id)).toEqual({
+      prompt_reply_id: sentReplyIds[0],
+      status: "pending",
+    })
+    expect(harness.store.getEvent(ambiguous.id)).toMatchObject({
+      routeStatus: "routed",
+      skipReason: "待归属确认已进入发送链路",
+    })
+    expect(harness.store.findThreadByEvent(ambiguous.id)).toBeNull()
+    expect(harness.store.getThreadDetail(account.thread.id).messages).toHaveLength(1)
+    expect(harness.store.getThreadDetail(reset.thread.id).messages).toHaveLength(1)
+  })
+
+  it("creates one answerable question instead of asking the operator to choose when both meanings have answers", async () => {
+    const harness = await createHarness()
+    const serverRegion = createFocusedQuestion(harness, {
+      messageId: "696", senderUserId: "30001", text: "服务器部署在哪个国家",
+    })
+    const businessRegion = createFocusedQuestion(harness, {
+      messageId: "697", senderUserId: "30001", text: "业务地区是哪个国家",
+    })
+    let clarificationCount = 0
+    const coordinator = new SupportThreadCoordinator({
+      database: harness.database,
+      store: harness.store,
+      router: { route: async () => ({
+        action: "new_thread",
+        questionFragment: "服务区可能指服务器所在地或业务地区，两项都有答案，需一起说明",
+        reason: "并列回答安全且信息完整",
+        confidence: 1,
+        clarificationReply: null,
+      }) },
+      batchWindowMs: 0,
+      wake: () => undefined,
+      sendRouteClarification: async () => {
+        clarificationCount += 1
+        return { replyId: randomUUID() }
+      },
+    })
+    const event = coordinator.accept({
+      groupId: harness.group.id,
+      messageId: "698",
+      senderId: "30001",
+      senderUsername: null,
+      senderDisplayName: "运营",
+      fromBot: false,
+      replyToMessageId: null,
+      messageThreadId: null,
+      replyTargetIsBot: false,
+      text: "我们服务区用的哪个国家",
+      attachments: [],
+      createdAt: new Date(Date.now() + 2_000).toISOString(),
+    })!
+
+    await coordinator.drain()
+
+    const routed = harness.store.findThreadByEvent(event.id)
+    expect(clarificationCount).toBe(0)
+    expect(routed).not.toBeNull()
+    expect(routed?.id).not.toBe(serverRegion.thread.id)
+    expect(routed?.id).not.toBe(businessRegion.thread.id)
+    expect(routed?.summary).toContain("两项都有答案")
+    expect(harness.store.getPendingRouteClarification(
+      harness.group.id, harness.service.id, "30001", event.createdAt,
+    )).toBeNull()
+  })
+
   it("asks about two concrete same-sender topics and resolves only the selected candidate", async () => {
     const harness = await createHarness()
     const decisions: ThreadRouteResult[] = [
@@ -830,9 +1175,9 @@ describe("sender-focused coordinator routing", () => {
       },
       batchWindowMs: 0,
       wake: () => undefined,
-      sendRouteClarification: async ({ text }) => {
+      sendRouteClarification: async ({ text, event }) => {
         sent.push(text)
-        return { replyId: null }
+        return { replyId: createUnthreadedReply(harness, event).id }
       },
     })
     const base = Date.now()

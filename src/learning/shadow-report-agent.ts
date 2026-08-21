@@ -96,7 +96,7 @@ export class CodexShadowReportAgent implements ShadowReportAgentPort {
       const prompt = [
         "你是客服影子学习报告分析器，只输出结构化 JSON，不调用工具、不执行操作、不发送消息、不更新记忆。",
         "按每个拆分后的问题单元判断候选真人回复是否真的回答了该问题，再比较影子回答。拆分线程族的候选回复可能只覆盖一个问题，也可能覆盖多个；不相关内容不得当作标准答案。人工回答只是参考证据，不自动视为绝对正确。",
-        "分别评价事实准确性、可靠性和真人群聊口吻；没有真人回答时也必须覆盖样本，并明确缺少对照。",
+        "分别评价事实准确性、可靠性和真人群聊口吻；输入样本都已经关联至少一条可信真人回复。",
         "建议只写入报告供人工审核，禁止提出自动写入规则、记忆、风格或生产配置。",
         `样本：${JSON.stringify(samples)}`,
       ].join("\n\n")
@@ -109,6 +109,7 @@ export class CodexShadowReportAgent implements ShadowReportAgentPort {
         readableRoots: [],
         concurrencyGroup: "shadow-learning-report",
         maxConcurrency: 1,
+        executionTimeoutMs: 15 * 60 * 1000,
       })
       const expected = new Set(samples.map((sample) => sample.sampleId))
       const actual = result.comparisons.map((comparison) => comparison.sampleId)

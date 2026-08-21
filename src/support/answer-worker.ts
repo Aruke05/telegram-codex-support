@@ -22,7 +22,6 @@ import {
   SupportInvestigationService,
   SupportModelOutputRejectedError,
 } from "./investigation-service.js"
-import { operatorCopy } from "./operator-copy.js"
 import type { ResourceWorkspace } from "./resource-workspace.js"
 import { routeSupportMessage } from "./routing.js"
 import type { TechnicalAlertDelivery, TechnicalAlertService } from "./technical-alert-service.js"
@@ -46,6 +45,14 @@ type TransportPort = {
   ): Promise<string>
 }
 type LearningPort = { enqueue(replyId: string): void }
+const retiredHumanPriorityHandoffErrorCodes = new Set([
+  "answer_ignored_after_human_priority",
+  "answer_model_failed",
+  "answer_model_timeout",
+  "structured_output_invalid",
+  "code_snapshot_unavailable",
+  "investigation_runtime_failed",
+])
 type ResourceBrokerPort = {
   runServerCheck(resourceId: string, check: "nginx_routes" | "system_resources"): Promise<{ exitCode: number; stdout: string; stderr: string }>
   verifyDatabaseQuery?(serviceId: string, request: TrustedDatabaseQueryRequest, signal?: AbortSignal): Promise<{
@@ -221,6 +228,25 @@ export class SupportAnswerWorker {
           })
           this.deps.store.finishGeneration(thread.id, inputRevision, "closed")
         })
+        return
+      }
+      if (preparedEscalation.errorCode
+        && retiredHumanPriorityHandoffErrorCodes.has(preparedEscalation.errorCode)) {
+        if (await this.escalateClaimedHumanPrioritySilently(
+          preparedEscalation.id,
+          thread,
+          inputRevision,
+          group,
+          preparedEscalation.decisionReason ?? "旧版人工优先流程未完成",
+          preparedEscalation.errorCode,
+          preparedEscalation.codeRevision,
+        )) return
+        this.deps.replies.transition(preparedEscalation.id, "failed", {
+          answer: "",
+          errorCode: "retired_human_priority_fixed_reply",
+          decisionReason: "旧版人工优先固定回复已取消，未向运营群发送",
+        })
+        this.deps.store.finishGeneration(thread.id, inputRevision, "closed")
         return
       }
       await this.resumePreparedTechnicalEscalation(preparedEscalation.id, thread, inputRevision, group)
@@ -400,7 +426,7 @@ export class SupportAnswerWorker {
           }
           return this.failShadow(reply.id, thread, inputRevision, errorCode, failureReason)
         }
-        if (await this.handoffClaimedHumanPriority(
+        if (await this.escalateClaimedHumanPrioritySilently(
           reply.id, thread, inputRevision, group, failureReason, errorCode,
         )) return
         this.deps.replies.transition(reply.id, "failed", {
@@ -671,7 +697,7 @@ export class SupportAnswerWorker {
       return
     }
     if (decision.decision === "ignore") {
-      if (await this.handoffClaimedHumanPriority(
+      if (await this.escalateClaimedHumanPrioritySilently(
         replyId,
         thread,
         inputRevision,
@@ -978,7 +1004,7 @@ export class SupportAnswerWorker {
     error: ProjectCodeSyncUnavailableError,
   ): Promise<void> {
     if (!this.current(thread.id, inputRevision)) return this.supersede(replyId)
-    if (await this.handoffClaimedHumanPriority(
+    if (await this.escalateClaimedHumanPrioritySilently(
       replyId, thread, inputRevision, group, error.message, "code_snapshot_unavailable",
     )) return
     const alertKind = "code_sync_unavailable" as const
@@ -1018,7 +1044,7 @@ export class SupportAnswerWorker {
     reason: string,
   ): Promise<void> {
     if (!this.current(thread.id, inputRevision)) return this.supersede(replyId)
-    if (await this.handoffClaimedHumanPriority(
+    if (await this.escalateClaimedHumanPrioritySilently(
       replyId, thread, inputRevision, group, reason, "investigation_runtime_failed",
     )) return
     const alertKind = "investigation_runtime_failure" as const
@@ -1046,7 +1072,7 @@ export class SupportAnswerWorker {
     this.deps.store.finishGeneration(thread.id, inputRevision, "answered")
   }
 
-  private async handoffClaimedHumanPriority(
+  private async escalateClaimedHumanPrioritySilently(
     replyId: string,
     thread: SupportThread,
     inputRevision: number,
@@ -1060,17 +1086,35 @@ export class SupportAnswerWorker {
       this.supersede(replyId)
       return true
     }
-    const prepared = this.deps.replies.prepareTechnicalEscalation(replyId, {
-      answer: operatorCopy.humanPriorityHandoff,
+    const alertKind = "escalation" as const
+    let alertSummary = "已有投递记录"
+    if (this.deps.replies.claimTechnicalAlert(replyId, alertKind)) {
+      try {
+        const alert = await this.deps.technicalAlerts.sendSupportAlert(
+          group,
+          replyId,
+          `${reason}；人工优先等待结束后未形成运营回复，转技术继续处理。`,
+          undefined,
+          alertKind,
+        )
+        alertSummary = alert.summary
+        this.deps.replies.completeTechnicalAlert(replyId, alertKind, alert.status)
+      } catch {
+        alertSummary = "发送失败：技术告警执行异常"
+        this.deps.replies.completeTechnicalAlert(replyId, alertKind, "failed")
+      }
+    }
+    this.deps.replies.transition(replyId, "escalated", {
+      answer: "",
       quote: null,
       codeRevision,
       errorCode,
-      decisionReason: `${reason}\n人工优先等待后的失败接管\n技术告警：发送中`.slice(0, 2000),
+      decisionReason: `${reason}\n人工优先等待后已转技术，运营群未发送固定回复\n技术告警：${alertSummary}`.slice(0, 2000),
       decisionConfidence: 0,
       memoryVersionRefs: [],
     })
-    if (!prepared) return false
-    await this.resumePreparedTechnicalEscalation(replyId, thread, inputRevision, group)
+    this.deps.store.finishGeneration(thread.id, inputRevision, "escalated")
+    this.deps.learning.enqueue(replyId)
     return true
   }
 

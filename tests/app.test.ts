@@ -48,6 +48,22 @@ describe("人工规则删除前端契约", () => {
   })
 })
 
+describe("学习报告续跑前端契约", () => {
+  it("使用精确报告 ID 请求继续生成", async () => {
+    const fetcher = vi.fn(async () => new Response(JSON.stringify({ id: "report/id", status: "completed" }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }))
+    const client = createApiClient(fetcher as typeof fetch)
+
+    await client.retryLearningReport("report/id")
+
+    expect(fetcher).toHaveBeenCalledWith("/api/learning-reports/report%2Fid/retry", expect.objectContaining({
+      method: "POST",
+    }))
+  })
+})
+
 describe("GET /health", () => {
   const apps: Array<ReturnType<typeof buildApp>> = []
 

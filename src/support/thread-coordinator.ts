@@ -34,6 +34,7 @@ export type IncomingThreadMessage = {
   replyTargetIsBot: boolean
   text: string
   attachments: SupportAttachmentContext[]
+  attachmentsPending?: boolean
   mediaGroupId?: string | null
   createdAt?: string
 }
@@ -143,6 +144,7 @@ export class SupportThreadCoordinator {
   private readonly inFlightBatches = new Set<string>()
   private readonly activeBatches = new Map<string, Omit<PendingBatch, "timer">>()
   private readonly pendingPresenceReplies = new Map<string, PendingPresenceReply>()
+  private readonly pendingAttachmentEvents = new Set<string>()
   private readonly active = new Set<Promise<void>>()
   private readonly resolveBatchWindowMs: () => number
   private recoveryTimer: ReturnType<typeof setInterval> | null = null
@@ -268,6 +270,7 @@ export class SupportThreadCoordinator {
       this.deps.wake()
       return recorded.event
     }
+    if (input.attachmentsPending) this.pendingAttachmentEvents.add(recorded.event.id)
     this.enqueue(group, service, recorded.event, input.mediaGroupId ?? null, humanPriorityUserIds.length > 0)
     return recorded.event
   }
@@ -275,8 +278,23 @@ export class SupportThreadCoordinator {
   enrichAttachments(eventId: string, attachments: SupportAttachmentContext[]): SupportMessageEvent {
     const summary = this.attachmentSummary(attachments)
     const current = this.deps.store.getEvent(eventId)
-    if (current.attachmentSummary === summary) return current
-    const replaced = this.deps.store.replaceEventAttachments(eventId, attachments, summary)
+    const replaced = current.attachmentSummary === summary
+      ? { event: current, refreshedThreadIds: [] as string[] }
+      : this.deps.store.replaceEventAttachments(eventId, attachments, summary)
+    this.pendingAttachmentEvents.delete(eventId)
+    for (const [batchKey, batch] of this.pending.entries()) {
+      const eventIndex = batch.events.findIndex((event) => event.id === eventId)
+      if (eventIndex < 0) continue
+      batch.events[eventIndex] = replaced.event
+      clearTimeout(batch.timer)
+      const waitingForOtherAttachments = batch.events.some((event) => this.pendingAttachmentEvents.has(event.id))
+      batch.timer = setTimeout(
+        () => this.launch(batchKey),
+        waitingForOtherAttachments ? 60_000 : this.batchWindowMs(),
+      )
+      batch.timer.unref()
+      break
+    }
     if (replaced.refreshedThreadIds.length > 0) {
       this.deps.cancelStale?.()
       this.deps.wake()
@@ -396,6 +414,9 @@ export class SupportThreadCoordinator {
     mediaGroupId: string | null,
     launchImmediately = false,
   ): void {
+    const launchDelay = (events: SupportMessageEvent[]): number => (
+      events.some((candidate) => this.pendingAttachmentEvents.has(candidate.id)) ? 60_000 : this.batchWindowMs()
+    )
     const conversationKey = mediaGroupId ? `media:${mediaGroupId}`
       : event.replyToMessageId ? `reply:${event.replyToMessageId}`
         : event.messageThreadId ?? "main"
@@ -408,13 +429,13 @@ export class SupportThreadCoordinator {
       }
       clearTimeout(current.timer)
       current.events.push(this.deps.store.assignEventBatch(event.id, current.id))
-      current.timer = setTimeout(() => this.launch(batchKey), this.batchWindowMs())
+      current.timer = setTimeout(() => this.launch(batchKey), launchDelay(current.events))
       current.timer.unref()
       this.deps.store.updateEventRoute(event.id, "batched")
       if (launchImmediately) this.launch(batchKey)
       return
     }
-    const timer = setTimeout(() => this.launch(batchKey), this.batchWindowMs())
+    const timer = setTimeout(() => this.launch(batchKey), launchDelay([event]))
     timer.unref()
     const id = event.ingestBatchId ?? randomUUID()
     this.pending.set(batchKey, { id, group, service, events: [this.deps.store.assignEventBatch(event.id, id)], timer })
@@ -521,6 +542,10 @@ export class SupportThreadCoordinator {
   }
 
   private async routeBatch(batch: Omit<PendingBatch, "timer">): Promise<void> {
+    batch = {
+      ...batch,
+      events: batch.events.map((event) => this.deps.store.getEvent(event.id)),
+    }
     const routeEvents = batch.events.map(normalizedEvent)
     const combined = routeEvents.map((event) => event.safeText || event.attachmentSummary).filter(Boolean).join("\n")
     const batchOwner = this.deps.store.findThreadByBatch(batch.id)
@@ -700,11 +725,63 @@ export class SupportThreadCoordinator {
       batch.group.id, batch.service.id, senderUserId, latestEvent.createdAt,
     )
     if (pending) {
-      const decision = await this.routeDecision(batch, routeEvents, null, {
+      const recoveringOriginalPrompt = batch.events.length === 1 && pending.messageEventId === latestEvent.id
+      if (recoveringOriginalPrompt && pending.promptReplyId) {
+        this.deps.store.updateEventRoute(latestEvent.id, "routed", "待归属确认已进入发送链路")
+        return
+      }
+      const pendingContext = {
         latestQuestion: combined,
         candidateLabels: pending.candidateLabels,
-      }, null, "resolve_clarification")
+      }
+      const decision = await this.routeDecision(
+        batch,
+        routeEvents,
+        null,
+        recoveringOriginalPrompt ? null : pendingContext,
+        recoveringOriginalPrompt ? pendingContext : null,
+        recoveringOriginalPrompt ? "classify" : "resolve_clarification",
+      )
       if (!decision) return
+      if (recoveringOriginalPrompt) {
+        if (decision.action === "uncertain" && decision.clarificationReply
+          && batch.group.operationMode !== "learning" && this.deps.sendRouteClarification) {
+          try {
+            const sent = await this.deps.sendRouteClarification({
+              group: batch.group, service: batch.service, event: latestEvent, clarification: pending,
+              text: decision.clarificationReply,
+            })
+            this.deps.store.markRouteClarificationPrompt(pending.id, sent.replyId, latestEvent.createdAt)
+          } catch {
+            this.deps.store.cancelPendingRouteClarification(
+              batch.group.id, batch.service.id, senderUserId, latestEvent.createdAt,
+            )
+            this.deps.store.updateEventRoute(latestEvent.id, "ignored", "待归属确认发送失败")
+          }
+          return
+        }
+        this.deps.store.cancelPendingRouteClarification(
+          batch.group.id, batch.service.id, senderUserId, latestEvent.createdAt,
+        )
+        if (decision.action === "idle") {
+          this.deps.store.updateEventRoute(latestEvent.id, "ignored", "明确闲聊或无需客服介入")
+          return
+        }
+        if (decision.action === "split") {
+          this.createSplitThreads(batch.group, batch.service, batch.events, decision, settleAt, batch.id)
+        } else {
+          this.createThread(
+            batch.group,
+            batch.service,
+            batch.events,
+            decision.questionFragment || combined,
+            settleAt,
+            batch.id,
+          )
+        }
+        this.deps.wake()
+        return
+      }
       if (decision.action === "candidate_1" || decision.action === "candidate_2") {
         const selectedCandidate = decision.action === "candidate_1" ? 1 : 2
         const resolved = this.deps.store.resolveRouteClarification({
@@ -743,6 +820,14 @@ export class SupportThreadCoordinator {
       }
       if (decision.action === "uncertain" && decision.clarificationReply
         && batch.group.operationMode !== "learning" && this.deps.sendRouteClarification) {
+        if (pending.promptReplyId) {
+          this.deps.store.cancelPendingRouteClarification(
+            batch.group.id, batch.service.id, senderUserId, latestEvent.createdAt,
+          )
+          this.createThread(batch.group, batch.service, batch.events, decision.questionFragment || combined, settleAt, batch.id)
+          this.deps.wake()
+          return
+        }
         try {
           const sent = await this.deps.sendRouteClarification({
             group: batch.group, service: batch.service, event: latestEvent, clarification: pending,
@@ -1057,11 +1142,21 @@ export class SupportThreadCoordinator {
   ): Promise<ThreadRouteResult | null> {
     let decision: ThreadRouteResult
     try {
+      const attachments = messages.flatMap((message) => this.deps.store.getEventAttachments(message.id).map((attachment) => ({
+        eventId: message.id,
+        name: attachment.fileName,
+        kind: attachment.kind,
+        mimeType: attachment.mimeType,
+        size: attachment.fileSize,
+        extractedText: attachment.extractedText,
+        localPath: attachment.storagePath || null,
+      })))
       decision = await this.deps.router.route({
         mode,
         group: batch.group,
         service: batch.service,
         messages,
+        attachments,
         focus,
         pending,
         ambiguity,

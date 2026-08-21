@@ -31,7 +31,7 @@ const labels: Record<MemoryTab, string> = {
   reports: "学习报告",
 }
 
-function reportCard(report: ShadowLearningReport): HTMLElement {
+function reportCard(report: ShadowLearningReport, notify: Notify, refresh: () => Promise<void>): HTMLElement {
   const row = element("article", "memory-card")
   const title = element("div", "memory-card__title-row")
   title.append(element("h3", "memory-card__title", report.triggerType === "scheduled" ? "首份学习报告" : "手动学习报告"),
@@ -40,6 +40,21 @@ function reportCard(report: ShadowLearningReport): HTMLElement {
   row.append(title, element("p", "memory-card__content", `截止 ${formatDateTime(report.cutoffAt)} · ${report.sampleCount} 个拆分问题`))
   if (report.renderedMarkdown) row.append(element("pre", "memory-card__content", report.renderedMarkdown))
   if (report.errorMessage) row.append(element("p", "form-error", report.errorMessage))
+  if (report.status === "failed") {
+    const actions = element("div", "memory-card__footer")
+    const retry = actionButton("继续生成", "primary")
+    retry.addEventListener("click", () => {
+      setButtonBusy(retry, true)
+      void api.retryLearningReport(report.id).then(async (result) => {
+        if (result.status === "failed") throw new Error(result.errorMessage ?? "报告生成失败")
+        notify("学习报告已从上次完成的批次继续生成")
+        await refresh()
+      }).catch((error: unknown) => notify(error instanceof Error ? error.message : "报告生成失败"))
+        .finally(() => setButtonBusy(retry, false))
+    })
+    actions.append(retry)
+    row.append(actions)
+  }
   return row
 }
 
@@ -406,7 +421,7 @@ export function renderMemories(container: HTMLElement, notify: Notify, onChanged
       replaceChildren(list, ...(result.items.length ? result.items.map(observationCard) : [emptyState("还没有学习观察", "授权来源的回复只会显示分类、关联和学习结果。", "memory")]))
     } else if (active === "reports") {
       const result = await api.getLearningReports()
-      replaceChildren(list, ...(result.items.length ? result.items.map(reportCard) : [emptyState("还没有学习报告", "首份报告将在 2026-08-20 23:00 自动生成，也可以通过接口手动生成。", "memory")]))
+      replaceChildren(list, ...(result.items.length ? result.items.map((item) => reportCard(item, notify, refresh)) : [emptyState("还没有学习报告", "首份报告将在 2026-08-20 23:00 自动生成，也可以通过接口手动生成。", "memory")]))
     } else if (active === "styles") {
       const result = await api.getOperatorStyleVersions()
       replaceChildren(list, ...(result.items.length ? result.items.map(styleVersionCard) : [emptyState("当前使用基线风格", "形成足够、有效的授权样本后会生成候选风格版本。", "sparkles")]))

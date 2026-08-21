@@ -1,10 +1,30 @@
-import type { ShadowLearningReport, ShadowReportStore } from "./shadow-report-store.js"
-import type { ShadowReportAgentPort, ShadowReportResult, ShadowReportSample } from "./shadow-report-agent.js"
+import type { ClaimedShadowReport, ShadowLearningReport, ShadowReportStore } from "./shadow-report-store.js"
+import type { ShadowReportAgentPort, ShadowReportSample } from "./shadow-report-agent.js"
 
-const reportBatchSize = 50
+export type ShadowReportBatchLimits = { maxSamples: number; maxBytes: number }
+const defaultBatchLimits: ShadowReportBatchLimits = { maxSamples: 8, maxBytes: 24_000 }
 
-function unique(values: string[]): string[] {
-  return [...new Set(values)].slice(0, 20)
+export function partitionShadowReportSamples(
+  samples: ShadowReportSample[],
+  limits: ShadowReportBatchLimits = defaultBatchLimits,
+): ShadowReportSample[][] {
+  if (!Number.isInteger(limits.maxSamples) || limits.maxSamples < 1 || !Number.isInteger(limits.maxBytes) || limits.maxBytes < 1) {
+    throw new Error("学习报告批次限制无效")
+  }
+  const batches: ShadowReportSample[][] = []
+  let current: ShadowReportSample[] = []
+  for (const sample of samples) {
+    const candidate = [...current, sample]
+    if (current.length > 0 && (candidate.length > limits.maxSamples
+      || Buffer.byteLength(JSON.stringify(candidate), "utf8") > limits.maxBytes)) {
+      batches.push(current)
+      current = [sample]
+    } else {
+      current = candidate
+    }
+  }
+  if (current.length > 0) batches.push(current)
+  return batches
 }
 
 export class ShadowReportWorker {
@@ -15,6 +35,7 @@ export class ShadowReportWorker {
     private readonly store: ShadowReportStore,
     private readonly agent: ShadowReportAgentPort,
     private readonly clock: () => Date = () => new Date(),
+    private readonly batchLimits: ShadowReportBatchLimits = defaultBatchLimits,
   ) {}
 
   start(): void {
@@ -35,13 +56,7 @@ export class ShadowReportWorker {
     this.store.recoverStale(now)
     const claim = this.store.claimDue(now)
     if (!claim) return false
-    try {
-      const samples = this.store.samples(claim.cutoffAt)
-      const result = await this.generate(samples, () => this.store.heartbeat(claim))
-      this.store.complete(claim, samples, result, this.clock())
-    } catch (error) {
-      this.store.fail(claim, error, this.clock())
-    }
+    await this.process(claim)
     return true
   }
 
@@ -49,14 +64,13 @@ export class ShadowReportWorker {
     const pending = this.store.createManual(now)
     const claim = this.store.claimDue(now, pending.id)
     if (!claim) throw new Error("手动学习报告无法领取")
-    try {
-      const samples = this.store.samples(claim.cutoffAt)
-      const result = await this.generate(samples, () => this.store.heartbeat(claim))
-      return this.store.complete(claim, samples, result, this.clock())
-    } catch (error) {
-      this.store.fail(claim, error, this.clock())
-      return this.store.get(claim.id)
-    }
+    return this.process(claim)
+  }
+
+  async retry(id: string, now = new Date()): Promise<ShadowLearningReport> {
+    const claim = this.store.retryFailed(id, now)
+    if (!claim) throw new Error("只有失败的学习报告可以继续生成")
+    return this.process(claim)
   }
 
   private tick(): Promise<boolean> {
@@ -65,21 +79,36 @@ export class ShadowReportWorker {
     return this.active
   }
 
-  private async generate(samples: ShadowReportSample[], heartbeat: () => boolean): Promise<ShadowReportResult> {
-    if (samples.length === 0) return this.agent.generate([])
-    const results: ShadowReportResult[] = []
-    for (let index = 0; index < samples.length; index += reportBatchSize) {
-      results.push(await this.agent.generate(samples.slice(index, index + reportBatchSize)))
-      if (!heartbeat()) throw new Error("学习报告 claim 已失效")
-    }
-    return {
-      summary: {
-        headline: `共比较 ${samples.length} 个拆分问题，以下结论仅供人工审核`,
-        strengths: unique(results.flatMap((result) => result.summary.strengths)),
-        gaps: unique(results.flatMap((result) => result.summary.gaps)),
-        recommendations: unique(results.flatMap((result) => result.summary.recommendations)),
-      },
-      comparisons: results.flatMap((result) => result.comparisons),
+  private async process(claim: ClaimedShadowReport): Promise<ShadowLearningReport> {
+    try {
+      const collected = this.store.samples(claim.cutoffAt)
+      const samples = collected.filter((sample) => sample.humanAnswers.length > 0)
+      if (samples.length === 0) {
+        return this.store.complete(claim, [], {
+          summary: {
+            headline: `采集到 ${collected.length} 个影子问题，但没有关联到可信真人回复`,
+            strengths: [],
+            gaps: ["当前没有可用于准确性、可靠性和拟人性对比的真人答案"],
+            recommendations: ["请先在 群与账号 > 用户与角色 中启用实际客服的学习来源"],
+          },
+          comparisons: [],
+        }, this.clock())
+      }
+      const completed = this.store.comparedSampleIds(claim.id)
+      const remaining = samples.filter((sample) => !completed.has(sample.sampleId))
+      for (const batch of partitionShadowReportSamples(remaining, this.batchLimits)) {
+        const result = await this.agent.generate(batch)
+        this.store.appendBatch(claim, batch, result, this.clock())
+      }
+      return this.store.finalize(
+        claim,
+        samples,
+        `共比较 ${samples.length} 个有可信真人回复的拆分问题，以下结论仅供人工审核`,
+        this.clock(),
+      )
+    } catch (error) {
+      this.store.fail(claim, error, this.clock())
+      return this.store.get(claim.id)
     }
   }
 }

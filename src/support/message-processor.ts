@@ -16,6 +16,7 @@ export type IncomingSupportMessage = {
   replyTargetIsBot: boolean
   text: string
   attachments: SupportAttachmentContext[]
+  attachmentsPending?: boolean
   mediaGroupId?: string | null
   createdAt?: string
 }

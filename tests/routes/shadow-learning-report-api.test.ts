@@ -22,6 +22,9 @@ describe("学习报告 API", () => {
     const database = await RuntimeDatabase.open(path.join(directory, "runtime.sqlite"))
     databases.push(database)
     const store = new ShadowReportStore(database)
+    const failedPending = store.createManual(new Date("2026-08-19T09:00:00.000Z"))
+    const failedClaim = store.claimDue(new Date("2026-08-19T09:00:00.000Z"), failedPending.id)!
+    store.fail(failedClaim, new Error("批次超时"), new Date("2026-08-19T09:05:00.000Z"))
     const app = buildApp({
       shadowReportStore: store,
       shadowReportWorker: {
@@ -29,12 +32,21 @@ describe("学习报告 API", () => {
           const pending = store.createManual(at)
           return pending
         },
+        retry: async (id, at = new Date()) => {
+          const claim = store.retryFailed(id, at)
+          if (!claim) throw new Error("学习报告不能重试")
+          store.complete(claim, [], {
+            summary: { headline: "重试完成", strengths: [], gaps: [], recommendations: [] },
+            comparisons: [],
+          }, at)
+          return store.get(id)
+        },
       },
     })
 
     const listed = await app.inject({ method: "GET", url: "/api/learning-reports" })
     expect(listed.statusCode).toBe(200)
-    expect(listed.json().items[0]).toMatchObject({
+    expect(listed.json().items.find((item: { triggerType: string }) => item.triggerType === "scheduled")).toMatchObject({
       triggerType: "scheduled",
       dueAt: "2026-08-20T15:00:00.000Z",
     })
@@ -43,6 +55,14 @@ describe("学习报告 API", () => {
     const created = await app.inject({ method: "POST", url: "/api/learning-reports" })
     expect(created.statusCode).toBe(201)
     expect(created.json()).toMatchObject({ triggerType: "manual", status: "pending" })
+
+    const retried = await app.inject({ method: "POST", url: `/api/learning-reports/${failedPending.id}/retry` })
+    expect(retried.statusCode).toBe(200)
+    expect(retried.json()).toMatchObject({ id: failedPending.id, status: "completed", errorMessage: null })
+
+    const retriedAgain = await app.inject({ method: "POST", url: `/api/learning-reports/${failedPending.id}/retry` })
+    expect(retriedAgain.statusCode).toBe(400)
+    expect(retriedAgain.json()).toEqual({ error: "学习报告不能重试" })
     await app.close()
   })
 })

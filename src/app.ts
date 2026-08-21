@@ -72,7 +72,7 @@ export type AppDependencies = {
   supportThreadQueryService: SupportThreadQueryService
   attachmentService: AttachmentService
   shadowReportStore: ShadowReportStore
-  shadowReportWorker: Pick<ShadowReportWorker, "runNow">
+  shadowReportWorker: Pick<ShadowReportWorker, "runNow" | "retry">
   authService: AdminAuthService
   adminUiRoot: string
 }
@@ -168,7 +168,7 @@ export function buildApp(deps: Partial<AppDependencies> = {}): FastifyInstance {
       "只有个人账号需要登录", "个人账号不存在", "没有进行中的登录",
       "验证码不能为空", "两步验证密码不能为空", "Telegram 连接服务未启用",
       "个人账号登录服务未启用",
-      "学习报告不存在",
+      "学习报告不存在", "只有失败的学习报告可以继续生成", "学习报告不能重试",
       "配置包含敏感信息", "只能配置一个技术告警群", "启用群必须绑定已启用的客服账号",
       "静态知识包含敏感信息",
       "迁移数据库完整性检查失败", "迁移数据库外键关系损坏",

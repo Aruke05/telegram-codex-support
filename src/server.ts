@@ -240,14 +240,18 @@ supportThreadCoordinator = new SupportThreadCoordinator({
     undefined,
     { groupId: group.id, serviceId: group.serviceId, kind: "presence_reply" },
   ),
-  sendRouteClarification: async ({ group, service, event, text }) => {
+  sendRouteClarification: async ({ group, service, event, clarification, text }) => {
+    const activeGroup = runtimeDatabase.readGroups().find((candidate) => (
+      candidate.id === group.id && candidate.enabled && candidate.telegramChatId
+    ))
+    if (!activeGroup) throw new Error("待归属确认发送前群已停用")
     const outbound = configuredSecretRedactor.assertSafeOutbound(text)
     if (!outbound.allowed || outbound.safeText !== text) throw new Error("待归属自然确认未通过发送前安全校验")
     const pending = replyService.createPending({
       threadId: null,
       inputRevision: null,
       groupId: group.id,
-      accountId: group.accountId,
+      accountId: activeGroup.accountId,
       projectId: service.projectId,
       serviceId: service.id,
       telegramMessageId: event.telegramMessageId,
@@ -259,6 +263,20 @@ supportThreadCoordinator = new SupportThreadCoordinator({
       serviceSource: "group_binding",
       question: event.safeText || event.attachmentSummary,
     })
+    const promptClaim = supportThreadStore.claimRouteClarificationPrompt(
+      clarification.id,
+      pending.id,
+      event.id,
+    )
+    if (!promptClaim.claimed) {
+      replyService.transition(pending.id, "ignored", {
+        decisionReason: promptClaim.promptReplyId
+          ? "同一待归属确认已有回复进入发送链路"
+          : "待归属确认已失效",
+      })
+      if (promptClaim.promptReplyId) return { replyId: promptClaim.promptReplyId }
+      throw new Error("待归属确认已失效")
+    }
     replyService.transition(pending.id, "generating")
     const sending = replyService.claimUnthreadedSending(pending.id, {
       answer: text,
@@ -268,8 +286,8 @@ supportThreadCoordinator = new SupportThreadCoordinator({
     if (!sending) throw new Error("待归属确认无法进入发送状态")
     try {
       const telegramMessageId = await telegramTransport.sendMessage(
-        group.accountId,
-        group.telegramChatId!,
+        activeGroup.accountId,
+        activeGroup.telegramChatId!,
         text,
         event.telegramMessageId,
         undefined,
