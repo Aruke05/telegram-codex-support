@@ -381,6 +381,7 @@ export class SupportInvestigationService {
         }, signal),
         packet,
         allowedMemoryIds,
+        request.latestMessage ?? request.question,
       )
       const firstReview = this.redactReview(await this.deps.agent.reviewReply({
         ...baseReviewInput,
@@ -403,6 +404,7 @@ export class SupportInvestigationService {
         }, signal),
         packet,
         allowedMemoryIds,
+        request.latestMessage ?? request.question,
       )
       const secondReview = this.redactReview(await this.deps.agent.reviewReply({
         ...baseReviewInput,
@@ -467,7 +469,10 @@ export class SupportInvestigationService {
       answer: composed.answer,
       quote: composed.quote,
       answerClaims: claims,
-      usedMemoryVersionIds: composed.usedMemoryVersionIds,
+      usedMemoryVersionIds: [...new Set([
+        ...baseline.usedMemoryVersionIds,
+        ...composed.usedMemoryVersionIds,
+      ])],
       evidencePacket: packet,
     }
   }
@@ -476,12 +481,15 @@ export class SupportInvestigationService {
     reply: ComposedReply,
     packet: EvidencePacket,
     allowedMemoryIds: Set<string>,
+    latestMessage: string,
   ): ComposedReply {
     const outbound = this.deps.redactor.assertSafeOutbound(reply.answer)
     if (!outbound.allowed || !outbound.safeText.trim() || garbled(outbound.safeText)) {
       throw new SupportModelOutputRejectedError(["组合回复为空、乱码或触发敏感信息出站拦截"])
     }
+    if (reply.quote && !latestMessage.includes(reply.quote)) throw new Error("组合回复引用片段不属于本轮最新消息")
     const safeQuote = reply.quote ? this.deps.redactor.assertSafeOutbound(reply.quote).safeText.slice(0, 1000) : null
+    if (reply.quote && safeQuote !== reply.quote) throw new Error("组合回复引用片段触发脱敏后无法逐字引用")
     const knownFacts = new Map(packet.facts.map((fact) => [fact.id, fact]))
     const claims = reply.claims.map((claim) => {
       const fact = knownFacts.get(claim.factId)

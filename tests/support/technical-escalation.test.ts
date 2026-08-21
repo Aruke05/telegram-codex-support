@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url"
 
 import { describe, expect, it } from "vitest"
 
-import { answerDecisionSchema } from "../../src/codex/schemas.js"
+import { answerDecisionSchema, evidenceFactSchema } from "../../src/codex/schemas.js"
 import { systemDirectivesPrompt } from "../../src/support/system-directives.js"
 
 const base = {
@@ -82,6 +82,25 @@ describe("技术升级由模型语义和通用记忆判断", () => {
         ...evidencePacket,
         communication: { ...evidencePacket.communication, intent: "direct_answer" as const },
       },
+    }).success).toBe(false)
+  })
+
+  it("推断来源和推断事实不能伪装成已确认", () => {
+    const baseFact = {
+      id: "F1",
+      statement: "当前只是初步判断",
+      provenance: "inference" as const,
+      evidenceSource: "inference" as const,
+      evidence: "基于前述证据推断",
+      outboundSafe: true,
+    }
+    expect(evidenceFactSchema.safeParse({ ...baseFact, certainty: "inferred" }).success).toBe(true)
+    expect(evidenceFactSchema.safeParse({ ...baseFact, certainty: "confirmed" }).success).toBe(false)
+    expect(evidenceFactSchema.safeParse({
+      ...baseFact,
+      provenance: "code",
+      evidenceSource: "inference",
+      certainty: "reported",
     }).success).toBe(false)
   })
 

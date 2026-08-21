@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 import type { AnswerDecision, ComposedReply, ReplyReview } from "../../src/codex/schemas.js"
 import { RuntimeDatabase } from "../../src/runtime/database.js"
 import type { ModelInstanceSnapshot } from "../../src/runtime/model-config-service.js"
+import type { MemoryView } from "../../src/runtime/types.js"
 import { ConfiguredSecretRedactor } from "../../src/security/dlp.js"
 import type {
   SupportDecisionAgentPort,
@@ -40,7 +41,7 @@ const modelSnapshot: ModelInstanceSnapshot = {
   updatedAt: "2026-08-22T00:00:00.000Z",
 }
 
-function baselineDecision(): AnswerDecision {
+function baselineDecision(usedMemoryVersionIds: string[] = []): AnswerDecision {
   return {
     decision: "reply",
     escalationType: "none",
@@ -49,7 +50,7 @@ function baselineDecision(): AnswerDecision {
     quote: null,
     reason: "已读取消息和当前代码",
     confidence: 0.9,
-    usedMemoryVersionIds: [],
+    usedMemoryVersionIds,
     answerClaims: [{
       statement: "我方已收到订单",
       provenance: "user_report",
@@ -125,7 +126,7 @@ ComposedReply {
   }
 }
 
-async function harness(agent: SupportDecisionAgentPort) {
+async function harness(agent: SupportDecisionAgentPort, memories: MemoryView[] = []) {
   const directory = await mkdtemp(path.join(tmpdir(), "reply-pipeline-"))
   temporaryDirectories.push(directory)
   const database = await RuntimeDatabase.open(path.join(directory, "runtime.sqlite"))
@@ -155,7 +156,7 @@ async function harness(agent: SupportDecisionAgentPort) {
   const investigation = new SupportInvestigationService({
     database,
     codeSync: { readCurrentSnapshot: () => snapshot, currentServiceForSnapshot: () => service },
-    knowledge: { listDirectives: () => [], listAnswerMemories: () => [], searchStaticKnowledge: () => [] },
+    knowledge: { listDirectives: () => [], listAnswerMemories: () => memories, searchStaticKnowledge: () => [] },
     resourceWorkspace: {
       open: async () => ({
         path: directory,
@@ -284,6 +285,22 @@ describe("证据收集、独立成稿和质量审核流水线", () => {
     }
   })
 
+  it("组合模型引用的片段不属于最新消息时回退当前版本基线", async () => {
+    const invalid = candidate()
+    invalid.quote = "这段文字不在运营最新消息里"
+    const runningAgent = agent({ compose: vi.fn(async () => invalid) })
+    const { database, investigation, input } = await harness(runningAgent)
+    try {
+      const result = await investigation.investigate(input, new AbortController().signal)
+      expect(result.decision.answer).toBe(baselineDecision().answer)
+      expect(result.pipelineAudit.finalSource).toBe("baseline")
+      expect(result.pipelineAudit.fallbackReason).toContain("保留调查模型基线")
+      expect(runningAgent.reviewReply).not.toHaveBeenCalled()
+    } finally {
+      database.close()
+    }
+  })
+
   it("父进程移除没有可信运行步骤支持的事实再交给回复模型", async () => {
     const compose = vi.fn(async (input: SupportReplyCompositionInput) => {
       expect(input.evidencePacket.facts.map((fact) => fact.id)).toEqual(["F1", "F2"])
@@ -293,6 +310,44 @@ describe("证据收集、独立成稿和质量审核流水线", () => {
     try {
       await investigation.investigate(input, new AbortController().signal)
       expect(compose).toHaveBeenCalledOnce()
+    } finally {
+      database.close()
+    }
+  })
+
+  it("采用独立成稿时继承调查阶段真实使用的记忆引用", async () => {
+    const memoryId = "00000000-0000-4000-8000-000000000711"
+    const now = "2026-08-22T00:00:00.000Z"
+    const memory: MemoryView = {
+      id: memoryId,
+      versionId: memoryId,
+      factId: "00000000-0000-4000-8000-000000000712",
+      version: 1,
+      title: "第三方沟通规则",
+      content: "对外沟通需要提供我方证据",
+      scope: "global",
+      region: null,
+      branch: null,
+      source: "human_rule",
+      risk: "low",
+      confidence: 1,
+      status: "active",
+      conflictReason: null,
+      validFrom: now,
+      validTo: null,
+      createdByEventId: "00000000-0000-4000-8000-000000000713",
+      createdAt: now,
+      topicKey: "a".repeat(64),
+      currentVersionId: memoryId,
+      evidenceCount: 1,
+      previousVersionCount: 0,
+    }
+    const runningAgent = agent({ decide: async () => baselineDecision([memoryId]) })
+    const { database, investigation, input } = await harness(runningAgent, [memory])
+    try {
+      const result = await investigation.investigate(input, new AbortController().signal)
+      expect(result.pipelineAudit.finalSource).toBe("first_candidate")
+      expect(result.decision.usedMemoryVersionIds).toEqual([memoryId])
     } finally {
       database.close()
     }

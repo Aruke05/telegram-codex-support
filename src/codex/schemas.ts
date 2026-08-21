@@ -60,7 +60,14 @@ export const evidenceFactSchema = z.object({
   evidence: z.string().trim().max(1000),
   certainty: z.enum(["confirmed", "reported", "inferred"]),
   outboundSafe: z.boolean(),
-}).strict()
+}).strict().superRefine((value, context) => {
+  if (value.evidenceSource === "inference" && value.certainty !== "inferred") {
+    context.addIssue({ code: "custom", path: ["certainty"], message: "推断来源不能标为已确认或转述" })
+  }
+  if (value.provenance === "inference" && value.certainty !== "inferred") {
+    context.addIssue({ code: "custom", path: ["certainty"], message: "推断事实不能标为已确认或转述" })
+  }
+})
 
 export const evidencePacketSchema = z.object({
   version: z.literal("1"),

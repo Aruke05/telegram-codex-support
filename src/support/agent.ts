@@ -298,7 +298,7 @@ export class CodexSupportDecisionAgent implements SupportDecisionAgentPort {
       "第一阶段的 decision、escalationType、humanOperation、responsibility 和 interaction 是不可修改的业务判断。你不能把 reply 改成 escalate，也不能改变责任归属或声称执行了尚未完成的操作。",
       "answer 必须像真实当班客服自然接话，不能自称或暗示自己是 AI、机器人、模型、自动客服、程序或自动化系统，也不能冒充具体个人。",
       "所有事实只能来自 outboundSafe=true 的 facts；每个写入 answer 的事实都必须在 claims 中引用对应 factId，并把 answer 中表达该事实的完整短句逐字填入 statement。outboundSafe=false 的事实绝不能写入 answer。不得把 reported 或 inferred 写成 confirmed；推断必须明确写成初步判断、推测、可能或暂时无法确认。事实中包含开关、状态、分支、时间范围或其他适用条件时，answer 必须保留会改变结论的条件，不能改写成始终、绝不会、一定等无条件结论。",
-      "claims 只登记 answer 实际使用的事实，不能引用不存在的 ID，statement 必须逐字出现在 answer。处理建议可以来自 handlingNotes，但不能伪装成已经发生的事实。usedMemoryVersionIds 只能从本轮有效记忆 ID 中选择。",
+      "claims 只登记 answer 实际使用的事实，不能引用不存在的 ID，statement 必须逐字出现在 answer。处理建议可以来自 handlingNotes，但不能伪装成已经发生的事实。你没有收到原始记忆内容，usedMemoryVersionIds 必须设为 []，父进程会继承调查阶段真实使用的记忆引用。",
       "communication.intent=copyable_message 时，先用一句短引导明确告诉运营下面独立正文可以直接发给 recipient，再给出能单独复制的完整正文。正文必须站在我方视角，包含证据包中与争议或核对直接相关且对方能够复核的我方证据和希望接收方核对的准确事项；不能裸放正文让运营猜。即使某事实 outboundSafe=true，也只在对方明确索要或确实能帮助对方定位时写关联标识；不要输出对方无法独立复核或本题不需要的请求体/响应体哈希、字节数、内部请求 ID、路由节点、DNS 快照等诊断元数据。",
       "communication.intent=minimal_clarification 时只追问当前最少需要的一项；handoff 时自然说明已通知技术接手，但不得声称技术已经处理完成或承诺时间；direct_answer 直接回应最新诉求。",
       "answer 必须逐项覆盖 requiredAnswerPoints，不能因为篇幅或措辞简洁省略其中任何一点。证据包能确认的用对应事实说明；仍未知的明确写当前边界；要求立即处理或长期方案时分别给出可执行步骤，不能只给原则性建议。",
@@ -307,10 +307,8 @@ export class CodexSupportDecisionAgent implements SupportDecisionAgentPort {
         : "回复风格不限制篇幅和技术词，但必须完整准确且遵守证据与敏感边界。",
       `系统固定规则：\n${systemDirectivesPrompt()}`,
       `人工固定规则：\n${humanDirectivesPrompt(request.directives)}`,
-      `有效记忆：${JSON.stringify(request.memories.map(memoryForAnswerPrompt))}`,
       `不可修改的业务判断：${JSON.stringify(decision)}`,
       `证据包：${JSON.stringify(evidencePacket)}`,
-      ...(request.conversationContext ? [`会话历史（只用于承接语气和指代，不能当作已确认事实）：${request.conversationContext}`] : []),
       ...(input.revisionFeedback?.length ? [`审核要求逐项修正：${JSON.stringify(input.revisionFeedback)}`] : []),
       `本轮唯一需要直接回应的最新消息：${request.latestMessage ?? request.question}`,
     ].join("\n\n")
@@ -328,7 +326,6 @@ export class CodexSupportDecisionAgent implements SupportDecisionAgentPort {
       validator: composedReplySchema,
       accessMode: "text-only",
       executionTimeoutMs: request.answerTimeoutSeconds * 1000,
-      concurrencyGroup: "reply-composer",
       maxConcurrency: request.answerMaxConcurrency,
       ...(signal ? { signal } : {}),
     })
@@ -363,7 +360,6 @@ export class CodexSupportDecisionAgent implements SupportDecisionAgentPort {
       validator: replyReviewSchema,
       accessMode: "text-only",
       executionTimeoutMs: request.answerTimeoutSeconds * 1000,
-      concurrencyGroup: "reply-reviewer",
       maxConcurrency: request.answerMaxConcurrency,
       ...(signal ? { signal } : {}),
     })

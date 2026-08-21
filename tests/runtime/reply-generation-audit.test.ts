@@ -1,9 +1,11 @@
 import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
+import { DatabaseSync } from "node:sqlite"
 
 import { afterEach, describe, expect, it } from "vitest"
 
+import { BackupService } from "../../src/runtime/backup-service.js"
 import { RuntimeDatabase } from "../../src/runtime/database.js"
 
 const temporaryDirectories: string[] = []
@@ -44,6 +46,12 @@ async function seededAdminTurn(): Promise<{ database: RuntimeDatabase; sessionId
     null, now, now, now, null,
   )
   return { database, sessionId, turnId }
+}
+
+async function temporaryDatabasePath(name: string): Promise<string> {
+  const directory = await mkdtemp(path.join(tmpdir(), "reply-generation-portable-"))
+  temporaryDirectories.push(directory)
+  return path.join(directory, name)
 }
 
 describe("回复生成审计", () => {
@@ -114,6 +122,60 @@ describe("回复生成审计", () => {
       })).toThrow(/必须且只能关联一种回复记录/)
     } finally {
       database.close()
+    }
+  })
+
+  it("SQLite 导出导入完整保留脱敏后的分阶段审计", async () => {
+    const { database, turnId } = await seededAdminTurn()
+    const portablePath = await temporaryDatabasePath("portable.sqlite")
+    const restored = await RuntimeDatabase.open(await temporaryDatabasePath("restored.sqlite"))
+    try {
+      database.recordReplyGenerationAudit({
+        adminChatTurnId: turnId,
+        pipelineVersion: "evidence-compose-review-v1",
+        mode: "multi_stage",
+        evidencePacket: { version: "1", facts: [{ id: "F1", statement: "已脱敏事实" }] },
+        baselineAnswer: "基线",
+        firstCandidateAnswer: "候选",
+        revisedCandidateAnswer: null,
+        reviews: [{ outcome: "approve", reason: "证据完整" }],
+        finalSource: "first_candidate",
+        fallbackReason: null,
+      })
+      await new BackupService(database).export(portablePath)
+      await new BackupService(restored).import(portablePath)
+
+      expect(restored.prepare(`SELECT pipeline_version,mode,evidence_packet_json,baseline_answer,
+        first_candidate_answer,final_source FROM reply_generation_audits WHERE admin_chat_turn_id=?`).get(turnId)).toEqual({
+        pipeline_version: "evidence-compose-review-v1",
+        mode: "multi_stage",
+        evidence_packet_json: JSON.stringify({ version: "1", facts: [{ id: "F1", statement: "已脱敏事实" }] }),
+        baseline_answer: "基线",
+        first_candidate_answer: "候选",
+        final_source: "first_candidate",
+      })
+    } finally {
+      restored.close()
+      database.close()
+    }
+  })
+
+  it("v31 运行库升级到 v32 时创建回复生成审计能力", async () => {
+    const filePath = await temporaryDatabasePath("v31.sqlite")
+    const current = await RuntimeDatabase.open(filePath)
+    current.close()
+    const legacy = new DatabaseSync(filePath)
+    legacy.exec(`DROP TABLE reply_generation_audits;
+      UPDATE metadata SET value='31' WHERE key='schema_version';`)
+    legacy.close()
+
+    const migrated = await RuntimeDatabase.open(filePath)
+    try {
+      expect(migrated.schemaVersion()).toBe(32)
+      expect(migrated.prepare(`SELECT sql FROM sqlite_master
+        WHERE type='table' AND name='reply_generation_audits'`).get()).toBeTruthy()
+    } finally {
+      migrated.close()
     }
   })
 })
