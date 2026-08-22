@@ -114,7 +114,6 @@ export function buildApp(deps: Partial<AppDependencies> = {}): FastifyInstance {
       store: deps.adminChatStore,
       worker: deps.adminChatWorker,
       database: deps.runtimeDatabase,
-      redactor: deps.configuredSecretRedactor,
       ...(deps.attachmentService ? { attachments: deps.attachmentService } : {}),
       ...(deps.memoryAuthoringService ? { authoring: deps.memoryAuthoringService } : {}),
     })

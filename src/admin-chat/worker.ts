@@ -307,7 +307,7 @@ export class AdminChatWorker {
         replyStyle: "human",
         onProgress: async (progress) => {
           const updated = this.deps.store.updateInvestigationProgress(turn.id, {
-            investigation: this.redactJson(progress.investigation),
+            investigation: progress.investigation,
             codeRevision: progress.snapshot.commit,
             codeSnapshotId: progress.snapshot.snapshotId,
             codeSyncBatchId: progress.snapshot.syncBatchId,
@@ -315,7 +315,6 @@ export class AdminChatWorker {
           this.publish(updated)
         },
       }, controller.signal)
-      const redact = (value: string) => this.deps.redactor.redact(value).text
       const decision = result.decision
       this.deps.database.recordReplyGenerationAudit({
         adminChatTurnId: turn.id,
@@ -330,10 +329,10 @@ export class AdminChatWorker {
         fallbackReason: result.pipelineAudit.fallbackReason,
       })
       const completed = this.deps.store.completeTurn(turn.id, {
-        answer: redact(decision.answer),
+        answer: decision.answer,
         decision: decision.decision,
-        investigation: this.redactJson(decision.investigation),
-        decisionReason: redact(decision.reason),
+        investigation: decision.investigation,
+        decisionReason: decision.reason,
         decisionConfidence: decision.confidence,
         codeRevision: result.snapshot.commit,
         codeSnapshotId: result.snapshot.snapshotId,
@@ -357,15 +356,6 @@ export class AdminChatWorker {
     } finally {
       if (this.controllers.get(turn.id) === controller) this.controllers.delete(turn.id)
     }
-  }
-
-  private redactJson(value: unknown): unknown {
-    if (typeof value === "string") return this.deps.redactor.redact(value).text
-    if (Array.isArray(value)) return value.map((item) => this.redactJson(item))
-    if (value && typeof value === "object") {
-      return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, this.redactJson(item)]))
-    }
-    return value
   }
 
   private publish(turn: AdminChatTurn): void {

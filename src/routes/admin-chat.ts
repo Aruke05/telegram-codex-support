@@ -7,7 +7,6 @@ import type { AdminChatStore } from "../admin-chat/store.js"
 import type { MemoryAuthoringService } from "../learning/authoring.js"
 import type { RuntimeDatabase } from "../runtime/database.js"
 import type { AdminChatSession, AdminChatTurn } from "../runtime/types.js"
-import type { ConfiguredSecretRedactor } from "../security/dlp.js"
 import type { AttachmentService } from "../telegram/attachment-service.js"
 import type { SupportAttachmentContext } from "../support/agent.js"
 import { requirePrincipal } from "../auth/types.js"
@@ -18,7 +17,6 @@ export type AdminChatRoutesDependencies = {
   store: AdminChatStore
   worker: AdminChatWorkerPort
   database: Pick<RuntimeDatabase, "readProjects" | "readProjectServices" | "prepare">
-  redactor: ConfiguredSecretRedactor
   attachments?: Pick<AttachmentService, "prepareBuffer" | "resolveStoredPath">
   authoring?: Pick<MemoryAuthoringService, "correctAdminChatTurn">
 }
@@ -58,33 +56,12 @@ function handleKnownError(error: unknown, reply: FastifyReply): never | FastifyR
   throw error
 }
 
-function redactJson(value: unknown, redactor: ConfiguredSecretRedactor): unknown {
-  if (typeof value === "string") return redactor.redact(value).text
-  if (Array.isArray(value)) return value.map((item) => redactJson(item, redactor))
-  if (value && typeof value === "object") {
-    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, redactJson(item, redactor)]))
-  }
-  return value
-}
-
-function publicTurn(turn: AdminChatTurn, redactor: ConfiguredSecretRedactor) {
+function publicTurn(turn: AdminChatTurn) {
   return {
     ...turn,
-    question: redactor.redact(turn.question).text,
-    answer: redactor.redact(turn.answer).text,
-    decisionReason: turn.decisionReason ? redactor.redact(turn.decisionReason).text : null,
-    investigation: redactJson(turn.investigation, redactor) as AdminChatTurn["investigation"],
     attachments: turn.attachments.map(({ storagePath, extractedText, ...attachment }) => ({
       ...attachment,
-      name: redactor.redact(attachment.name).text,
-      mimeType: redactor.redact(attachment.mimeType).text,
       url: storagePath ? `/api/admin-chat/attachments/${encodeURIComponent(attachment.id)}` : null,
-    })),
-    corrections: turn.corrections.map((correction) => ({
-      ...correction,
-      correctedAnswer: redactor.redact(correction.correctedAnswer).text,
-      reason: redactor.redact(correction.reason).text,
-      correctedBy: redactor.redact(correction.correctedBy).text,
     })),
   }
 }
@@ -133,12 +110,12 @@ export function registerAdminChatRoutes(app: FastifyInstance, deps: AdminChatRou
     const owner = session.createdByUserId
       ? deps.database.prepare("SELECT username FROM admin_users WHERE id=?").get(session.createdByUserId) as { username?: unknown } | undefined
       : undefined
-    const createdByUsername = deps.redactor.redact(String(owner?.username ?? "system")).text
+    const createdByUsername = String(owner?.username ?? "system")
     const { createdByUserId: _createdByUserId, ...safeSession } = session
     return {
       ...safeSession,
       createdByUsername,
-      title: deps.redactor.redact(session.title).text,
+      title: session.title,
       latestTurnStatus: session.latestTurnStatus ?? null,
       latestTurnUpdatedAt: session.latestTurnUpdatedAt ?? null,
       project: { id: project.id, key: project.key, name: project.name },
@@ -201,7 +178,7 @@ export function registerAdminChatRoutes(app: FastifyInstance, deps: AdminChatRou
       const detail = deps.store.getSession(idSchema.parse(request.params.id), viewer(request))
       return {
         session: publicSession(detail.session),
-        turns: detail.turns.map((turn) => publicTurn(turn, deps.redactor)),
+        turns: detail.turns.map(publicTurn),
       }
     } catch (error) {
       return handleKnownError(error, reply)
@@ -217,7 +194,7 @@ export function registerAdminChatRoutes(app: FastifyInstance, deps: AdminChatRou
       deps.worker.wake()
       return reply.code(202).send({
         session: publicSession(created.session),
-        turn: publicTurn(created.turn, deps.redactor),
+        turn: publicTurn(created.turn),
       })
     } catch (error) {
       return handleKnownError(error, reply)
@@ -238,7 +215,7 @@ export function registerAdminChatRoutes(app: FastifyInstance, deps: AdminChatRou
         )
         created.supersededTurnIds.forEach((turnId) => deps.worker.cancel(turnId))
         deps.worker.wake()
-        return reply.code(202).send(publicTurn(created.turn, deps.redactor))
+        return reply.code(202).send(publicTurn(created.turn))
       } catch (error) {
         return handleKnownError(error, reply)
       }
@@ -250,7 +227,7 @@ export function registerAdminChatRoutes(app: FastifyInstance, deps: AdminChatRou
       const created = deps.store.retryTurnSupersedingActive(idSchema.parse(request.params.id), viewer(request))
       created.supersededTurnIds.forEach((turnId) => deps.worker.cancel(turnId))
       deps.worker.wake()
-      return reply.code(202).send(publicTurn(created.turn, deps.redactor))
+      return reply.code(202).send(publicTurn(created.turn))
     } catch (error) {
       return handleKnownError(error, reply)
     }
@@ -261,7 +238,7 @@ export function registerAdminChatRoutes(app: FastifyInstance, deps: AdminChatRou
       const turnId = idSchema.parse(request.params.id)
       const turn = deps.store.cancelTurn(turnId, viewer(request))
       deps.worker.cancel(turnId)
-      return reply.send(publicTurn(turn, deps.redactor))
+      return reply.send(publicTurn(turn))
     } catch (error) {
       return handleKnownError(error, reply)
     }
@@ -297,7 +274,7 @@ export function registerAdminChatRoutes(app: FastifyInstance, deps: AdminChatRou
         input.reason,
         requirePrincipal(request).username,
       )
-      return reply.code(201).send(publicTurn(turn, deps.redactor))
+      return reply.code(201).send(publicTurn(turn))
     } catch (error) {
       return handleKnownError(error, reply)
     }
