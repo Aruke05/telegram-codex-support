@@ -684,13 +684,20 @@ export class SupportThreadCoordinator {
         batch.group.id,
         event.replyToMessageId,
       )
+      const botReplyText = referencedEvent ? null : this.deps.store.findDeliveredBotReplyText(
+        batch.group.id,
+        event.replyToMessageId,
+      )
       const referencedThread = eventThread ?? botThread
       const activeSameService = referencedThread && referencedThread.status !== "closed"
         && referencedThread.serviceId === batch.service.id
       if (activeSameService) continue
       const text = referencedEvent
         ? referencedEvent.safeText.trim() || referencedEvent.attachmentSummary.trim()
-        : referencedThread?.summary.trim() || ""
+        : [
+            referencedThread?.summary.trim() ? `已归档问题：${referencedThread.summary.trim()}` : "",
+            botReplyText ? `当时已发送的客服回复：${botReplyText}` : "",
+          ].filter(Boolean).join("\n")
       if (!text) continue
       unresolvedReplyReferences.set(event.replyToMessageId, {
         event: referencedEvent,

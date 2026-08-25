@@ -1231,6 +1231,16 @@ export class SupportThreadStore {
     return legacy ? threadFromRow(legacy) : null
   }
 
+  findDeliveredBotReplyText(groupId: string, telegramMessageId: string): string | null {
+    const row = this.database.prepare(`SELECT p.answer FROM support_replies r
+      JOIN support_reply_payloads p ON p.reply_id=r.id
+      WHERE r.group_id=? AND r.telegram_reply_message_id=?
+        AND r.status IN ('replied','escalated','corrected') AND trim(p.answer)<>''
+      ORDER BY r.updated_at DESC,r.id DESC LIMIT 1`).get(groupId, telegramMessageId) as SqlRow | undefined
+    const answer = row?.answer === null || row?.answer === undefined ? "" : String(row.answer).trim()
+    return answer || null
+  }
+
   claimDue(now: string, progressNotificationSeconds = DEFAULT_PROGRESS_DELAY_SECONDS): { thread: SupportThread; inputRevision: number } | null {
     this.archiveExpired(now)
     return this.database.transaction(() => {
