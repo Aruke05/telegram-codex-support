@@ -146,7 +146,11 @@ describe("Reference classifier Codex permissions", () => {
   it("影子报告使用无网络且只能读取空工作目录的严格权限", () => {
     const cwd = "/private/tmp/shadow-report-empty"
     const args = executorModule.buildCodexArgs(
-      { ...referenceClassifierInvocation(cwd, []), accessMode: "shadow-report" },
+      {
+        ...referenceClassifierInvocation(cwd, []),
+        accessMode: "shadow-report",
+        imagePaths: ["/private/tmp/forbidden-shadow-image.png"],
+      },
       "/private/tmp/schema.json",
       "/private/tmp/result.json",
     )
@@ -158,12 +162,14 @@ describe("Reference classifier Codex permissions", () => {
     expect(overrides.some((override) => override.startsWith("permissions.shadow-report.filesystem=")
       && override.includes('\":root\"=\"deny\"')
       && override.includes(`${JSON.stringify(cwd)}=\"read\"`))).toBe(true)
+    expect(optionValues(args, "--image")).toEqual([])
   })
 
   it("回复组合与审核使用无网络、无工作目录读取能力的纯文本权限", () => {
     const cwd = "/private/tmp/reply-composer"
+    const imagePath = "/private/tmp/reviewer-evidence.png"
     const args = executorModule.buildCodexArgs(
-      { ...referenceClassifierInvocation(cwd, []), accessMode: "text-only" },
+      { ...referenceClassifierInvocation(cwd, []), accessMode: "text-only", imagePaths: [imagePath] },
       "/private/tmp/schema.json",
       "/private/tmp/result.json",
     )
@@ -175,13 +181,14 @@ describe("Reference classifier Codex permissions", () => {
     expect(overrides.some((override) => override.startsWith("permissions.text-only.filesystem=")
       && override.includes('\":root\"=\"deny\"')
       && !override.includes(`${JSON.stringify(cwd)}=\"read\"`))).toBe(true)
+    expect(optionValues(args, "--image")).toEqual([imagePath])
   })
 
   it("uses a strict inline permission profile without the legacy sandbox flag", () => {
     const cwd = "/safe/current-snapshot"
     const repository = "/safe/current-snapshot/java-project"
     const args = executorModule.buildCodexArgs(
-      referenceClassifierInvocation(cwd, [repository]),
+      { ...referenceClassifierInvocation(cwd, [repository]), imagePaths: ["/safe/forbidden-classifier-image.png"] },
       "/safe/runtime/output-schema.json",
       "/safe/runtime/result.json",
     )
@@ -202,6 +209,7 @@ describe("Reference classifier Codex permissions", () => {
       "plugins",
       "workspace_dependencies",
     ]))
+    expect(optionValues(args, "--image")).toEqual([])
     expect(args).not.toContain("--profile-v2")
     expect(sandboxMode(args)).toBeNull()
     expect(overrides).toContain('default_permissions="reference-classifier"')

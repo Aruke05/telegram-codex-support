@@ -22,6 +22,8 @@ const endpoints = {
 } as const
 
 const referenceClassifierTools = new Set(["search_code", "read_code"])
+const invalidToolArguments = Symbol("invalid-tool-arguments")
+const toolFailureResult = "工具调用失败或不被允许 请检查参数并改用当前服务范围内的只读工具"
 
 function record(value: unknown): JsonRecord | null {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as JsonRecord : null
@@ -31,9 +33,13 @@ function array(value: unknown): unknown[] {
   return Array.isArray(value) ? value : []
 }
 
-function parseArguments(value: unknown): unknown {
-  if (typeof value !== "string") return value
-  try { return JSON.parse(value) as unknown } catch { throw new ModelExecutionError("structured_output_invalid", "模型工具参数格式错误") }
+function parseWireArguments(value: unknown): JsonRecord | typeof invalidToolArguments {
+  if (typeof value !== "string") return invalidToolArguments
+  try {
+    return record(JSON.parse(value) as unknown) ?? invalidToolArguments
+  } catch {
+    return invalidToolArguments
+  }
 }
 
 function outputText(value: unknown): string {
@@ -51,7 +57,13 @@ function finalTool(definition: Record<string, unknown>): AgentToolDefinition {
 }
 
 function openAiTool(tool: AgentToolDefinition): JsonRecord {
-  return { type: "function", name: tool.name, description: tool.description, parameters: tool.inputSchema, strict: true }
+  return {
+    type: "function",
+    name: tool.name,
+    description: tool.description,
+    parameters: tool.inputSchema,
+    strict: tool.name === "submit_result",
+  }
 }
 
 function chatTool(tool: AgentToolDefinition): JsonRecord {
@@ -172,11 +184,13 @@ export class DirectApiAdapter {
       const calls = array(response.output).flatMap((item, index) => {
         const part = record(item)
         if (part?.type !== "function_call" || typeof part.name !== "string") return []
-        return [{ id: typeof part.call_id === "string" ? part.call_id : `call-${round}-${index}`, name: part.name, arguments: parseArguments(part.arguments) }]
+        return [{ id: typeof part.call_id === "string" ? part.call_id : `call-${round}-${index}`, name: part.name, arguments: parseWireArguments(part.arguments) }]
       })
       const submitted = calls.find((call) => call.name === "submit_result")
       if (submitted) {
-        const parsed = this.tryValidateValue(submitted.arguments, input)
+        const parsed = submitted.arguments === invalidToolArguments
+          ? { ok: false as const, error: "工具参数不是有效 JSON" }
+          : this.tryValidateValue(submitted.arguments, input)
         if (parsed.ok) return { value: parsed.value, toolCallCount }
         validationFailures += 1
         if (validationFailures >= 3) throw new ModelExecutionError("structured_output_invalid", "模型最终结果不符合 Schema")
@@ -190,8 +204,11 @@ export class DirectApiAdapter {
       if (calls.length > 0) {
         const outputs = []
         for (const call of calls) {
-          const result = await this.executeTool(call, input, executableTools)
-          toolCallCount += 1
+          const malformed = call.arguments === invalidToolArguments
+          const result = malformed
+            ? toolFailureResult
+            : await this.executeTool(call, input, executableTools)
+          if (!malformed) toolCallCount += 1
           outputs.push({ type: "function_call_output", call_id: call.id, output: result })
         }
         nextInput = outputs
@@ -308,11 +325,13 @@ export class DirectApiAdapter {
         const call = record(item)
         const fn = record(call?.function)
         if (!fn || typeof fn.name !== "string") return []
-        return [{ id: typeof call?.id === "string" ? call.id : `call-${round}-${index}`, name: fn.name, arguments: parseArguments(fn.arguments) }]
+        return [{ id: typeof call?.id === "string" ? call.id : `call-${round}-${index}`, name: fn.name, arguments: parseWireArguments(fn.arguments) }]
       })
       const submitted = calls.find((call) => call.name === "submit_result")
       if (submitted) {
-        const parsed = this.tryValidateValue(submitted.arguments, input)
+        const parsed = submitted.arguments === invalidToolArguments
+          ? { ok: false as const, error: "工具参数不是有效 JSON" }
+          : this.tryValidateValue(submitted.arguments, input)
         if (parsed.ok) return { value: parsed.value, toolCallCount }
         validationFailures += 1
         if (validationFailures >= 3) throw new ModelExecutionError("structured_output_invalid", "模型最终结果不符合 Schema")
@@ -326,8 +345,11 @@ export class DirectApiAdapter {
       if (calls.length > 0) {
         messages.push(chatAssistantMessage(message))
         for (const call of calls) {
-          const result = await this.executeTool(call, input, executableTools)
-          toolCallCount += 1
+          const malformed = call.arguments === invalidToolArguments
+          const result = malformed
+            ? toolFailureResult
+            : await this.executeTool(call, input, executableTools)
+          if (!malformed) toolCallCount += 1
           messages.push({ role: "tool", tool_call_id: call.id, content: result })
         }
         continue
@@ -382,7 +404,7 @@ export class DirectApiAdapter {
       result = await this.tools.execute(call, input.toolScope, input.signal)
     } catch (error) {
       if (input.signal?.aborted) throw error
-      return "工具调用失败或不被允许 请检查参数并改用当前服务范围内的只读工具"
+      return toolFailureResult
     }
     if (result.observation) await input.onCommandObservations?.([result.observation])
     return result.content.slice(0, 32_000)

@@ -97,15 +97,75 @@ describe("基于生产 SQLite 分布的 AI 客服场景矩阵", () => {
   it.each(shortFollowups)("短追问在分类协议中只能承接焦点不能直接选择候选：%s", (latest) => {
     expect(classifyThreadRouteResultSchema.safeParse({
       action: "follow_up",
+      messageIntent: "actionable",
       questionFragment: latest,
+      issues: null,
+      investigationEffect: "changes_input",
       reason: "承接同一发送人的当前焦点",
       confidence: 1,
       clarificationReply: null,
     }).success).toBe(true)
     expect(classifyThreadRouteResultSchema.safeParse({
       action: "candidate_1",
+      messageIntent: "actionable",
       questionFragment: latest,
+      issues: null,
+      investigationEffect: "changes_input",
       reason: "分类阶段非法选择候选",
+      confidence: 1,
+      clarificationReply: null,
+    }).success).toBe(false)
+  })
+
+  it("路由 messageIntent、action 与 investigationEffect 必须严格一致", () => {
+    expect(classifyThreadRouteResultSchema.safeParse({
+      action: "follow_up",
+      messageIntent: "progress_request",
+      questionFragment: "现在处理到哪了",
+      issues: null,
+      investigationEffect: "status_only",
+      reason: "只询问处理进度",
+      confidence: 1,
+      clarificationReply: null,
+    }).success).toBe(true)
+    expect(classifyThreadRouteResultSchema.safeParse({
+      action: "new_thread",
+      messageIntent: "progress_request",
+      questionFragment: "现在处理到哪了",
+      issues: null,
+      investigationEffect: "status_only",
+      reason: "非法把进度询问建成新线程",
+      confidence: 1,
+      clarificationReply: null,
+    }).success).toBe(false)
+    expect(classifyThreadRouteResultSchema.safeParse({
+      action: "idle",
+      messageIntent: "actionable",
+      questionFragment: "补充订单号 ORDER-REDACTED",
+      issues: null,
+      investigationEffect: null,
+      reason: "非法忽略可执行补充",
+      confidence: 1,
+      clarificationReply: null,
+    }).success).toBe(false)
+    expect(classifyThreadRouteResultSchema.safeParse({
+      action: "uncertain",
+      messageIntent: "unclear",
+      questionFragment: "1",
+      issues: null,
+      investigationEffect: null,
+      reason: "语义不完整",
+      confidence: 0.1,
+      clarificationReply: "你是问订单进度，还是账号处理进度？",
+    }).success).toBe(true)
+    expect(classifyThreadRouteResultSchema.safeParse({
+      action: "follow_up",
+      messageIntent: "progress_request",
+      questionFragment: "现在处理到哪了",
+      issues: null,
+      investigationEffect: "status_only",
+      progressReply: "路由模型不应生成进度文案",
+      reason: "非法兼容字段",
       confidence: 1,
       clarificationReply: null,
     }).success).toBe(false)

@@ -21,11 +21,17 @@ import {
   SupportCodeSyncRuntimeError,
   SupportInvestigationService,
   SupportModelOutputRejectedError,
+  type SupportReplyPipelineAudit,
 } from "./investigation-service.js"
 import type { ResourceWorkspace } from "./resource-workspace.js"
 import { routeSupportMessage } from "./routing.js"
 import type { TechnicalAlertDelivery, TechnicalAlertService } from "./technical-alert-service.js"
-import type { SupportThreadStore } from "./thread-store.js"
+import {
+  FEATURE_REQUEST_PREPARED_ERROR_CODE,
+  TECHNICAL_AVAILABILITY_REPLY_PENDING,
+  type SupportThreadStore,
+  type ThreadOutputClaimSource,
+} from "./thread-store.js"
 import type { TrustedDatabaseQueryRequest } from "./trusted-command-observation.js"
 import { ShadowLearningStore } from "./shadow-learning-store.js"
 
@@ -45,14 +51,6 @@ type TransportPort = {
   ): Promise<string>
 }
 type LearningPort = { enqueue(replyId: string): void }
-const retiredHumanPriorityHandoffErrorCodes = new Set([
-  "answer_ignored_after_human_priority",
-  "answer_model_failed",
-  "answer_model_timeout",
-  "structured_output_invalid",
-  "code_snapshot_unavailable",
-  "investigation_runtime_failed",
-])
 type ResourceBrokerPort = {
   runServerCheck(resourceId: string, check: "nginx_routes" | "system_resources"): Promise<{ exitCode: number; stdout: string; stderr: string }>
   verifyDatabaseQuery?(serviceId: string, request: TrustedDatabaseQueryRequest, signal?: AbortSignal): Promise<{
@@ -95,6 +93,53 @@ function fitQuestion(value: string): string {
 
 function deliveryState(error: unknown): "failed" | "uncertain" {
   return error instanceof TelegramDeliveryError ? error.state : "uncertain"
+}
+
+function handoffSource(escalationType: AnswerDecision["escalationType"]): ThreadOutputClaimSource {
+  switch (escalationType) {
+    case "code_defect":
+    case "technical_change":
+    case "feature_request":
+    case "service_handoff":
+    case "human_operation":
+      return escalationType
+    case "none":
+      throw new Error("升级决定缺少 handoff 来源")
+  }
+}
+
+function nullableString(value: unknown): value is string | null {
+  return value === null || typeof value === "string"
+}
+
+function carriedPipelineAudit(error: unknown): SupportReplyPipelineAudit | null {
+  const eligible = error instanceof SupportModelOutputRejectedError
+    || (error instanceof ModelExecutionError && error.code === "structured_output_invalid")
+  if (!eligible || !("pipelineAudit" in error)) return null
+  const audit = (error as { pipelineAudit?: unknown }).pipelineAudit
+  if (!audit || typeof audit !== "object" || Array.isArray(audit)) return null
+  const candidate = audit as Record<string, unknown>
+  const evidencePacket = candidate.evidencePacket
+  if (candidate.version !== "evidence-binding-review-v2"
+    || (candidate.mode !== "legacy" && candidate.mode !== "multi_stage")
+    || (candidate.finalSource !== "baseline"
+      && candidate.finalSource !== "first_candidate"
+      && candidate.finalSource !== "revised_candidate")
+    || typeof candidate.baselineAnswer !== "string"
+    || !nullableString(candidate.firstCandidateAnswer)
+    || !nullableString(candidate.revisedCandidateAnswer)
+    || !Array.isArray(candidate.reviews)
+    || !nullableString(candidate.fallbackReason)
+    || (evidencePacket !== null
+      && (typeof evidencePacket !== "object" || Array.isArray(evidencePacket)))) return null
+  return audit as SupportReplyPipelineAudit
+}
+
+function redactAuditValue(redactor: ConfiguredSecretRedactor, value: unknown): unknown {
+  if (typeof value === "string") return redactor.redact(value).text
+  if (Array.isArray(value)) return value.map((item) => redactAuditValue(redactor, item))
+  if (!value || typeof value !== "object") return value
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, redactAuditValue(redactor, item)]))
 }
 
 export class SupportAnswerWorker {
@@ -172,6 +217,21 @@ export class SupportAnswerWorker {
     return cancelled
   }
 
+  async resumeHardDeadline(threadId: string, inputRevision: number): Promise<void> {
+    if (await this.resumeClaimedHardDeadline(threadId, inputRevision)) return
+    const replyId = this.deps.store.findPreparedEscalationReplyId(threadId, inputRevision)
+    if (!replyId || this.deps.replies.getDetail(replyId).answer !== TECHNICAL_AVAILABILITY_REPLY_PENDING) return
+    let thread: SupportThread
+    try {
+      thread = this.deps.store.getThread(threadId)
+    } catch {
+      return
+    }
+    const group = this.deps.database.readGroups().find((item) => item.id === thread.groupId)
+    if (!group?.enabled || !group.telegramChatId || group.purpose === "technical_alert") return
+    await this.resumePreparedTechnicalEscalation(replyId, thread, inputRevision, group)
+  }
+
   async runDueOnce(now = new Date()): Promise<boolean> {
     if (await this.sendPendingEscalationDeliveryFailure()) return true
     const claimed = this.deps.store.claimDue(
@@ -204,13 +264,29 @@ export class SupportAnswerWorker {
   private async processClaim(thread: SupportThread, inputRevision: number): Promise<void> {
     if (!this.current(thread.id, inputRevision)) return
     const detail = this.deps.store.getThreadDetail(thread.id)
+    if (this.deps.store.findPreparedHardDeadlineReplyId(thread.id, inputRevision)) {
+      await this.resumeClaimedHardDeadline(thread.id, inputRevision)
+      return
+    }
+    const preparedEscalationId = this.deps.store.findPreparedEscalationReplyId(thread.id, inputRevision)
     const group = this.deps.database.readGroups().find((item) => item.id === thread.groupId)
     let service = this.deps.database.readProjectServices("WHERE id=? AND enabled=1", [thread.serviceId])[0]
     if (!group?.enabled || !group.telegramChatId || !service || group.purpose === "technical_alert") {
-      this.deps.store.finishGeneration(thread.id, inputRevision, "closed")
+      this.deps.database.transaction(() => {
+        if (preparedEscalationId) {
+          this.deps.replies.transition(preparedEscalationId, "failed", {
+            errorCode: "prepared_delivery_source_unavailable",
+            decisionReason: "已准备的回复因来源群或服务不可用而停止投递",
+            decisionConfidence: 0,
+          })
+        }
+        this.deps.store.finishGeneration(thread.id, inputRevision, "closed")
+      })
       return
     }
-    const preparedEscalation = this.deps.replies.findPreparedTechnicalEscalation(thread.id, inputRevision)
+    const preparedEscalation = preparedEscalationId === null
+      ? null
+      : this.deps.replies.getDetail(preparedEscalationId)
     if (preparedEscalation) {
       if (thread.answerOperationMode === "learning") {
         this.deps.database.transaction(() => {
@@ -230,23 +306,8 @@ export class SupportAnswerWorker {
         })
         return
       }
-      if (preparedEscalation.errorCode
-        && retiredHumanPriorityHandoffErrorCodes.has(preparedEscalation.errorCode)) {
-        if (await this.escalateClaimedHumanPrioritySilently(
-          preparedEscalation.id,
-          thread,
-          inputRevision,
-          group,
-          preparedEscalation.decisionReason ?? "旧版人工优先流程未完成",
-          preparedEscalation.errorCode,
-          preparedEscalation.codeRevision,
-        )) return
-        this.deps.replies.transition(preparedEscalation.id, "failed", {
-          answer: "",
-          errorCode: "retired_human_priority_fixed_reply",
-          decisionReason: "旧版人工优先固定回复已取消，未向运营群发送",
-        })
-        this.deps.store.finishGeneration(thread.id, inputRevision, "closed")
+      if (preparedEscalation.errorCode === FEATURE_REQUEST_PREPARED_ERROR_CODE) {
+        await this.resumePreparedFeatureRequest(preparedEscalation.id, thread, inputRevision, group)
         return
       }
       await this.resumePreparedTechnicalEscalation(preparedEscalation.id, thread, inputRevision, group)
@@ -317,20 +378,9 @@ export class SupportAnswerWorker {
           },
         }, controller.signal)
         service = result.service
-        this.deps.database.recordReplyGenerationAudit({
-          supportReplyId: reply.id,
-          pipelineVersion: result.pipelineAudit.version,
-          mode: result.pipelineAudit.mode,
-          evidencePacket: result.pipelineAudit.evidencePacket,
-          baselineAnswer: result.pipelineAudit.baselineAnswer,
-          firstCandidateAnswer: result.pipelineAudit.firstCandidateAnswer,
-          revisedCandidateAnswer: result.pipelineAudit.revisedCandidateAnswer,
-          reviews: result.pipelineAudit.reviews,
-          finalSource: result.pipelineAudit.finalSource,
-          fallbackReason: result.pipelineAudit.fallbackReason,
-        })
+        this.recordPipelineAudit(reply.id, result.pipelineAudit)
         await this.waitForPendingRouting(thread.id, inputRevision, controller.signal)
-        if (this.hardDeadlineReached(thread.id, inputRevision)) return
+        if (await this.finalizeHardDeadlineIfDue(thread, inputRevision, group)) return
         if (!this.current(thread.id, inputRevision)) return this.supersede(reply.id)
         await this.applyDecision(
           reply.id,
@@ -343,11 +393,14 @@ export class SupportAnswerWorker {
           replyTarget?.safeText ?? "",
         )
       } catch (error) {
+        const pipelineAudit = carriedPipelineAudit(error)
+        if (pipelineAudit) this.recordPipelineAudit(reply.id, pipelineAudit)
         if (controller.signal.aborted) {
+          if (await this.resumeClaimedHardDeadline(thread.id, inputRevision)) return
           if (!this.current(thread.id, inputRevision)) this.supersede(reply.id)
           return
         }
-        if (this.hardDeadlineReached(thread.id, inputRevision)) return
+        if (await this.finalizeHardDeadlineIfDue(thread, inputRevision, group)) return
         if (error instanceof SupportCodeConfigurationChangedError) {
           return this.retryForCodeConfiguration(reply.id, thread, inputRevision)
         }
@@ -375,6 +428,7 @@ export class SupportAnswerWorker {
       }
     } catch (error) {
       if (controller.signal.aborted) {
+        if (await this.resumeClaimedHardDeadline(thread.id, inputRevision)) return
         const currentReply = this.deps.replies.getDetail(reply.id)
         if (currentReply.status === "sending") {
           this.deps.replies.transition(reply.id, "failed", {
@@ -385,7 +439,7 @@ export class SupportAnswerWorker {
         } else if (!this.current(thread.id, inputRevision)) this.supersede(reply.id)
         return
       }
-      if (this.hardDeadlineReached(thread.id, inputRevision)) return
+      if (await this.finalizeHardDeadlineIfDue(thread, inputRevision, group)) return
       const current = this.deps.replies.getDetail(reply.id)
       if (!this.current(thread.id, inputRevision)) {
         this.supersede(reply.id)
@@ -412,6 +466,14 @@ export class SupportAnswerWorker {
             ?? (error instanceof ModelExecutionError
               ? `${error.name}(${error.code})：${this.deps.redactor.redact(error.message).text}`
               : `回答模型执行失败：${error instanceof Error ? error.name : "unknown"}`)
+        const failureDecisionReason = (timeout
+          ? `回答模型达到当前配置上限（${limit} 秒），未向运营群发送代码兜底文案。`
+          : rejectedOutputReason
+            ? `${rejectedOutputReason}，未向运营群发送代码兜底文案。`
+            : structuredOutputInvalid
+              ? `${failureReason}；本次未向运营群发送代码兜底文案。`
+              : `回答模型执行失败，未向运营群发送代码兜底文案：${error instanceof Error ? error.name : "unknown"}`
+        ).slice(0, 2000)
         if (thread.answerOperationMode === "learning") {
           if (structuredOutputInvalid) {
             this.deps.replies.transition(reply.id, "failed", {
@@ -438,25 +500,27 @@ export class SupportAnswerWorker {
           }
           return this.failShadow(reply.id, thread, inputRevision, errorCode, failureReason)
         }
-        if (await this.escalateClaimedHumanPrioritySilently(
-          reply.id, thread, inputRevision, group, failureReason, errorCode,
-        )) return
-        this.deps.replies.transition(reply.id, "failed", {
-          errorCode,
-          decisionReason: timeout
-            ? `回答模型达到当前配置上限（${limit} 秒），未向运营群发送代码兜底文案。`
-            : rejectedOutputReason
-              ? `${rejectedOutputReason}，未向运营群发送代码兜底文案。`
-              : structuredOutputInvalid
-                ? `${failureReason}；本次未向运营群发送代码兜底文案。`
-                : `回答模型执行失败，未向运营群发送代码兜底文案：${error instanceof Error ? error.name : "unknown"}`,
-          decisionConfidence: 0,
-        })
-        if (structuredOutputInvalid && this.structuredOutputFailureCount(thread.id, inputRevision) < 2) {
-          if (this.deps.store.retryGeneration(thread.id, inputRevision)) this.wake()
+        if (structuredOutputInvalid && this.structuredOutputFailureCount(thread.id, inputRevision) < 1) {
+          if (this.failAndRetryStructuredGeneration(
+            reply.id, thread.id, inputRevision, errorCode, failureDecisionReason,
+          )) this.wake()
+          else if (!await this.resumeClaimedHardDeadline(thread.id, inputRevision)) this.supersede(reply.id)
           return
         }
-        this.deps.store.finishGeneration(thread.id, inputRevision, "answered")
+        const outcome = this.finalizeRejectedGeneration(
+          reply.id,
+          thread.id,
+          inputRevision,
+          errorCode,
+          failureDecisionReason,
+          failureReason,
+          current.codeRevision,
+        )
+        if (outcome === "progress") {
+          await this.resumePreparedTechnicalEscalation(reply.id, thread, inputRevision, group)
+        } else if (outcome === "stale") {
+          this.supersede(reply.id)
+        }
         return
       }
       if (current.status === "sending") {
@@ -708,23 +772,34 @@ export class SupportAnswerWorker {
       })
       return
     }
+    if (await this.resumeClaimedHardDeadline(thread.id, inputRevision)) return
     if (decision.decision === "ignore") {
-      if (await this.escalateClaimedHumanPrioritySilently(
+      const outcome = this.finalizeRejectedGeneration(
         replyId,
-        thread,
+        thread.id,
         inputRevision,
-        group,
-        `回答模型选择忽略：${decision.reason}`,
         "answer_ignored_after_human_priority",
+        decision.reason,
+        `回答模型选择忽略：${decision.reason}`,
         codeRevision,
-      )) return
-      this.deps.replies.transition(replyId, "ignored", {
-        codeRevision,
-        decisionReason: decision.reason,
-        decisionConfidence: decision.confidence,
-      })
-      this.deps.store.finishGeneration(thread.id, inputRevision, "closed")
-      this.deps.learning.enqueue(replyId)
+        () => {
+          this.deps.replies.transition(replyId, "ignored", {
+            codeRevision,
+            decisionReason: decision.reason,
+            decisionConfidence: decision.confidence,
+          })
+          if (!this.deps.store.finishGeneration(thread.id, inputRevision, "closed")) {
+            throw new Error("忽略回答未能结束当前问题版本")
+          }
+        },
+      )
+      if (outcome === "progress") {
+        await this.resumePreparedTechnicalEscalation(replyId, thread, inputRevision, group)
+      } else if (outcome === "stale") {
+        this.supersede(replyId)
+      } else {
+        this.deps.learning.enqueue(replyId)
+      }
       return
     }
     if (decision.decision === "escalate") {
@@ -748,16 +823,22 @@ export class SupportAnswerWorker {
     if (!this.current(thread.id, inputRevision)) return this.supersede(replyId)
     const quote = decision.quote && originText.includes(decision.quote) ? decision.quote : null
     const memoryVersionRefs = decision.usedMemoryVersionIds.filter((id) => allowedMemoryIds.has(id))
-    const sending = this.deps.replies.claimSending(replyId, {
-      answer,
-      quote,
-      codeRevision,
-      memoryVersionRefs,
-      errorCode: null,
-      decisionReason: decision.reason,
-      decisionConfidence: decision.confidence,
+    const sending = this.deps.database.transaction(() => {
+      if (this.deps.store.findPreparedHardDeadlineReplyId(thread.id, inputRevision)) return null
+      return this.deps.replies.claimSending(replyId, {
+        answer,
+        quote,
+        codeRevision,
+        memoryVersionRefs,
+        errorCode: null,
+        decisionReason: decision.reason,
+        decisionConfidence: decision.confidence,
+      })
     })
-    if (!sending) return
+    if (!sending) {
+      await this.resumeClaimedHardDeadline(thread.id, inputRevision)
+      return
+    }
     const messageId = await this.deps.transport.sendMessage(
       group.accountId,
       group.telegramChatId!,
@@ -802,6 +883,112 @@ export class SupportAnswerWorker {
     })
   }
 
+  private recordPipelineAudit(replyId: string, audit: SupportReplyPipelineAudit): void {
+    this.deps.database.recordReplyGenerationAudit({
+      supportReplyId: replyId,
+      pipelineVersion: audit.version,
+      mode: audit.mode,
+      evidencePacket: redactAuditValue(this.deps.redactor, audit.evidencePacket),
+      baselineAnswer: this.deps.redactor.redact(audit.baselineAnswer).text,
+      firstCandidateAnswer: audit.firstCandidateAnswer === null
+        ? null
+        : this.deps.redactor.redact(audit.firstCandidateAnswer).text,
+      revisedCandidateAnswer: audit.revisedCandidateAnswer === null
+        ? null
+        : this.deps.redactor.redact(audit.revisedCandidateAnswer).text,
+      reviews: redactAuditValue(this.deps.redactor, audit.reviews) as unknown[],
+      finalSource: audit.finalSource,
+      fallbackReason: audit.fallbackReason === null
+        ? null
+        : this.deps.redactor.redact(audit.fallbackReason).text,
+    })
+  }
+
+  private hasStartedProgress(threadId: string): boolean {
+    return this.deps.store.hasStartedProgress(threadId)
+  }
+
+  private finalizeRejectedGeneration(
+    replyId: string,
+    threadId: string,
+    inputRevision: number,
+    errorCode: string,
+    decisionReason: string,
+    progressReason: string,
+    codeRevision: string | null,
+    finalizeWithoutProgress: (() => void) | undefined = undefined,
+  ): "failed" | "progress" | "stale" {
+    return this.deps.database.transaction(() => {
+      const state = this.deps.database.prepare(`SELECT thread.status AS thread_status,
+        thread.revision AS thread_revision,reply.status AS reply_status
+        FROM support_threads thread JOIN support_replies reply ON reply.thread_id=thread.id
+        WHERE thread.id=? AND reply.id=?`).get(threadId, replyId) as {
+          thread_status: string
+          thread_revision: number
+          reply_status: string
+        } | undefined
+      if (!state || state.thread_status !== "generating"
+        || Number(state.thread_revision) !== inputRevision || state.reply_status !== "generating") return "stale"
+      if (this.deps.store.findPreparedHardDeadlineReplyId(threadId, inputRevision)) return "progress"
+      if (this.hasStartedProgress(threadId)) {
+        const prepared = this.deps.replies.prepareTechnicalEscalation(replyId, {
+          answer: TECHNICAL_AVAILABILITY_REPLY_PENDING,
+          quote: null,
+          codeRevision,
+          errorCode,
+          decisionReason: `${progressReason}\n已发送进度提示，转技术继续处理\n技术告警：发送中`.slice(0, 2000),
+          decisionConfidence: 0,
+          memoryVersionRefs: [],
+        }, "failure_after_progress")
+        if (!prepared) throw new Error("进度提示后的失败收口未能持久化")
+        return "progress"
+      }
+      if (finalizeWithoutProgress) finalizeWithoutProgress()
+      else {
+        this.deps.replies.transition(replyId, "failed", {
+          errorCode,
+          decisionReason,
+          decisionConfidence: 0,
+        })
+        if (!this.deps.store.finishGeneration(threadId, inputRevision, "answered")) {
+          throw new Error("回答失败未能结束当前问题版本")
+        }
+      }
+      return "failed"
+    })
+  }
+
+  private failAndRetryStructuredGeneration(
+    replyId: string,
+    threadId: string,
+    inputRevision: number,
+    errorCode: string,
+    decisionReason: string,
+  ): boolean {
+    return this.deps.database.transaction(() => {
+      const state = this.deps.database.prepare(`SELECT thread.status AS thread_status,
+        thread.revision AS thread_revision,reply.status AS reply_status
+        FROM support_threads thread JOIN support_replies reply ON reply.thread_id=thread.id
+        WHERE thread.id=? AND reply.id=?`).get(threadId, replyId) as {
+          thread_status: string
+          thread_revision: number
+          reply_status: string
+        } | undefined
+      if (!state || state.thread_status !== "generating"
+        || Number(state.thread_revision) !== inputRevision || state.reply_status !== "generating") return false
+      if (this.deps.store.findPreparedHardDeadlineReplyId(threadId, inputRevision)) return false
+      this.deps.replies.transition(replyId, "failed", {
+        errorCode,
+        decisionReason,
+        decisionConfidence: 0,
+      })
+      if (!this.deps.store.retryGeneration(threadId, inputRevision)) {
+        throw new Error("结构化输出失败未能进入单次重试")
+      }
+      return true
+    })
+  }
+
   private async forwardFeatureRequest(
     replyId: string,
     thread: SupportThread,
@@ -819,46 +1006,77 @@ export class SupportAnswerWorker {
     }
     const answer = outbound.safeText.trim()
     const memoryVersionRefs = decision.usedMemoryVersionIds.filter((id) => allowedMemoryIds.has(id))
-    const prepared = this.deps.replies.prepareTechnicalEscalation(replyId, {
-      answer,
-      quote: null,
-      codeRevision,
-      decisionReason: decision.reason,
-      decisionConfidence: decision.confidence,
-      memoryVersionRefs,
-    })
-    if (!prepared) return
-
-    try {
-      await this.deps.technicalAlerts.sendTransientFeatureRequest?.(
-        group,
-        replyId,
-        decision.reason,
+    const prepared = this.deps.database.transaction(() => {
+      if (this.deps.store.findPreparedHardDeadlineReplyId(thread.id, inputRevision)) return null
+      return this.deps.replies.prepareTechnicalEscalation(replyId, {
         answer,
-      )
-    } catch { /* 产品需求即时通知失败不持久化也不阻止运营回复。 */ }
+        quote: null,
+        codeRevision,
+        errorCode: FEATURE_REQUEST_PREPARED_ERROR_CODE,
+        decisionReason: decision.reason,
+        decisionConfidence: decision.confidence,
+        memoryVersionRefs,
+      }, handoffSource(decision.escalationType))
+    })
+    if (!prepared) {
+      await this.resumeClaimedHardDeadline(thread.id, inputRevision)
+      return
+    }
+    await this.resumePreparedFeatureRequest(replyId, thread, inputRevision, group)
+  }
+
+  private async resumePreparedFeatureRequest(
+    replyId: string,
+    thread: SupportThread,
+    inputRevision: number,
+    group: RuntimeGroup,
+  ): Promise<void> {
+    if (!this.current(thread.id, inputRevision)) return this.supersede(replyId)
+    let prepared = this.deps.replies.getDetail(replyId)
+    if (prepared.status !== "generating" || prepared.errorCode !== FEATURE_REQUEST_PREPARED_ERROR_CODE) return
+    if (!this.deps.store.hasFeatureRequestAlertOwnership(replyId)) {
+      try {
+        await this.deps.technicalAlerts.sendTransientFeatureRequest?.(
+          group,
+          replyId,
+          prepared.decisionReason ?? "产品改动需求",
+          prepared.answer,
+        )
+      } catch { /* 产品需求即时通知失败不持久化也不阻止运营回复。 */ }
+    }
 
     if (!this.current(thread.id, inputRevision)) return this.supersede(replyId)
-    const sending = this.deps.replies.claimSending(replyId, {
-      answer,
-      quote: null,
-      codeRevision,
-      errorCode: null,
-      decisionReason: decision.reason,
-      decisionConfidence: decision.confidence,
-      memoryVersionRefs,
+    const sending = this.deps.database.transaction(() => {
+      if (this.deps.store.findPreparedHardDeadlineReplyId(thread.id, inputRevision)) return null
+      prepared = this.deps.replies.getDetail(replyId)
+      if (prepared.status !== "generating" || prepared.errorCode !== FEATURE_REQUEST_PREPARED_ERROR_CODE) return null
+      return this.deps.replies.claimSending(replyId, {
+        answer: prepared.answer,
+        quote: null,
+        codeRevision: prepared.codeRevision,
+        errorCode: FEATURE_REQUEST_PREPARED_ERROR_CODE,
+        decisionReason: prepared.decisionReason,
+        decisionConfidence: prepared.decisionConfidence,
+        memoryVersionRefs: prepared.memoryVersionRefs,
+      })
     })
-    if (!sending) return
+    if (!sending) {
+      await this.resumeClaimedHardDeadline(thread.id, inputRevision)
+      return
+    }
     try {
       const operatorMessageId = await this.deps.transport.sendMessage(
         group.accountId,
         group.telegramChatId!,
-        answer,
+        prepared.answer,
         this.replyTargetMessageId(replyId, thread),
         undefined,
         { groupId: group.id, threadId: thread.id, serviceId: thread.serviceId, replyId, kind: "support_reply" },
       )
-      this.deps.replies.transition(replyId, "escalated", { telegramReplyMessageId: operatorMessageId })
+      this.deps.replies.transition(replyId, "escalated", {
+        telegramReplyMessageId: operatorMessageId,
+        errorCode: null,
+      })
       if (sending.senderUserId) this.deps.store.setSenderFocusAfterDeliveredReply(
         thread.id, sending.senderUserId, operatorMessageId,
       )
@@ -868,9 +1086,24 @@ export class SupportAnswerWorker {
       const state = deliveryState(error)
       this.deps.replies.transition(replyId, "failed", {
         errorCode: state === "uncertain" ? "delivery_state_unknown" : "support_delivery_failed",
-        decisionReason: `${decision.reason}\n运营群回复${state === "uncertain" ? "发送结果未知" : "发送失败"}`.slice(0, 2000),
+        decisionReason: `${prepared.decisionReason ?? "产品改动需求"}\n运营群回复${state === "uncertain" ? "发送结果未知" : "发送失败"}`.slice(0, 2000),
         operatorDeliveryStatus: state,
       })
+      const alertKind = "support_delivery_failure" as const
+      if (this.deps.replies.claimTechnicalAlert(replyId, alertKind)) {
+        try {
+          const alert = await this.deps.technicalAlerts.sendSupportAlert(
+            group,
+            replyId,
+            state === "uncertain" ? "运营群回复发送结果未知，需要人工确认是否送达。" : "运营群回复发送失败，需要技术继续处理。",
+            prepared.answer,
+            alertKind,
+          )
+          this.deps.replies.completeTechnicalAlert(replyId, alertKind, alert.status)
+        } catch {
+          this.deps.replies.completeTechnicalAlert(replyId, alertKind, "failed")
+        }
+      }
       this.deps.store.finishGeneration(thread.id, inputRevision, "escalated")
     }
   }
@@ -892,15 +1125,21 @@ export class SupportAnswerWorker {
       throw new Error("技术升级的模型回复未通过发送前安全校验")
     }
     const answer = outbound.safeText.trim()
-    const prepared = this.deps.replies.prepareTechnicalEscalation(replyId, {
-      answer,
-      quote: null,
-      codeRevision,
-      decisionReason: `${decision.reason}\n技术告警：发送中`.slice(0, 2000),
-      decisionConfidence: decision.confidence,
-      memoryVersionRefs,
+    const prepared = this.deps.database.transaction(() => {
+      if (this.deps.store.findPreparedHardDeadlineReplyId(thread.id, inputRevision)) return null
+      return this.deps.replies.prepareTechnicalEscalation(replyId, {
+        answer,
+        quote: null,
+        codeRevision,
+        decisionReason: `${decision.reason}\n技术告警：发送中`.slice(0, 2000),
+        decisionConfidence: decision.confidence,
+        memoryVersionRefs,
+      }, handoffSource(decision.escalationType))
     })
-    if (!prepared) return
+    if (!prepared) {
+      await this.resumeClaimedHardDeadline(thread.id, inputRevision)
+      return
+    }
     await this.resumePreparedTechnicalEscalation(replyId, thread, inputRevision, group)
   }
 
@@ -911,7 +1150,8 @@ export class SupportAnswerWorker {
     group: RuntimeGroup,
   ): Promise<void> {
     if (!this.current(thread.id, inputRevision)) return this.supersede(replyId)
-    let prepared = this.deps.replies.getDetail(replyId)
+    let prepared = await this.materializeTechnicalAvailabilityReply(replyId, thread, inputRevision)
+    if (!prepared) return
     let delivery = this.deps.database.prepare(`SELECT status FROM support_reply_alert_deliveries
       WHERE reply_id=? AND alert_kind='escalation'`).get(replyId) as { status?: string } | undefined
     if (!delivery) {
@@ -939,6 +1179,48 @@ export class SupportAnswerWorker {
     await this.sendPreparedEscalationOperator(prepared.id, thread, inputRevision, group)
   }
 
+  private async materializeTechnicalAvailabilityReply(
+    replyId: string,
+    thread: SupportThread,
+    inputRevision: number,
+  ): Promise<ReturnType<ReplyService["getDetail"]> | null> {
+    let prepared = this.deps.replies.getDetail(replyId)
+    if (prepared.answer !== TECHNICAL_AVAILABILITY_REPLY_PENDING) return prepared
+    if (!this.current(thread.id, inputRevision)) {
+      this.supersede(replyId)
+      return null
+    }
+    const compose = this.deps.agent.composeTechnicalAvailabilityReply
+    if (!compose) throw new Error("回答模型未提供技术离线收口文案生成能力")
+    const detail = this.deps.store.getThreadDetail(thread.id)
+    const conversationContext = this.conversationContext(detail, replyId)
+    const generated = await compose.call(this.deps.agent, {
+      latestMessage: this.latestQuestion(detail),
+      ...(conversationContext.value ? { conversationContext: conversationContext.value } : {}),
+      operatorStyleProfile: thread.operatorStyleProfile,
+      modelInstanceId: thread.answerModelInstanceId,
+      modelSnapshot: this.deps.config.getModelInstanceSnapshot(thread.answerModelInstanceId),
+      answerTimeoutSeconds: thread.answerTimeoutSeconds,
+      answerMaxConcurrency: thread.answerMaxConcurrency,
+      answerBindingEnabled: thread.answerBindingEnabled,
+      replyStyle: thread.answerReplyStyle,
+    })
+    const outbound = this.deps.redactor.assertSafeOutbound(generated.answer)
+    const answer = outbound.safeText.trim()
+    if (!outbound.allowed || !answer || garbled(answer)) {
+      throw new Error("技术离线收口文案未通过发送前安全校验")
+    }
+    const updated = this.deps.replies.replacePreparedTechnicalEscalationAnswer(
+      replyId,
+      TECHNICAL_AVAILABILITY_REPLY_PENDING,
+      answer,
+    )
+    if (updated) return updated
+    prepared = this.deps.replies.getDetail(replyId)
+    if (prepared.status === "generating" && prepared.answer !== TECHNICAL_AVAILABILITY_REPLY_PENDING) return prepared
+    return null
+  }
+
   private async sendPreparedEscalationOperator(
     replyId: string,
     thread: SupportThread,
@@ -946,25 +1228,29 @@ export class SupportAnswerWorker {
     group: RuntimeGroup,
   ): Promise<void> {
     if (!this.current(thread.id, inputRevision)) return this.supersede(replyId)
-    const prepared = this.deps.replies.getDetail(replyId)
     const delivery = this.deps.database.prepare(`SELECT status FROM support_reply_alert_deliveries
       WHERE reply_id=? AND alert_kind='escalation'`).get(replyId) as { status?: string } | undefined
     const alertSummary = delivery?.status === "sent" ? "已发送"
       : delivery?.status === "not_configured" ? "技术告警群未配置"
         : delivery?.status === "uncertain" ? "发送结果未知"
           : "发送失败"
-    const baseReason = (prepared.decisionReason ?? "已确认需要技术处理").replace(/\n技术告警：[^\n]*$/u, "")
-    const decisionReason = `${baseReason}\n技术告警：${alertSummary}`.slice(0, 2000)
-    const sending = this.deps.replies.claimSending(replyId, {
-      answer: prepared.answer,
-      quote: null,
-      codeRevision: prepared.codeRevision,
-      errorCode: prepared.errorCode,
-      decisionReason,
-      decisionConfidence: prepared.decisionConfidence,
-      memoryVersionRefs: prepared.memoryVersionRefs,
+    const claimed = this.deps.database.transaction(() => {
+      const prepared = this.deps.replies.getDetail(replyId)
+      const baseReason = (prepared.decisionReason ?? "已确认需要技术处理").replace(/\n技术告警：[^\n]*$/u, "")
+      const decisionReason = `${baseReason}\n技术告警：${alertSummary}`.slice(0, 2000)
+      const sending = this.deps.replies.claimSending(replyId, {
+        answer: prepared.answer,
+        quote: null,
+        codeRevision: prepared.codeRevision,
+        errorCode: prepared.errorCode,
+        decisionReason,
+        decisionConfidence: prepared.decisionConfidence,
+        memoryVersionRefs: prepared.memoryVersionRefs,
+      })
+      return sending ? { prepared, sending, decisionReason } : null
     })
-    if (!sending) return
+    if (!claimed) return
+    const { prepared, sending, decisionReason } = claimed
     try {
       const operatorMessageId = await this.deps.transport.sendMessage(
         group.accountId,
@@ -1016,12 +1302,36 @@ export class SupportAnswerWorker {
     error: ProjectCodeSyncUnavailableError,
   ): Promise<void> {
     if (!this.current(thread.id, inputRevision)) return this.supersede(replyId)
-    if (await this.escalateClaimedHumanPrioritySilently(
-      replyId, thread, inputRevision, group, error.message, "code_snapshot_unavailable",
-    )) return
     const alertKind = "code_sync_unavailable" as const
-    let alertSummary = "未发送"
-    if (this.deps.replies.claimTechnicalAlert(replyId, alertKind)) {
+    let alertClaimed = false
+    const outcome = this.finalizeRejectedGeneration(
+      replyId,
+      thread.id,
+      inputRevision,
+      "code_snapshot_unavailable",
+      `${error.message}\n运营群未发送代码兜底文案\n技术告警：发送中`.slice(0, 2000),
+      error.message,
+      null,
+      () => {
+        alertClaimed = this.deps.replies.claimTechnicalAlert(replyId, alertKind)
+        this.deps.replies.transition(replyId, "failed", {
+          codeSyncBatchId: error.batchId,
+          errorCode: "code_snapshot_unavailable",
+          decisionReason: `${error.message}\n运营群未发送代码兜底文案\n技术告警：${alertClaimed ? "发送中" : "已有投递记录"}`.slice(0, 2000),
+        })
+        if (!this.deps.store.finishGeneration(thread.id, inputRevision, "answered")) {
+          throw new Error("代码快照失败未能结束当前问题版本")
+        }
+      },
+    )
+    if (outcome === "progress") {
+      await this.resumePreparedTechnicalEscalation(replyId, thread, inputRevision, group)
+      return
+    }
+    if (outcome === "stale") return this.supersede(replyId)
+
+    let alertSummary = alertClaimed ? "发送中" : "已有投递记录"
+    if (alertClaimed) {
       try {
         const alert = await this.deps.technicalAlerts.sendCodeSyncFailure({
           sourceGroup: group,
@@ -1035,17 +1345,15 @@ export class SupportAnswerWorker {
         alertSummary = alert.summary
         this.deps.replies.completeTechnicalAlert(replyId, alertKind, alert.status)
         this.deps.codeSync.recordAlert?.(error.batchId, alert)
-      } catch (alertError) {
+      } catch {
+        alertSummary = "发送失败：技术告警执行异常"
         this.deps.replies.completeTechnicalAlert(replyId, alertKind, "failed")
-        throw alertError
       }
     }
-    this.deps.replies.transition(replyId, "failed", {
-      codeSyncBatchId: error.batchId,
-      errorCode: "code_snapshot_unavailable",
-      decisionReason: `${error.message}\n运营群未发送代码兜底文案\n技术告警：${alertSummary}`.slice(0, 2000),
-    })
-    this.deps.store.finishGeneration(thread.id, inputRevision, "answered")
+    this.updateFailedDecisionReason(
+      replyId,
+      `${error.message}\n运营群未发送代码兜底文案\n技术告警：${alertSummary}`,
+    )
   }
 
   private async failInvestigationRuntime(
@@ -1056,12 +1364,35 @@ export class SupportAnswerWorker {
     reason: string,
   ): Promise<void> {
     if (!this.current(thread.id, inputRevision)) return this.supersede(replyId)
-    if (await this.escalateClaimedHumanPrioritySilently(
-      replyId, thread, inputRevision, group, reason, "investigation_runtime_failed",
-    )) return
     const alertKind = "investigation_runtime_failure" as const
-    let alertSummary = "未发送"
-    if (this.deps.replies.claimTechnicalAlert(replyId, alertKind)) {
+    let alertClaimed = false
+    const outcome = this.finalizeRejectedGeneration(
+      replyId,
+      thread.id,
+      inputRevision,
+      "investigation_runtime_failed",
+      `${reason}\n运营群未发送代码兜底文案\n运行告警：发送中`.slice(0, 2000),
+      reason,
+      null,
+      () => {
+        alertClaimed = this.deps.replies.claimTechnicalAlert(replyId, alertKind)
+        this.deps.replies.transition(replyId, "failed", {
+          errorCode: "investigation_runtime_failed",
+          decisionReason: `${reason}\n运营群未发送代码兜底文案\n运行告警：${alertClaimed ? "发送中" : "已有投递记录"}`.slice(0, 2000),
+        })
+        if (!this.deps.store.finishGeneration(thread.id, inputRevision, "answered")) {
+          throw new Error("只读排查失败未能结束当前问题版本")
+        }
+      },
+    )
+    if (outcome === "progress") {
+      await this.resumePreparedTechnicalEscalation(replyId, thread, inputRevision, group)
+      return
+    }
+    if (outcome === "stale") return this.supersede(replyId)
+
+    let alertSummary = alertClaimed ? "发送中" : "已有投递记录"
+    if (alertClaimed) {
       try {
         const alert = await this.deps.technicalAlerts.sendSupportAlert(
           group,
@@ -1072,62 +1403,21 @@ export class SupportAnswerWorker {
         )
         alertSummary = alert.summary
         this.deps.replies.completeTechnicalAlert(replyId, alertKind, alert.status)
-      } catch (error) {
-        this.deps.replies.completeTechnicalAlert(replyId, alertKind, "failed")
-        throw error
-      }
-    }
-    this.deps.replies.transition(replyId, "failed", {
-      errorCode: "investigation_runtime_failed",
-      decisionReason: `${reason}\n运营群未发送代码兜底文案\n运行告警：${alertSummary}`.slice(0, 2000),
-    })
-    this.deps.store.finishGeneration(thread.id, inputRevision, "answered")
-  }
-
-  private async escalateClaimedHumanPrioritySilently(
-    replyId: string,
-    thread: SupportThread,
-    inputRevision: number,
-    group: RuntimeGroup,
-    reason: string,
-    errorCode: string,
-    codeRevision: string | null = null,
-  ): Promise<boolean> {
-    if (!this.deps.store.hasClaimedHumanPriority(thread.id)) return false
-    if (!this.current(thread.id, inputRevision)) {
-      this.supersede(replyId)
-      return true
-    }
-    const alertKind = "escalation" as const
-    let alertSummary = "已有投递记录"
-    if (this.deps.replies.claimTechnicalAlert(replyId, alertKind)) {
-      try {
-        const alert = await this.deps.technicalAlerts.sendSupportAlert(
-          group,
-          replyId,
-          `${reason}；人工优先等待结束后未形成运营回复，转技术继续处理。`,
-          undefined,
-          alertKind,
-        )
-        alertSummary = alert.summary
-        this.deps.replies.completeTechnicalAlert(replyId, alertKind, alert.status)
       } catch {
         alertSummary = "发送失败：技术告警执行异常"
         this.deps.replies.completeTechnicalAlert(replyId, alertKind, "failed")
       }
     }
-    this.deps.replies.transition(replyId, "escalated", {
-      answer: "",
-      quote: null,
-      codeRevision,
-      errorCode,
-      decisionReason: `${reason}\n人工优先等待后已转技术，运营群未发送固定回复\n技术告警：${alertSummary}`.slice(0, 2000),
-      decisionConfidence: 0,
-      memoryVersionRefs: [],
-    })
-    this.deps.store.finishGeneration(thread.id, inputRevision, "escalated")
-    this.deps.learning.enqueue(replyId)
-    return true
+    this.updateFailedDecisionReason(
+      replyId,
+      `${reason}\n运营群未发送代码兜底文案\n运行告警：${alertSummary}`,
+    )
+  }
+
+  private updateFailedDecisionReason(replyId: string, reason: string): void {
+    const now = new Date().toISOString()
+    this.deps.database.prepare(`UPDATE support_replies SET decision_reason=?,updated_at=?
+      WHERE id=? AND status='failed'`).run(this.deps.redactor.redact(reason).text.slice(0, 2000), now, replyId)
   }
 
   private current(threadId: string, revision: number): boolean {
@@ -1164,14 +1454,77 @@ export class SupportAnswerWorker {
     return this.deps.replies.getDetail(replyId).telegramMessageId ?? thread.anchorMessageId
   }
 
-  private hardDeadlineReached(threadId: string, revision: number, now = new Date()): boolean {
+  private async finalizeHardDeadlineIfDue(
+    thread: SupportThread,
+    inputRevision: number,
+    group: RuntimeGroup,
+    now = new Date(),
+  ): Promise<boolean> {
+    const claim = this.deps.store.claimHardDeadline(thread.id, inputRevision, now.toISOString())
+    if (!claim) return this.resumeClaimedHardDeadline(thread.id, inputRevision)
+    if (claim.outcome === "closed") return true
+    if (claim.outcome === "delivery_in_flight") return false
+    if (!this.current(thread.id, inputRevision)) {
+      this.supersede(claim.replyId)
+      return true
+    }
+    await this.resumePreparedTechnicalEscalation(claim.replyId, thread, inputRevision, group)
+    return true
+  }
+
+  private async resumeClaimedHardDeadline(threadId: string, inputRevision: number): Promise<boolean> {
+    const replyId = this.deps.store.findPreparedHardDeadlineReplyId(threadId, inputRevision)
+    if (!replyId) return false
+    let thread: SupportThread
     try {
-      const thread = this.deps.store.getThread(threadId)
-      return thread.status === "generating" && thread.revision === revision
-        && thread.hardDeadlineAt !== null && Date.parse(thread.hardDeadlineAt) <= now.getTime()
+      thread = this.deps.store.getThread(threadId)
     } catch {
       return false
     }
+    if (thread.status !== "generating" || thread.revision !== inputRevision) {
+      this.supersede(replyId)
+      return true
+    }
+    if (thread.answerOperationMode === "learning") {
+      this.failPreparedHardDeadlineWithoutDelivery(
+        replyId,
+        thread,
+        inputRevision,
+        "学习模式禁止 hard deadline Telegram 投递",
+      )
+      return true
+    }
+    const group = this.deps.database.readGroups().find((item) => item.id === thread.groupId)
+    if (!group?.enabled || !group.telegramChatId || group.purpose === "technical_alert") {
+      this.failPreparedHardDeadlineWithoutDelivery(
+        replyId,
+        thread,
+        inputRevision,
+        "hard deadline 来源群已禁用或不可投递",
+      )
+      return true
+    }
+    await this.resumePreparedTechnicalEscalation(replyId, thread, inputRevision, group)
+    return true
+  }
+
+  private failPreparedHardDeadlineWithoutDelivery(
+    replyId: string,
+    thread: SupportThread,
+    inputRevision: number,
+    reason: string,
+  ): void {
+    this.deps.database.transaction(() => {
+      if (!this.current(thread.id, inputRevision)) return
+      this.deps.replies.transition(replyId, "failed", {
+        errorCode: "answer_hard_deadline",
+        decisionReason: reason,
+        decisionConfidence: 0,
+      })
+      if (!this.deps.store.finishGeneration(thread.id, inputRevision, "closed")) {
+        throw new Error("hard deadline 不可投递状态未能关闭当前问题版本")
+      }
+    })
   }
 
   private structuredOutputFailureCount(threadId: string, revision: number): number {

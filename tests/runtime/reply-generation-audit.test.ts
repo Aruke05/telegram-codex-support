@@ -171,7 +171,7 @@ describe("回复生成审计", () => {
 
     const migrated = await RuntimeDatabase.open(filePath)
     try {
-      expect(migrated.schemaVersion()).toBe(32)
+      expect(migrated.schemaVersion()).toBe(34)
       expect(migrated.prepare(`SELECT sql FROM sqlite_master
         WHERE type='table' AND name='reply_generation_audits'`).get()).toBeTruthy()
     } finally {

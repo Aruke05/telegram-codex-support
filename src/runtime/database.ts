@@ -198,6 +198,39 @@ WHEN COALESCE((SELECT value FROM metadata WHERE key='allow_support_history_impor
 BEGIN SELECT RAISE(ABORT, 'support ingest batch already linked to another thread'); END;
 `
 
+const supportThreadNotificationV33TableSchema = `CREATE TABLE IF NOT EXISTS support_thread_notifications (
+  id TEXT PRIMARY KEY,
+  thread_id TEXT NOT NULL REFERENCES support_threads(id) ON DELETE CASCADE,
+  input_revision INTEGER NOT NULL CHECK(input_revision >= 1),
+  kind TEXT NOT NULL CHECK(kind IN ('progress','timeout_operator','timeout_alert')),
+  status TEXT NOT NULL CHECK(status IN ('pending','sending','sent','failed','unknown')),
+  due_at TEXT NOT NULL,
+  telegram_message_id TEXT,
+  error_message TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(thread_id,input_revision,kind)
+)`
+
+const supportThreadNotificationTableSchema = `CREATE TABLE IF NOT EXISTS support_thread_notifications (
+  id TEXT PRIMARY KEY,
+  thread_id TEXT NOT NULL REFERENCES support_threads(id) ON DELETE CASCADE,
+  input_revision INTEGER NOT NULL CHECK(input_revision >= 1),
+  kind TEXT NOT NULL CHECK(kind IN ('progress','timeout_operator','timeout_alert')),
+  status TEXT NOT NULL CHECK(status IN ('pending','sending','sent','failed','unknown')),
+  due_at TEXT NOT NULL,
+  telegram_message_id TEXT,
+  outbound_text TEXT,
+  error_message TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(thread_id,input_revision,kind)
+)`
+
+const supportThreadNotificationSchema = `${supportThreadNotificationTableSchema};
+CREATE INDEX IF NOT EXISTS support_thread_notifications_due_idx
+  ON support_thread_notifications(status,due_at,id);`
+
 const supportThreadSchema = `
 CREATE TABLE IF NOT EXISTS support_threads (
   id TEXT PRIMARY KEY,
@@ -252,20 +285,7 @@ CREATE INDEX IF NOT EXISTS support_threads_human_priority_due_idx
 CREATE UNIQUE INDEX IF NOT EXISTS support_threads_origin_batch_unique_idx
   ON support_threads(origin_batch_id) WHERE origin_batch_id IS NOT NULL;
 
-CREATE TABLE IF NOT EXISTS support_thread_notifications (
-  id TEXT PRIMARY KEY,
-  thread_id TEXT NOT NULL REFERENCES support_threads(id) ON DELETE CASCADE,
-  input_revision INTEGER NOT NULL CHECK(input_revision >= 1),
-  kind TEXT NOT NULL CHECK(kind IN ('progress','timeout_operator','timeout_alert')),
-  status TEXT NOT NULL CHECK(status IN ('pending','sending','sent','failed','unknown')),
-  due_at TEXT NOT NULL,
-  telegram_message_id TEXT,
-  error_message TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  UNIQUE(thread_id,input_revision,kind)
-);
-CREATE INDEX IF NOT EXISTS support_thread_notifications_due_idx ON support_thread_notifications(status,due_at,id);
+${supportThreadNotificationSchema}
 
 CREATE TABLE IF NOT EXISTS support_message_events (
   id TEXT PRIMARY KEY,
@@ -452,6 +472,30 @@ CREATE UNIQUE INDEX IF NOT EXISTS telegram_outgoing_candidates_owner_message_uni
 CREATE INDEX IF NOT EXISTS telegram_outgoing_candidates_resolution_idx
   ON telegram_outgoing_candidates(resolution_status,updated_at,id);
 `
+
+const supportThreadOutputClaimTableSchema = `CREATE TABLE IF NOT EXISTS support_thread_output_claims (
+  thread_id TEXT NOT NULL REFERENCES support_threads(id) ON DELETE CASCADE,
+  claim_kind TEXT NOT NULL CHECK(claim_kind IN ('progress','handoff')),
+  source_kind TEXT NOT NULL CHECK(source_kind IN (
+    'scheduled_progress','status_request','human_priority',
+    'code_defect','technical_change','feature_request','service_handoff','human_operation',
+    'failure_after_progress','hard_deadline'
+  )),
+  reply_id TEXT REFERENCES support_replies(id) ON DELETE CASCADE,
+  notification_id TEXT REFERENCES support_thread_notifications(id) ON DELETE CASCADE,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(thread_id,claim_kind),
+  UNIQUE(reply_id),
+  UNIQUE(notification_id),
+  CHECK(
+    (claim_kind='progress' AND reply_id IS NULL AND notification_id IS NOT NULL)
+    OR
+    (claim_kind='handoff' AND reply_id IS NOT NULL AND notification_id IS NULL)
+  )
+)`
+
+const supportThreadOutputClaimSchema = `${supportThreadOutputClaimTableSchema};`
 
 const adminChatSchema = `
 CREATE TABLE IF NOT EXISTS admin_chat_sessions (
@@ -1063,6 +1107,8 @@ CREATE TABLE IF NOT EXISTS support_reply_payloads (
   quote_text TEXT,
   has_attachment INTEGER NOT NULL DEFAULT 0 CHECK (has_attachment IN (0, 1))
 );
+
+${supportThreadOutputClaimSchema}
 
 CREATE TABLE IF NOT EXISTS reply_generation_audits (
   id TEXT PRIMARY KEY,
@@ -2018,11 +2064,17 @@ function tableColumns(connection: DatabaseSync, table: string): Set<string> {
   return new Set((connection.prepare(`PRAGMA table_info(${table})`).all() as SqlRow[]).map((column) => String(column.name)))
 }
 
+function tableHasColumns(connection: DatabaseSync, table: string, columns: string[]): boolean {
+  if (!tableExists(connection, table)) return false
+  const existing = tableColumns(connection, table)
+  return columns.every((column) => existing.has(column))
+}
+
 type ColumnInvariant = {
   name: string
   type: string
   notNull: 0 | 1
-  primaryKey: 0 | 1
+  primaryKey: number
   defaultValue?: string | null
 }
 
@@ -2092,6 +2144,210 @@ function schemaIndexMatches(
     && Number(index.partial) === 0
     && String(index.origin) === expected.origin
     && JSON.stringify(schemaIndexColumns(connection, String(index.name))) === JSON.stringify(expected.columns)
+}
+
+function assertSupportThreadNotificationStructureForVersion(
+  connection: DatabaseSync,
+  tableSchema: string,
+  includesOutboundText: boolean,
+): void {
+  const message = "线程进度通知结构不完整"
+  if (!tableExists(connection, "support_thread_notifications")) throw new Error(message)
+  const columns: ColumnInvariant[] = [
+    { name: "id", type: "TEXT", notNull: 0, primaryKey: 1 },
+    { name: "thread_id", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "input_revision", type: "INTEGER", notNull: 1, primaryKey: 0 },
+    { name: "kind", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "status", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "due_at", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "telegram_message_id", type: "TEXT", notNull: 0, primaryKey: 0 },
+    { name: "error_message", type: "TEXT", notNull: 0, primaryKey: 0 },
+    { name: "created_at", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "updated_at", type: "TEXT", notNull: 1, primaryKey: 0 },
+  ]
+  if (includesOutboundText) columns.splice(7, 0, {
+    name: "outbound_text", type: "TEXT", notNull: 0, primaryKey: 0,
+  })
+  assertExactColumns(connection, "support_thread_notifications", columns, message)
+
+  const indexes = connection.prepare("PRAGMA index_list(support_thread_notifications)").all() as SqlRow[]
+  const expectedIndexes = [
+    {
+      unique: 1,
+      origin: "pk",
+      columns: [{ name: "id", descending: 0, collation: "BINARY" }],
+    },
+    {
+      unique: 1,
+      origin: "u",
+      columns: [
+        { name: "thread_id", descending: 0, collation: "BINARY" },
+        { name: "input_revision", descending: 0, collation: "BINARY" },
+        { name: "kind", descending: 0, collation: "BINARY" },
+      ],
+    },
+    {
+      unique: 0,
+      origin: "c",
+      columns: [
+        { name: "status", descending: 0, collation: "BINARY" },
+        { name: "due_at", descending: 0, collation: "BINARY" },
+        { name: "id", descending: 0, collation: "BINARY" },
+      ],
+    },
+  ]
+  if (indexes.length !== expectedIndexes.length || expectedIndexes.some((expected) => !indexes.some((index) => (
+    schemaIndexMatches(connection, index, expected)
+  )))) throw new Error(message)
+
+  const foreignKeys = connection.prepare("PRAGMA foreign_key_list(support_thread_notifications)").all() as SqlRow[]
+  if (foreignKeys.length !== 1 || !foreignKeys.some((foreignKey) => (
+    String(foreignKey.from) === "thread_id"
+      && String(foreignKey.table) === "support_threads"
+      && String(foreignKey.to) === "id"
+      && String(foreignKey.on_delete).toLocaleUpperCase("en-US") === "CASCADE"
+  ))) throw new Error(message)
+
+  const tableSql = compactSchemaSql((connection.prepare(`SELECT sql FROM sqlite_master
+    WHERE type='table' AND name='support_thread_notifications'`).get() as SqlRow | undefined)?.sql)
+  const expectedTableSql = compactSchemaSql(tableSchema.replace(
+    "CREATE TABLE IF NOT EXISTS",
+    "CREATE TABLE",
+  ))
+  if (tableSql !== expectedTableSql) throw new Error(message)
+}
+
+function assertSupportThreadNotificationV33Structure(connection: DatabaseSync): void {
+  assertSupportThreadNotificationStructureForVersion(connection, supportThreadNotificationV33TableSchema, false)
+}
+
+function assertSupportThreadNotificationStructure(connection: DatabaseSync): void {
+  assertSupportThreadNotificationStructureForVersion(connection, supportThreadNotificationTableSchema, true)
+}
+
+function repairSupportThreadNotificationStructure(connection: DatabaseSync): void {
+  if (!tableExists(connection, "support_thread_notifications")) {
+    connection.exec(`${supportThreadNotificationV33TableSchema};
+      CREATE INDEX support_thread_notifications_due_idx
+        ON support_thread_notifications(status,due_at,id);`)
+    assertSupportThreadNotificationV33Structure(connection)
+    return
+  }
+  try {
+    assertSupportThreadNotificationV33Structure(connection)
+    return
+  } catch { /* 能力型旧谱系在下方做无损重建。 */ }
+
+  const expectedColumns = [
+    "id", "thread_id", "input_revision", "kind", "status", "due_at", "telegram_message_id", "error_message",
+    "created_at", "updated_at",
+  ]
+  const requiredColumns = ["id", "thread_id", "input_revision", "kind", "status", "due_at", "created_at", "updated_at"]
+  const actualColumns = tableColumns(connection, "support_thread_notifications")
+  const rowCount = Number((connection.prepare(
+    "SELECT COUNT(*) AS count FROM support_thread_notifications",
+  ).get() as SqlRow).count)
+  const missingRequired = requiredColumns.filter((column) => !actualColumns.has(column))
+  const unexpectedColumns = [...actualColumns].filter((column) => !expectedColumns.includes(column))
+  if (rowCount > 0 && (missingRequired.length > 0 || unexpectedColumns.length > 0)) {
+    throw new Error("线程进度通知结构不完整，历史数据无法无损升级")
+  }
+  if (rowCount > 0 && !tableHasColumns(connection, "support_threads", ["id"])) {
+    throw new Error("线程进度通知结构不完整，缺少线程父表")
+  }
+  const rebuildTable = "support_thread_notifications_v33_rebuild"
+  if (tableExists(connection, rebuildTable)) throw new Error("线程进度通知结构迁移临时表冲突")
+  const rebuildSchema = supportThreadNotificationV33TableSchema.replace(
+    "support_thread_notifications",
+    rebuildTable,
+  )
+  connection.exec(rebuildSchema)
+  const sourceExpressions = expectedColumns.map((column) => actualColumns.has(column) ? column : "NULL")
+  connection.exec(`INSERT INTO ${rebuildTable}(${expectedColumns.join(",")})
+    SELECT ${sourceExpressions.join(",")} FROM support_thread_notifications`)
+  const rebuiltCount = Number((connection.prepare(
+    `SELECT COUNT(*) AS count FROM ${rebuildTable}`,
+  ).get() as SqlRow).count)
+  if (rebuiltCount !== rowCount) throw new Error("线程进度通知结构无法完整迁移")
+  connection.exec(`DROP TABLE support_thread_notifications;
+    ${supportThreadNotificationV33TableSchema};
+    INSERT INTO support_thread_notifications(${expectedColumns.join(",")})
+      SELECT ${expectedColumns.join(",")} FROM ${rebuildTable};
+    DROP TABLE ${rebuildTable};
+    CREATE INDEX support_thread_notifications_due_idx
+      ON support_thread_notifications(status,due_at,id);`)
+  assertSupportThreadNotificationV33Structure(connection)
+}
+
+function assertThreadOutputOwnershipForeignKeyRows(connection: DatabaseSync): void {
+  const tables = ["support_thread_notifications", "support_thread_output_claims"] as const
+  for (const table of tables) {
+    if (!tableExists(connection, table)) continue
+    const violations = connection.prepare(`PRAGMA foreign_key_check(${table})`).all() as SqlRow[]
+    if (violations.length > 0 && violations.every((violation) => String(violation.table) === table)) {
+      throw new Error("线程语义输出所有权外键关系损坏")
+    }
+    if (violations.length > 0) {
+      throw new Error("线程语义输出所有权外键检查返回异常")
+    }
+  }
+}
+
+export function assertSupportThreadOutputClaimStructure(connection: DatabaseSync): void {
+  const message = "线程语义输出所有权结构不完整"
+  if (!tableExists(connection, "support_thread_output_claims")) throw new Error(message)
+  assertExactColumns(connection, "support_thread_output_claims", [
+    { name: "thread_id", type: "TEXT", notNull: 1, primaryKey: 1 },
+    { name: "claim_kind", type: "TEXT", notNull: 1, primaryKey: 2 },
+    { name: "source_kind", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "reply_id", type: "TEXT", notNull: 0, primaryKey: 0 },
+    { name: "notification_id", type: "TEXT", notNull: 0, primaryKey: 0 },
+    { name: "created_at", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "updated_at", type: "TEXT", notNull: 1, primaryKey: 0 },
+  ], message)
+
+  const indexes = connection.prepare("PRAGMA index_list(support_thread_output_claims)").all() as SqlRow[]
+  const expectedIndexes = [
+    {
+      origin: "pk",
+      columns: [
+        { name: "thread_id", descending: 0, collation: "BINARY" },
+        { name: "claim_kind", descending: 0, collation: "BINARY" },
+      ],
+    },
+    {
+      origin: "u",
+      columns: [{ name: "reply_id", descending: 0, collation: "BINARY" }],
+    },
+    {
+      origin: "u",
+      columns: [{ name: "notification_id", descending: 0, collation: "BINARY" }],
+    },
+  ] as const
+  if (indexes.length !== expectedIndexes.length || expectedIndexes.some((expected) => !indexes.some((index) => (
+    schemaIndexMatches(connection, index, { unique: 1, origin: expected.origin, columns: [...expected.columns] })
+  )))) throw new Error(message)
+
+  const expectedForeignKeys = new Map<string, readonly [string, string, string]>([
+    ["thread_id", ["support_threads", "id", "CASCADE"]],
+    ["reply_id", ["support_replies", "id", "CASCADE"]],
+    ["notification_id", ["support_thread_notifications", "id", "CASCADE"]],
+  ])
+  const foreignKeys = connection.prepare("PRAGMA foreign_key_list(support_thread_output_claims)").all() as SqlRow[]
+  if (foreignKeys.length !== expectedForeignKeys.size || foreignKeys.some((foreignKey) => {
+    const expected = expectedForeignKeys.get(String(foreignKey.from))
+    return !expected || String(foreignKey.table) !== expected[0] || String(foreignKey.to) !== expected[1]
+      || String(foreignKey.on_delete).toLocaleUpperCase("en-US") !== expected[2]
+  })) throw new Error(message)
+
+  const tableSql = compactSchemaSql((connection.prepare(
+    "SELECT sql FROM sqlite_master WHERE type='table' AND name='support_thread_output_claims'",
+  ).get() as SqlRow | undefined)?.sql)
+  const expectedTableSql = compactSchemaSql(supportThreadOutputClaimTableSchema.replace(
+    "CREATE TABLE IF NOT EXISTS",
+    "CREATE TABLE",
+  ))
+  if (tableSql !== expectedTableSql) throw new Error(message)
 }
 
 function appendOnlyTerminalTriggerSql(operation: "update" | "delete"): string {
@@ -3514,6 +3770,255 @@ function migrateV31ToV32(connection: DatabaseSync): void {
   }
 }
 
+function migrateV32ToV33(connection: DatabaseSync): void {
+  connection.exec("PRAGMA foreign_keys=OFF")
+  try {
+    connection.exec("BEGIN IMMEDIATE")
+    repairSupportThreadNotificationStructure(connection)
+    connection.exec(supportThreadOutputClaimSchema)
+    assertSupportThreadOutputClaimStructure(connection)
+
+    if (tableHasColumns(connection, "support_threads", ["id"])
+      && tableHasColumns(connection, "support_thread_notifications", ["id", "thread_id", "kind", "created_at", "updated_at"])) {
+      const hasNotificationOwnership = tableHasColumns(connection, "telegram_output_ownership", [
+        "notification_id", "delivery_status", "telegram_message_id",
+      ])
+      const startedOwnership = hasNotificationOwnership
+        ? `EXISTS(SELECT 1 FROM telegram_output_ownership ownership
+            WHERE ownership.notification_id=notification.id
+              AND (ownership.delivery_status IN ('sending','sent','unknown')
+                OR ownership.telegram_message_id IS NOT NULL))`
+        : "0"
+      connection.exec(`
+        WITH progress_candidates AS (
+          SELECT notification.*,
+            CASE WHEN notification.status IN ('sent','unknown')
+                OR notification.telegram_message_id IS NOT NULL OR ${startedOwnership}
+              THEN 1 ELSE 0 END AS has_started_fact,
+            CASE WHEN notification.input_revision=thread.revision
+                AND notification.status IN ('pending','sending')
+                AND notification.telegram_message_id IS NULL AND NOT (${startedOwnership})
+              THEN 1 ELSE 0 END AS is_current_recoverable
+          FROM support_thread_notifications notification
+          JOIN support_threads thread ON thread.id=notification.thread_id
+          WHERE notification.kind='progress'
+        ), ranked_candidates AS (
+          SELECT candidate.*,
+            ROW_NUMBER() OVER (
+              PARTITION BY candidate.thread_id
+              ORDER BY CASE WHEN candidate.has_started_fact=1 THEN 0 ELSE 1 END,
+                candidate.created_at,candidate.id
+            ) AS owner_order
+          FROM progress_candidates candidate
+          WHERE candidate.has_started_fact=1 OR candidate.is_current_recoverable=1
+        )
+        INSERT OR IGNORE INTO support_thread_output_claims(
+          thread_id,claim_kind,source_kind,reply_id,notification_id,created_at,updated_at
+        )
+        SELECT thread_id,'progress','scheduled_progress',NULL,id,created_at,updated_at
+        FROM ranked_candidates
+        WHERE owner_order=1;
+      `)
+    }
+
+    const threadColumns = tableExists(connection, "support_threads")
+      ? tableColumns(connection, "support_threads")
+      : new Set<string>()
+    const canInsertSyntheticProgress = ["id", "revision", "created_at", "updated_at"]
+      .every((column) => threadColumns.has(column))
+      && tableHasColumns(connection, "support_thread_notifications", [
+        "id", "thread_id", "input_revision", "kind", "status", "due_at", "telegram_message_id", "error_message",
+        "created_at", "updated_at",
+      ])
+    const hasHumanProgressMessage = threadColumns.has("human_priority_progress_message_id")
+    const hasProgressOwnership = tableHasColumns(connection, "telegram_output_ownership", [
+      "id", "thread_id", "output_kind", "delivery_status", "telegram_message_id", "reply_id", "notification_id",
+      "created_at", "updated_at",
+    ])
+    if (canInsertSyntheticProgress && (hasHumanProgressMessage || hasProgressOwnership)) {
+      const humanProgressMessage = hasHumanProgressMessage ? "thread.human_priority_progress_message_id" : "NULL"
+      const humanOwnership = hasProgressOwnership
+        ? `EXISTS(SELECT 1 FROM telegram_output_ownership ownership
+            WHERE ownership.thread_id=thread.id AND ownership.output_kind='mention_claim_progress'
+              AND (ownership.delivery_status IN ('sending','sent','unknown') OR ownership.telegram_message_id IS NOT NULL))`
+        : "0"
+      const anyProgressOwnership = hasProgressOwnership
+        ? `EXISTS(SELECT 1 FROM telegram_output_ownership ownership
+            WHERE ownership.thread_id=thread.id
+              AND (ownership.output_kind='mention_claim_progress'
+                OR (ownership.output_kind='progress' AND ownership.reply_id IS NOT NULL))
+              AND (ownership.delivery_status IN ('sending','sent','unknown') OR ownership.telegram_message_id IS NOT NULL))`
+        : "0"
+      const syntheticProgressRows = connection.prepare(`SELECT thread.id,thread.revision,
+          ${humanProgressMessage} AS human_priority_progress_message_id,thread.created_at,thread.updated_at,
+          ${humanOwnership} AS has_human_ownership
+        FROM support_threads thread
+        WHERE NOT EXISTS(SELECT 1 FROM support_thread_output_claims claim
+          WHERE claim.thread_id=thread.id AND claim.claim_kind='progress')
+          AND (${humanProgressMessage} IS NOT NULL OR ${anyProgressOwnership})
+        ORDER BY thread.created_at,thread.id`).all() as SqlRow[]
+      const insertNotification = connection.prepare(`INSERT INTO support_thread_notifications(
+        id,thread_id,input_revision,kind,status,due_at,telegram_message_id,error_message,created_at,updated_at
+      ) VALUES (?,?,?,?,?,?,?,?,?,?)`)
+      const insertClaim = connection.prepare(`INSERT INTO support_thread_output_claims(
+        thread_id,claim_kind,source_kind,reply_id,notification_id,created_at,updated_at
+      ) VALUES (?,?,?,?,?,?,?)`)
+      const linkHumanOwnership = hasProgressOwnership
+        ? connection.prepare(`UPDATE telegram_output_ownership SET notification_id=?
+            WHERE thread_id=? AND notification_id IS NULL AND output_kind='mention_claim_progress'`)
+        : null
+      const linkStatusOwnership = hasProgressOwnership
+        ? connection.prepare(`UPDATE telegram_output_ownership SET notification_id=?
+            WHERE thread_id=? AND notification_id IS NULL AND output_kind='progress' AND reply_id IS NOT NULL`)
+        : null
+      const ownershipFacts = hasProgressOwnership
+        ? connection.prepare(`SELECT delivery_status,telegram_message_id,created_at,updated_at
+            FROM telegram_output_ownership
+            WHERE thread_id=? AND (
+              (?='human_priority' AND output_kind='mention_claim_progress')
+              OR (?='status_request' AND output_kind='progress' AND reply_id IS NOT NULL)
+            )
+            ORDER BY created_at,id`)
+        : null
+      for (const row of syntheticProgressRows) {
+        const source = row.human_priority_progress_message_id !== null || Number(row.has_human_ownership) === 1
+          ? "human_priority"
+          : "status_request"
+        const ownerships = (ownershipFacts?.all(String(row.id), source, source) as SqlRow[] | undefined) ?? []
+        const notificationId = randomUUID()
+        const createdAt = String(ownerships[0]?.created_at ?? row.created_at)
+        const updatedAt = String(ownerships.at(-1)?.updated_at ?? row.updated_at)
+        const sentOwnership = ownerships.find((ownership) => ownership.delivery_status === "sent")
+        const status = row.human_priority_progress_message_id !== null || sentOwnership
+          ? "sent"
+          : ownerships.some((ownership) => ownership.delivery_status === "sending" || ownership.delivery_status === "unknown")
+            ? "unknown"
+            : "failed"
+        const telegramMessageId = row.human_priority_progress_message_id === null
+          ? sentOwnership?.telegram_message_id === null || sentOwnership?.telegram_message_id === undefined
+            ? null
+            : String(sentOwnership.telegram_message_id)
+          : String(row.human_priority_progress_message_id)
+        insertNotification.run(
+          notificationId, String(row.id), Number(row.revision), "progress", status, createdAt,
+          telegramMessageId, null, createdAt, updatedAt,
+        )
+        if (source === "human_priority") linkHumanOwnership?.run(notificationId, String(row.id))
+        else linkStatusOwnership?.run(notificationId, String(row.id))
+        insertClaim.run(String(row.id), "progress", source, null, notificationId, createdAt, updatedAt)
+      }
+    }
+
+    const replyColumns = tableExists(connection, "support_replies")
+      ? tableColumns(connection, "support_replies")
+      : new Set<string>()
+    const canBackfillHandoff = tableHasColumns(connection, "support_threads", ["id"])
+      && ["id", "thread_id", "decision", "created_at", "updated_at"].every((column) => replyColumns.has(column))
+    if (canBackfillHandoff) {
+      const evidencePredicates: string[] = []
+      if (replyColumns.has("status")) {
+        evidencePredicates.push("reply.status IN ('sending','replied','ignored','escalated','failed','correcting','corrected','superseded')")
+        if (tableHasColumns(connection, "support_reply_payloads", ["reply_id", "answer"])) {
+          evidencePredicates.push(`(reply.status='generating' AND EXISTS(
+            SELECT 1 FROM support_reply_payloads payload
+            WHERE payload.reply_id=reply.id AND length(trim(payload.answer))>0))`)
+        }
+      }
+      if (tableHasColumns(connection, "support_reply_alert_deliveries", ["reply_id"])) {
+        evidencePredicates.push("EXISTS(SELECT 1 FROM support_reply_alert_deliveries delivery WHERE delivery.reply_id=reply.id)")
+      }
+      if (tableHasColumns(connection, "telegram_output_ownership", [
+        "reply_id", "delivery_status", "telegram_message_id",
+      ])) {
+        evidencePredicates.push(`EXISTS(SELECT 1 FROM telegram_output_ownership ownership
+          WHERE ownership.reply_id=reply.id
+            AND (ownership.delivery_status IN ('sending','sent','unknown') OR ownership.telegram_message_id IS NOT NULL))`)
+      }
+      if (evidencePredicates.length > 0) {
+        const errorCode = replyColumns.has("error_code") ? "error_code" : "NULL"
+        connection.exec(`
+          INSERT OR IGNORE INTO support_thread_output_claims(
+            thread_id,claim_kind,source_kind,reply_id,notification_id,created_at,updated_at
+          )
+          SELECT thread_id,'handoff',CASE ${errorCode}
+              WHEN 'feature_request_prepared' THEN 'feature_request'
+              WHEN 'answer_hard_deadline' THEN 'hard_deadline'
+              ELSE 'technical_change'
+            END,
+            id,NULL,created_at,updated_at
+          FROM (
+            SELECT reply.*,
+              ROW_NUMBER() OVER (PARTITION BY reply.thread_id ORDER BY reply.created_at,reply.id) AS owner_order
+            FROM support_replies reply
+            JOIN support_threads thread ON thread.id=reply.thread_id
+            WHERE reply.thread_id IS NOT NULL AND reply.decision='escalate'
+              AND (${evidencePredicates.join(" OR ")})
+          ) candidates
+          WHERE owner_order=1;
+        `)
+      }
+    }
+
+    assertSupportThreadOutputClaimStructure(connection)
+    assertThreadOutputOwnershipForeignKeyRows(connection)
+    connection.prepare("UPDATE metadata SET value='33' WHERE key='schema_version'").run()
+    connection.exec("COMMIT")
+  } catch (error) {
+    try { connection.exec("ROLLBACK") } catch { /* 事务已结束时无需处理。 */ }
+    throw error
+  } finally {
+    connection.exec("PRAGMA foreign_keys=ON")
+  }
+}
+
+function migrateV33ToV34(connection: DatabaseSync): void {
+  connection.exec("PRAGMA foreign_keys=OFF")
+  try {
+    connection.exec("BEGIN IMMEDIATE")
+    try {
+      assertSupportThreadNotificationStructure(connection)
+    } catch {
+      assertSupportThreadNotificationV33Structure(connection)
+      const rebuildTable = "support_thread_notifications_v34_rebuild"
+      if (tableExists(connection, rebuildTable)) throw new Error("线程进度通知 v34 迁移临时表冲突")
+      connection.exec(supportThreadNotificationTableSchema.replace(
+        "support_thread_notifications",
+        rebuildTable,
+      ))
+      connection.exec(`INSERT INTO ${rebuildTable}(
+          id,thread_id,input_revision,kind,status,due_at,telegram_message_id,outbound_text,error_message,created_at,updated_at
+        ) SELECT id,thread_id,input_revision,kind,status,due_at,telegram_message_id,NULL,error_message,created_at,updated_at
+          FROM support_thread_notifications`)
+      const sourceCount = Number((connection.prepare(
+        "SELECT COUNT(*) AS count FROM support_thread_notifications",
+      ).get() as SqlRow).count)
+      const rebuiltCount = Number((connection.prepare(
+        `SELECT COUNT(*) AS count FROM ${rebuildTable}`,
+      ).get() as SqlRow).count)
+      if (sourceCount !== rebuiltCount) throw new Error("线程进度通知 v34 无法完整迁移")
+      connection.exec(`DROP TABLE support_thread_notifications;
+        ${supportThreadNotificationTableSchema};
+        INSERT INTO support_thread_notifications(
+          id,thread_id,input_revision,kind,status,due_at,telegram_message_id,outbound_text,error_message,created_at,updated_at
+        ) SELECT id,thread_id,input_revision,kind,status,due_at,telegram_message_id,outbound_text,error_message,created_at,updated_at
+          FROM ${rebuildTable};
+        DROP TABLE ${rebuildTable};
+        CREATE INDEX support_thread_notifications_due_idx
+          ON support_thread_notifications(status,due_at,id);`)
+    }
+    assertSupportThreadNotificationStructure(connection)
+    assertSupportThreadOutputClaimStructure(connection)
+    assertThreadOutputOwnershipForeignKeyRows(connection)
+    connection.prepare("UPDATE metadata SET value='34' WHERE key='schema_version'").run()
+    connection.exec("COMMIT")
+  } catch (error) {
+    try { connection.exec("ROLLBACK") } catch { /* 事务已结束时无需处理。 */ }
+    throw error
+  } finally {
+    connection.exec("PRAGMA foreign_keys=ON")
+  }
+}
+
 function ensureAdminChatConversationExtensions(connection: DatabaseSync): void {
   connection.exec("DROP INDEX IF EXISTS admin_chat_turns_one_active_idx")
   connection.exec(adminChatConversationExtensionSchema)
@@ -3607,6 +4112,8 @@ export class RuntimeDatabase {
       if (current === 29) { migrateV29ToV30(connection); current = 30 }
       if (current === 30) { migrateV30ToV31(connection); current = 31 }
       if (current === 31) { migrateV31ToV32(connection); current = 32 }
+      if (current === 32) { migrateV32ToV33(connection); current = 33 }
+      if (current === 33) { migrateV33ToV34(connection); current = 34 }
       if (current !== DATABASE_SCHEMA_VERSION) {
         connection.close()
         throw new Error("运行数据库版本不兼容")
@@ -3615,6 +4122,14 @@ export class RuntimeDatabase {
         try {
           assertTelegramOutputOwnershipRows(connection)
           assertReferenceLearningAuditStructure(connection)
+        } catch (error) {
+          connection.close()
+          throw error
+        }
+      }
+      if (openedVersion >= 33) {
+        try {
+          assertSupportThreadOutputClaimStructure(connection)
         } catch (error) {
           connection.close()
           throw error
@@ -3630,6 +4145,8 @@ export class RuntimeDatabase {
       assertMultiIssueThreadStructure(connection)
       assertSupportSenderFocusStructure(connection)
       assertShadowLearningStructure(connection)
+      assertSupportThreadNotificationStructure(connection)
+      assertSupportThreadOutputClaimStructure(connection)
     } catch (error) {
       connection.close()
       throw error
@@ -3685,6 +4202,8 @@ export class RuntimeDatabase {
       if (current === 29) { migrateV29ToV30(connection); current = 30 }
       if (current === 30) { migrateV30ToV31(connection); current = 31 }
       if (current === 31) { migrateV31ToV32(connection); current = 32 }
+      if (current === 32) { migrateV32ToV33(connection); current = 33 }
+      if (current === 33) { migrateV33ToV34(connection); current = 34 }
       if (current !== DATABASE_SCHEMA_VERSION) {
         connection.close()
         throw new Error("迁移数据库版本不兼容")
@@ -3693,6 +4212,14 @@ export class RuntimeDatabase {
         try {
           assertTelegramOutputOwnershipRows(connection)
           assertReferenceLearningAuditStructure(connection)
+        } catch (error) {
+          connection.close()
+          throw error
+        }
+      }
+      if (openedVersion >= 33) {
+        try {
+          assertSupportThreadOutputClaimStructure(connection)
         } catch (error) {
           connection.close()
           throw error
@@ -3707,6 +4234,8 @@ export class RuntimeDatabase {
         assertMultiIssueThreadStructure(connection)
         assertSupportSenderFocusStructure(connection)
         assertShadowLearningStructure(connection)
+        assertSupportThreadNotificationStructure(connection)
+        assertSupportThreadOutputClaimStructure(connection)
         assertPortableReferenceLearningGroupTopology(connection)
         ensureV3Columns(connection)
         ensureV3ReplySearch(connection)
@@ -3730,6 +4259,8 @@ export class RuntimeDatabase {
           assertMultiIssueThreadStructure(connection)
           assertSupportSenderFocusStructure(connection)
           assertShadowLearningStructure(connection)
+          assertSupportThreadNotificationStructure(connection)
+          assertSupportThreadOutputClaimStructure(connection)
         }
       } catch (error) {
         connection.close()
@@ -4195,6 +4726,7 @@ export class RuntimeDatabase {
         DELETE FROM admin_chat_turns;
         DELETE FROM admin_chat_sessions;
         DELETE FROM reply_memory_refs;
+        DELETE FROM support_thread_output_claims;
         DELETE FROM support_replies;
         DELETE FROM operator_style_version_evidence;
         DELETE FROM operator_style_versions;

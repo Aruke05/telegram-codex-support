@@ -12,6 +12,7 @@ import {
   SupportCodeSyncRuntimeError,
   SupportModelOutputRejectedError,
   type SupportInvestigationService,
+  type SupportReplyPipelineAudit,
 } from "../support/investigation-service.js"
 import type { AdminChatStore } from "./store.js"
 
@@ -28,6 +29,40 @@ type SafeFailure = { errorCode: string; reason: string }
 
 const maximumHistoryTurns = 20
 const maximumContextLength = 12_000
+
+function nullableString(value: unknown): value is string | null {
+  return value === null || typeof value === "string"
+}
+
+function carriedPipelineAudit(error: unknown): SupportReplyPipelineAudit | null {
+  const eligible = error instanceof SupportModelOutputRejectedError
+    || (error instanceof ModelExecutionError && error.code === "structured_output_invalid")
+  if (!eligible || !("pipelineAudit" in error)) return null
+  const audit = (error as { pipelineAudit?: unknown }).pipelineAudit
+  if (!audit || typeof audit !== "object" || Array.isArray(audit)) return null
+  const candidate = audit as Record<string, unknown>
+  const evidencePacket = candidate.evidencePacket
+  if (candidate.version !== "evidence-binding-review-v2"
+    || (candidate.mode !== "legacy" && candidate.mode !== "multi_stage")
+    || (candidate.finalSource !== "baseline"
+      && candidate.finalSource !== "first_candidate"
+      && candidate.finalSource !== "revised_candidate")
+    || typeof candidate.baselineAnswer !== "string"
+    || !nullableString(candidate.firstCandidateAnswer)
+    || !nullableString(candidate.revisedCandidateAnswer)
+    || !Array.isArray(candidate.reviews)
+    || !nullableString(candidate.fallbackReason)
+    || (evidencePacket !== null
+      && (typeof evidencePacket !== "object" || Array.isArray(evidencePacket)))) return null
+  return audit as SupportReplyPipelineAudit
+}
+
+function redactAuditValue(redactor: ConfiguredSecretRedactor, value: unknown): unknown {
+  if (typeof value === "string") return redactor.redact(value).text
+  if (Array.isArray(value)) return value.map((item) => redactAuditValue(redactor, item))
+  if (!value || typeof value !== "object") return value
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, redactAuditValue(redactor, item)]))
+}
 
 function turnMessageSignature(turn: AdminChatTurn): string {
   const attachments = turn.attachments
@@ -316,18 +351,7 @@ export class AdminChatWorker {
         },
       }, controller.signal)
       const decision = result.decision
-      this.deps.database.recordReplyGenerationAudit({
-        adminChatTurnId: turn.id,
-        pipelineVersion: result.pipelineAudit.version,
-        mode: result.pipelineAudit.mode,
-        evidencePacket: result.pipelineAudit.evidencePacket,
-        baselineAnswer: result.pipelineAudit.baselineAnswer,
-        firstCandidateAnswer: result.pipelineAudit.firstCandidateAnswer,
-        revisedCandidateAnswer: result.pipelineAudit.revisedCandidateAnswer,
-        reviews: result.pipelineAudit.reviews,
-        finalSource: result.pipelineAudit.finalSource,
-        fallbackReason: result.pipelineAudit.fallbackReason,
-      })
+      this.recordPipelineAudit(turn.id, result.pipelineAudit)
       const completed = this.deps.store.completeTurn(turn.id, {
         answer: decision.answer,
         decision: decision.decision,
@@ -341,6 +365,8 @@ export class AdminChatWorker {
       })
       this.publish(completed)
     } catch (error) {
+      const pipelineAudit = carriedPipelineAudit(error)
+      if (pipelineAudit) this.recordPipelineAudit(turn.id, pipelineAudit)
       if (controller.signal.aborted) return
       const failure = safeFailure(error)
       try {
@@ -350,12 +376,53 @@ export class AdminChatWorker {
           this.deps.redactor.redact(failure.reason).text,
         )
         this.publish(failed)
+        if (error instanceof ModelExecutionError && error.code === "structured_output_invalid"
+          && this.structuredOutputFailureCount(failed) < 2) {
+          const retry = this.deps.store.retryTurn(failed.id)
+          this.publish(retry)
+        }
       } catch {
         // 状态已经由并发恢复或关闭流程接管时不覆盖现有结果。
       }
     } finally {
       if (this.controllers.get(turn.id) === controller) this.controllers.delete(turn.id)
     }
+  }
+
+  private structuredOutputFailureCount(turn: AdminChatTurn): number {
+    const signature = turnMessageSignature(turn)
+    let count = 0
+    const turns = this.deps.store.getSession(turn.sessionId).turns
+      .filter((candidate) => candidate.position <= turn.position)
+      .sort((left, right) => right.position - left.position)
+    for (const candidate of turns) {
+      if (candidate.status !== "failed"
+        || candidate.errorCode !== "admin_chat_model_structured_output_invalid"
+        || turnMessageSignature(candidate) !== signature) break
+      count += 1
+    }
+    return count
+  }
+
+  private recordPipelineAudit(turnId: string, audit: SupportReplyPipelineAudit): void {
+    this.deps.database.recordReplyGenerationAudit({
+      adminChatTurnId: turnId,
+      pipelineVersion: audit.version,
+      mode: audit.mode,
+      evidencePacket: redactAuditValue(this.deps.redactor, audit.evidencePacket),
+      baselineAnswer: this.deps.redactor.redact(audit.baselineAnswer).text,
+      firstCandidateAnswer: audit.firstCandidateAnswer === null
+        ? null
+        : this.deps.redactor.redact(audit.firstCandidateAnswer).text,
+      revisedCandidateAnswer: audit.revisedCandidateAnswer === null
+        ? null
+        : this.deps.redactor.redact(audit.revisedCandidateAnswer).text,
+      reviews: redactAuditValue(this.deps.redactor, audit.reviews) as unknown[],
+      finalSource: audit.finalSource,
+      fallbackReason: audit.fallbackReason === null
+        ? null
+        : this.deps.redactor.redact(audit.fallbackReason).text,
+    })
   }
 
   private publish(turn: AdminChatTurn): void {

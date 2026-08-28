@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 
-import { afterEach, describe, expect, it } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
 
 import type { ThreadRouteResult } from "../../src/codex/schemas.js"
 import { ReplyEventBus } from "../../src/replies/reply-event-bus.js"
@@ -85,7 +85,10 @@ class NewThreadRouter implements SupportThreadRouterPort {
   async route(input: Parameters<SupportThreadRouterPort["route"]>[0]): Promise<ThreadRouteResult> {
     return {
       action: "new_thread",
+      messageIntent: "actionable",
       questionFragment: input.messages.map((message) => message.safeText).join("\n"),
+      issues: null,
+      investigationEffect: "changes_input",
       reason: "测试新问题",
       confidence: 1,
       clarificationReply: null,
@@ -98,11 +101,13 @@ class SplitRouter implements SupportThreadRouterPort {
     const eventId = input.messages[0]!.id
     return {
       action: "split",
+      messageIntent: "actionable",
       questionFragment: "",
       issues: [
         { eventIds: [eventId], questionFragment: "核对第一笔订单" },
         { eventIds: [eventId], questionFragment: "核对第二笔订单" },
       ],
+      investigationEffect: "changes_input",
       reason: "一条消息包含两个独立问题",
       confidence: 1,
       clarificationReply: null,
@@ -503,25 +508,41 @@ describe("可信人工回复观察", () => {
       telegramMessageId: "robot-401",
     })
 
-    const directBot = harness.coordinator.accept(incoming({
-      groupId: harness.group.id,
-      messageId: "402",
-      senderId: "20001",
-      text: "直接回复机器人",
-      replyToMessageId: "robot-401",
-    }))!
-    const chained = harness.coordinator.accept(incoming({
-      groupId: harness.group.id,
-      messageId: "403",
-      senderId: "20001",
-      text: "沿人工回复链补充",
-      replyToMessageId: "402",
-    }))!
+    const [directBot, chained] = (() => {
+      vi.useFakeTimers({ now: new Date("2026-08-28T05:30:00.000Z") })
+      try {
+        return [
+          harness.coordinator.accept(incoming({
+            groupId: harness.group.id,
+            messageId: "402",
+            senderId: "20001",
+            text: "直接回复机器人",
+            replyToMessageId: "robot-401",
+          }))!,
+          harness.coordinator.accept(incoming({
+            groupId: harness.group.id,
+            messageId: "403",
+            senderId: "20001",
+            text: "沿人工回复链补充",
+            replyToMessageId: "402",
+          }))!,
+        ] as const
+      } finally {
+        vi.useRealTimers()
+      }
+    })()
+    // 同毫秒 observation 的 UUID tie-breaker 不代表插入顺序，反向固定 ID 让这个边界可重复。
+    harness.database.prepare("UPDATE learning_source_observations SET id=? WHERE message_event_id=?")
+      .run("ffffffff-ffff-4fff-bfff-ffffffffffff", directBot.id)
+    harness.database.prepare("UPDATE learning_source_observations SET id=? WHERE message_event_id=?")
+      .run("00000000-0000-4000-8000-000000000000", chained.id)
 
-    expect(observations(harness.database)).toEqual([
+    const recorded = observations(harness.database)
+    expect(recorded).toHaveLength(2)
+    expect(recorded).toEqual(expect.arrayContaining([
       expect.objectContaining({ messageEventId: directBot.id, threadId, associationReason: "direct_bot_reply" }),
       expect.objectContaining({ messageEventId: chained.id, threadId, associationReason: "reply_chain" }),
-    ])
+    ]))
   })
 
   it("多活跃线程时直接回复 progress 通过统一 ownership 精确关联原 thread", async () => {
@@ -904,7 +925,10 @@ describe("可信人工回复观察", () => {
 
     resolveRoute({
       action: "new_thread",
+      messageIntent: "actionable",
       questionFragment: "正在异步路由的问题",
+      issues: null,
+      investigationEffect: "changes_input",
       reason: "测试新问题",
       confidence: 1,
       clarificationReply: null,
@@ -964,7 +988,10 @@ describe("可信人工回复观察", () => {
 
     resolveRoute({
       action: "new_thread",
+      messageIntent: "actionable",
       questionFragment: "服务改绑期间的问题",
+      issues: null,
+      investigationEffect: "changes_input",
       reason: "测试新问题",
       confidence: 1,
       clarificationReply: null,

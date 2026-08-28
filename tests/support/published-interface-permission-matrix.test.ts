@@ -3,7 +3,7 @@ import { join } from "node:path"
 
 import { describe, expect, it } from "vitest"
 
-import { answerDecisionSchema } from "../../src/codex/schemas.js"
+import { answerDecisionModelSchema } from "../../src/codex/schemas.js"
 import { systemDirectivesPrompt } from "../../src/support/system-directives.js"
 
 type InterfaceModule = {
@@ -149,9 +149,29 @@ const publishedInterfaces = publishedInterfaceModules.flatMap((group) => group.e
 }))
 
 const baseDecision = {
+  humanOperation: null,
   quote: null,
   confidence: 1,
   usedMemoryVersionIds: [],
+  answerClaims: [{
+    factId: "F1" as const,
+    statement: "当前已发布代码明确了页面入口和业务角色权限",
+    provenance: "code" as const,
+    evidenceSource: "code" as const,
+    evidence: "当前已发布代码与角色权限",
+  }],
+  responsibility: {
+    party: "not_applicable" as const,
+    certainty: "not_applicable" as const,
+    evidenceSources: [],
+    factIds: [],
+  },
+  interaction: {
+    sentiment: "neutral" as const,
+    situation: "new_request" as const,
+    underlyingNeed: "根据当前页面入口和角色权限确认处理人",
+    responseStrategy: "direct_answer" as const,
+  },
   investigation: {
     summary: "已完成接口和权限闭环核对",
     steps: [{
@@ -162,6 +182,59 @@ const baseDecision = {
       conclusion: "处理人已确认",
     }],
   },
+  evidencePacket: {
+    version: "2" as const,
+    communication: {
+      intent: "direct_answer" as const,
+      recipient: null,
+      desiredOutcome: "说明当前页面入口和业务角色处理路径",
+    },
+    facts: [{
+      id: "F1" as const,
+      statement: "当前已发布代码明确了页面入口和业务角色权限",
+      provenance: "code" as const,
+      evidenceSource: "code" as const,
+      evidence: "当前已发布代码与角色权限",
+      certainty: "confirmed" as const,
+      outboundSafe: true,
+      subjectKind: "general" as const,
+      businessType: "not_applicable" as const,
+      identifiers: [],
+      associationId: null,
+      dependsOnFactIds: [],
+    }],
+    associations: [],
+    requiredAnswerPoints: ["说明当前处理入口和角色权限"],
+    unknowns: [],
+    handlingNotes: [],
+    reviewLevel: "standard" as const,
+  },
+}
+
+function evidenceForAnswer(
+  statement: string,
+  evidence: string,
+  intent: "direct_answer" | "handoff" = "direct_answer",
+  desiredOutcome = "说明当前页面入口和业务角色处理路径",
+) {
+  return {
+    answerClaims: [{
+      factId: "F1" as const,
+      statement,
+      provenance: "code" as const,
+      evidenceSource: "code" as const,
+      evidence,
+    }],
+    evidencePacket: {
+      ...baseDecision.evidencePacket,
+      communication: { intent, recipient: null, desiredOutcome },
+      facts: [{
+        ...baseDecision.evidencePacket.facts[0],
+        statement,
+        evidence,
+      }],
+    },
+  }
 }
 
 function discoverJavaInterfaces(root: string): string[] {
@@ -195,9 +268,11 @@ describe("当前已发布接口的处理权限场景矩阵", () => {
   })
 
   it.each(publishedInterfaces)("当前运营角色有入口和权限时直接回复：$id", ({ id, menu }) => {
-    const answer = `已确认当前情况的处理入口在【${menu}】，运营账号已有对应权限，按页面提示处理并保存后重试即可。`
-    const parsed = answerDecisionSchema.safeParse({
+    const factStatement = `已确认当前情况可由运营账号在【${menu}】处理。`
+    const answer = `${factStatement} 按页面提示处理并保存后重试即可。`
+    const parsed = answerDecisionModelSchema.safeParse({
       ...baseDecision,
+      ...evidenceForAnswer(factStatement, `当前已发布代码确认 ${id} 的页面入口和运营角色权限`),
       decision: "reply",
       escalationType: "none",
       answer,
@@ -208,9 +283,11 @@ describe("当前已发布接口的处理权限场景矩阵", () => {
   })
 
   it.each(publishedInterfaces)("运营无权但其他业务角色可处理时不报技术：$id", ({ id, menu }) => {
-    const answer = `已确认这项操作有现成入口，当前账号没有权限，请由有权限的业务角色在【${menu}】处理，不需要修改系统配置。`
-    const parsed = answerDecisionSchema.safeParse({
+    const factStatement = `已确认【${menu}】有其他授权业务角色可用的现成入口。`
+    const answer = `${factStatement} 当前账号没有权限，请由有权限的业务角色处理，不需要修改系统配置。`
+    const parsed = answerDecisionModelSchema.safeParse({
       ...baseDecision,
+      ...evidenceForAnswer(factStatement, `当前已发布代码确认 ${id} 的页面入口和其他业务角色权限`),
       decision: "reply",
       escalationType: "none",
       answer,
@@ -221,12 +298,20 @@ describe("当前已发布接口的处理权限场景矩阵", () => {
   })
 
   it.each(publishedInterfaces)("所有业务角色均无法处理且确需内部写入时才报技术：$id", ({ id }) => {
-    const parsed = answerDecisionSchema.safeParse({
+    const factStatement = "已确认这项处理没有业务角色可用的后台入口。"
+    const parsed = answerDecisionModelSchema.safeParse({
       ...baseDecision,
+      ...evidenceForAnswer(
+        factStatement,
+        `当前已发布代码确认 ${id} 没有业务角色操作入口`,
+        "handoff",
+        "通知技术执行必要的内部配置修改",
+      ),
       decision: "escalate",
       escalationType: "technical_change",
-      answer: "已确认这项处理没有业务角色可用的后台入口，必须由技术修改内部配置，已经通知技术处理。",
+      answer: `${factStatement} 必须由技术修改内部配置，已经通知技术处理。`,
       reason: `[已确认技术处理] 类型=生产配置\n已核对 ${id}：现有界面、权限注解、角色授权和运行证据均确认运营及其他业务角色无法完成，且必须内部写入。`,
+      responsibility: { party: "our_side", certainty: "confirmed", evidenceSources: ["code"], factIds: ["F1"] },
     })
     expect(parsed.success).toBe(true)
   })

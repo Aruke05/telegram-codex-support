@@ -1,6 +1,10 @@
 import { randomUUID } from "node:crypto"
 
-import type { ThreadRouteResult } from "../codex/schemas.js"
+import {
+  classifyThreadRouteResultSchema,
+  resolveThreadRouteResultSchema,
+  type ThreadRouteResult,
+} from "../codex/schemas.js"
 import type { RuntimeDatabase } from "../runtime/database.js"
 import type {
   ProjectServiceRecord,
@@ -19,7 +23,7 @@ import type {
   SenderRoutePendingContext,
   SupportThreadRouterPort,
 } from "./thread-router.js"
-import { SupportThreadStore } from "./thread-store.js"
+import { SupportThreadStore, type SupportThreadNotification } from "./thread-store.js"
 
 export type IncomingThreadMessage = {
   groupId: string
@@ -81,8 +85,8 @@ export type SupportThreadCoordinatorDependencies = {
     service: ProjectServiceRecord
     thread: SupportThread
     event: SupportMessageEvent
-    text: string
-  }): Promise<{ replyId: string | null }>
+    notification: SupportThreadNotification
+  }): Promise<void>
   correct?(input: CorrectionInput): Promise<void>
   alert?(group: RuntimeGroup, reason: string, event: SupportMessageEvent): Promise<void>
   learningSourceObserver?: Pick<LearningSourceObserver, "observe" | "reconcilePending">
@@ -192,6 +196,12 @@ export class SupportThreadCoordinator {
     const humanPriorityUserIds = group.purpose === "support" && route.action === "process" && !route.immediate
       ? mentionedHumanPriorityUserIds(input.text, roles)
       : []
+    const humanPriorityTechnicalMention = humanPriorityUserIds.some((userId) => roles.some((candidate) => (
+      candidate.enabled && candidate.role === "technical" && candidate.telegramUserId === userId
+    )))
+    const humanPriorityIgnoredUserIds = humanPriorityUserIds.filter((userId) => roles.some((candidate) => (
+      candidate.enabled && candidate.role === "ignored" && candidate.telegramUserId === userId
+    )))
     const recorded = this.deps.store.recordEvent({
       groupId: group.id,
       accountId: group.accountId,
@@ -208,6 +218,8 @@ export class SupportThreadCoordinator {
       routeStatus: eventStatus,
       skipReason: route.action === "ignore" ? route.reason : null,
       humanPriorityUserIds,
+      humanPriorityTechnicalMention,
+      humanPriorityIgnoredUserIds,
       ...(input.createdAt ? { createdAt: input.createdAt } : {}),
     })
     if (recorded.created && input.attachments.length > 0) {
@@ -551,6 +563,16 @@ export class SupportThreadCoordinator {
     const batchOwner = this.deps.store.findThreadByBatch(batch.id)
     if (batchOwner) {
       this.assertBatchOwner(batch, batchOwner)
+      if (this.deps.store.hasHandoffClaim(batchOwner.id)) {
+        const appended = this.appendAuditBatchToThread(
+          batchOwner.id,
+          batch.events,
+          combined,
+          "new_thread",
+        )
+        if (!appended) throw new Error("恢复批次无法补入原客服终态审计")
+        return
+      }
       for (const event of batch.events) {
         const appended = this.deps.store.appendMessageWithSenderFocus({
           threadId: batchOwner.id,
@@ -580,24 +602,62 @@ export class SupportThreadCoordinator {
     }))
     if (replyTargets.size === 1) {
       const target = [...replyTargets.values()][0]!
-      const targetDetail = this.deps.store.getThreadDetail(target.id)
-      const effectDecision = await this.routeDecision(batch, routeEvents, {
-        summary: target.summary,
-        recentMessages: targetDetail.messages.slice(-6).map((message) => ({
-          sender: "operator" as const,
-          text: message.event.safeText || message.event.attachmentSummary,
-          createdAt: message.event.createdAt,
-        })),
-      }, null, null, "classify")
-      if (effectDecision?.action === "follow_up" && effectDecision.investigationEffect === "status_only") {
-        const appended = this.appendStatusOnlyBatchToThread(
+      const effectDecision = await this.routeDecision(
+        batch,
+        routeEvents,
+        this.senderFocusContext(target),
+        null,
+        null,
+        "classify",
+      )
+      if (!effectDecision) return
+      if (this.deps.store.hasHandoffClaim(target.id)) {
+        if (effectDecision.action === "new_thread") {
+          this.createThread(
+            batch.group,
+            batch.service,
+            batch.events,
+            effectDecision.questionFragment || combined,
+            addSeconds(batch.events.at(-1)!.createdAt, 30),
+            batch.id,
+          )
+          this.deps.wake()
+          return
+        }
+        if (effectDecision.action === "split") {
+          this.createSplitThreads(
+            batch.group,
+            batch.service,
+            batch.events,
+            effectDecision,
+            addSeconds(batch.events.at(-1)!.createdAt, 30),
+            batch.id,
+          )
+          this.deps.wake()
+          return
+        }
+        this.appendAuditBatchToThread(
           target.id,
           batch.events,
           effectDecision.questionFragment || combined,
           "explicit_reply",
         )
-        if (appended) {
-          await this.sendStatusOnlyUpdate(batch, appended, effectDecision.progressReply, batch.events)
+        return
+      }
+      if (effectDecision?.action === "follow_up" && effectDecision.investigationEffect === "status_only") {
+        const committed = this.appendStatusOnlyBatchToThread(
+          target.id,
+          batch.events,
+          effectDecision.questionFragment || combined,
+          "explicit_reply",
+        )
+        if (committed) {
+          await this.sendStatusOnlyUpdate(
+            batch,
+            committed.thread,
+            committed.notification,
+            batch.events,
+          )
           return
         }
       }
@@ -776,7 +836,8 @@ export class SupportThreadCoordinator {
         }
         if (decision.action === "split") {
           this.createSplitThreads(batch.group, batch.service, batch.events, decision, settleAt, batch.id)
-        } else {
+          this.deps.wake()
+        } else if (decision.action === "new_thread") {
           this.createThread(
             batch.group,
             batch.service,
@@ -785,35 +846,27 @@ export class SupportThreadCoordinator {
             settleAt,
             batch.id,
           )
+          this.deps.wake()
+        } else {
+          batch.events.forEach((event) => this.deps.store.updateEventRoute(
+            event.id,
+            "ignored",
+            "待归属恢复路由未提供可执行动作",
+          ))
         }
-        this.deps.wake()
         return
       }
       if (decision.action === "candidate_1" || decision.action === "candidate_2") {
         const selectedCandidate = decision.action === "candidate_1" ? 1 : 2
-        const resolved = this.deps.store.resolveRouteClarification({
+        const resolution = this.deps.store.resolveRouteClarification({
           clarificationId: pending.id,
-          answerEventId: batch.events[0]!.id,
+          answerEventIds: batch.events.map((event) => event.id),
           selectedCandidate,
           settleAt,
         })
-        if (resolved) {
-          for (const event of batch.events.slice(1)) {
-            this.deps.store.appendMessageWithSenderFocus({
-              threadId: resolved.id,
-              eventId: event.id,
-              relation: "supplement",
-              questionFragment: originalQuestionFragment(event, decision.questionFragment || combined),
-              settleAt,
-            }, {
-              senderUserId,
-              source: "clarification_answer",
-              operatorMessageId: event.telegramMessageId,
-            })
-          }
-          this.deps.cancelStale?.()
-          this.deps.wake()
-        }
+        if (resolution.mode === "audit_only") return
+        this.deps.cancelStale?.()
+        this.deps.wake()
         return
       }
       if (decision.action === "new_thread") {
@@ -828,11 +881,11 @@ export class SupportThreadCoordinator {
       if (decision.action === "uncertain" && decision.clarificationReply
         && batch.group.operationMode !== "learning" && this.deps.sendRouteClarification) {
         if (pending.promptReplyId) {
-          this.deps.store.cancelPendingRouteClarification(
-            batch.group.id, batch.service.id, senderUserId, latestEvent.createdAt,
-          )
-          this.createThread(batch.group, batch.service, batch.events, decision.questionFragment || combined, settleAt, batch.id)
-          this.deps.wake()
+          batch.events.forEach((event) => this.deps.store.updateEventRoute(
+            event.id,
+            "ignored",
+            "待归属回答仍不明确，保留原确认且不新建问题",
+          ))
           return
         }
         try {
@@ -854,14 +907,8 @@ export class SupportThreadCoordinator {
     const senderCandidates = this.deps.store.listSenderRouteCandidates(
       batch.group.id, batch.service.id, senderUserId, 2, latestEvent.createdAt,
     )
-    const focusContext = focus ? {
-      summary: this.deps.store.getThread(focus.threadId).summary,
-      recentMessages: this.deps.store.getThreadDetail(focus.threadId).messages.slice(-6).map((message) => ({
-        sender: "operator" as const,
-        text: message.event.safeText || message.event.attachmentSummary,
-        createdAt: message.event.createdAt,
-      })),
-    } : null
+    const focusThread = focus ? this.deps.store.getThread(focus.threadId) : null
+    const focusContext = focusThread ? this.senderFocusContext(focusThread) : null
     const ambiguityContext = senderCandidates.length === 2 ? {
       latestQuestion: combined,
       candidateLabels: senderCandidates.map((candidate) => candidate.label),
@@ -873,26 +920,44 @@ export class SupportThreadCoordinator {
       try {
         this.createSplitThreads(batch.group, batch.service, batch.events, decision, settleAt, batch.id)
       } catch {
-        this.createThread(batch.group, batch.service, batch.events, combined, settleAt, batch.id)
+        batch.events.forEach((event) => this.deps.store.updateEventRoute(
+          event.id,
+          "ignored",
+          "拆分路由无法完整持久化，未默认创建问题",
+        ))
+        return
       }
       this.deps.cancelStale?.()
       this.deps.wake()
       return
     }
     if (decision.action === "idle") {
+      if (focusThread && this.deps.store.hasHandoffClaim(focusThread.id)) {
+        this.appendAuditBatchToThread(focusThread.id, batch.events, question, "operator_reply")
+        return
+      }
       batch.events.forEach((event) => this.deps.store.updateEventRoute(event.id, "ignored", "明确闲聊或无需客服介入"))
       return
     }
     if (decision.action === "follow_up" && focus) {
+      if (this.deps.store.hasHandoffClaim(focus.threadId)) {
+        this.appendAuditBatchToThread(focus.threadId, batch.events, question, "operator_reply")
+        return
+      }
       if (decision.investigationEffect === "status_only") {
-        const appended = this.appendStatusOnlyBatchToThread(
+        const committed = this.appendStatusOnlyBatchToThread(
           focus.threadId,
           batch.events,
           question,
           "operator_reply",
         )
-        if (appended) {
-          await this.sendStatusOnlyUpdate(batch, appended, decision.progressReply, batch.events)
+        if (committed) {
+          await this.sendStatusOnlyUpdate(
+            batch,
+            committed.thread,
+            committed.notification,
+            batch.events,
+          )
           return
         }
       }
@@ -937,16 +1002,35 @@ export class SupportThreadCoordinator {
       }
       return
     }
-    if (decision.action === "candidate_1" || decision.action === "candidate_2") {
+    if (decision.action === "uncertain" && focusThread && this.deps.store.hasHandoffClaim(focusThread.id)) {
+      this.appendAuditBatchToThread(focusThread.id, batch.events, question, "operator_reply")
+      return
+    }
+    if (decision.action === "new_thread") {
       this.createThread(batch.group, batch.service, batch.events, question, settleAt, batch.id)
       this.deps.wake()
       return
     }
-    this.deps.store.cancelPendingRouteClarification(
-      batch.group.id, batch.service.id, senderUserId, latestEvent.createdAt,
-    )
-    this.createThread(batch.group, batch.service, batch.events, question, settleAt, batch.id)
-    this.deps.wake()
+    batch.events.forEach((event) => this.deps.store.updateEventRoute(
+      event.id,
+      "ignored",
+      decision.action === "uncertain"
+        ? "uncertain 缺少两个有效候选，静默忽略"
+        : "分类路由未提供可执行动作",
+    ))
+  }
+
+  private senderFocusContext(thread: SupportThread): SenderRouteFocusContext {
+    return {
+      summary: thread.summary,
+      status: thread.status,
+      handoffSource: this.deps.store.handoffSource(thread.id),
+      recentMessages: this.deps.store.getThreadDetail(thread.id).messages.slice(-6).map((message) => ({
+        sender: "operator" as const,
+        text: message.event.safeText || message.event.attachmentSummary,
+        createdAt: message.event.createdAt,
+      })),
+    }
   }
 
   private createThread(
@@ -1086,51 +1170,75 @@ export class SupportThreadCoordinator {
     return current
   }
 
-  private appendStatusOnlyBatchToThread(
+  private appendAuditBatchToThread(
     threadId: string,
     events: SupportMessageEvent[],
     question: string,
-    source: "operator_reply" | "explicit_reply",
+    source: "new_thread" | "explicit_reply" | "operator_reply",
   ): SupportThread | null {
-    let current = this.deps.store.getThread(threadId)
-    if (current.status !== "collecting" && current.status !== "generating") return null
-    for (const [index, event] of events.entries()) {
-      const appended = this.deps.store.appendStatusOnlyMessageWithSenderFocus({
+    const current = this.deps.store.getThread(threadId)
+    return this.deps.store.appendAuditBatchWithSenderFocus(events.map((event, index) => ({
+      message: {
         threadId,
         eventId: event.id,
         relation: "supplement",
         questionFragment: originalQuestionFragment(event, question),
         settleAt: current.settleAt,
         ...(index === 0 ? { expectedRevision: current.revision } : {}),
-      }, {
+      },
+      focus: {
         senderUserId: event.senderUserId,
         source,
         operatorMessageId: event.telegramMessageId,
-      })
-      if (!appended) return null
-      current = appended
-    }
-    return current
+      },
+    })))
+  }
+
+  private appendStatusOnlyBatchToThread(
+    threadId: string,
+    events: SupportMessageEvent[],
+    question: string,
+    source: "operator_reply" | "explicit_reply",
+  ): { thread: SupportThread; notification: SupportThreadNotification | null } | null {
+    const current = this.deps.store.getThread(threadId)
+    if (current.status !== "collecting" && current.status !== "generating") return null
+    return this.deps.store.appendStatusOnlyBatchAndClaimProgress(events.map((event, index) => ({
+      message: {
+        threadId,
+        eventId: event.id,
+        relation: "supplement",
+        questionFragment: originalQuestionFragment(event, question),
+        settleAt: current.settleAt,
+        ...(index === 0 ? { expectedRevision: current.revision } : {}),
+      },
+      focus: {
+        senderUserId: event.senderUserId,
+        source,
+        operatorMessageId: event.telegramMessageId,
+      },
+    })))
   }
 
   private async sendStatusOnlyUpdate(
     batch: Omit<PendingBatch, "timer">,
     thread: SupportThread,
-    text: string | null | undefined,
+    notification: SupportThreadNotification | null,
     events: SupportMessageEvent[],
   ): Promise<void> {
     const latestEvent = events.at(-1)!
     let reason = "仅询问当前排查进度，不改变排查输入"
     try {
-      if (thread.answerOperationMode !== "learning" && text && this.deps.sendStatusUpdate) {
+      if (notification && this.deps.sendStatusUpdate) {
         await this.deps.sendStatusUpdate({
           group: batch.group,
           service: batch.service,
           thread,
           event: latestEvent,
-          text,
+          notification,
         })
         reason = "仅询问当前排查进度，已由当班客服回复且不改变排查输入"
+      } else if (!notification && thread.answerOperationMode === "live") {
+        reason = "仅询问当前排查进度，同一问题已有进度提示发送资格，不重复发送"
       }
     } catch {
       reason = "仅询问当前排查进度，进度回复发送失败但不改变排查输入"
@@ -1147,40 +1255,52 @@ export class SupportThreadCoordinator {
     ambiguity: SenderRoutePendingContext | null,
     mode: "classify" | "resolve_clarification",
   ): Promise<ThreadRouteResult | null> {
-    let decision: ThreadRouteResult
-    try {
-      const attachments = messages.flatMap((message) => this.deps.store.getEventAttachments(message.id).map((attachment) => ({
-        eventId: message.id,
-        name: attachment.fileName,
-        kind: attachment.kind,
-        mimeType: attachment.mimeType,
-        size: attachment.fileSize,
-        extractedText: attachment.extractedText,
-        localPath: attachment.storagePath || null,
-      })))
-      decision = await this.deps.router.route({
-        mode,
-        group: batch.group,
-        service: batch.service,
-        messages,
-        attachments,
-        focus,
-        pending,
-        ambiguity,
-      })
-    } catch {
-      return {
-        action: "new_thread",
-        questionFragment: messages.map((message) => originalQuestionFragment(message, message.safeText)).join("\n").trim(),
-        reason: "路由模型失败，按独立问题安全接收，避免消息丢失或误归到其他线程",
-        confidence: 0,
-        clarificationReply: null,
+    const attachments = messages.flatMap((message) => this.deps.store.getEventAttachments(message.id).map((attachment) => ({
+      eventId: message.id,
+      name: attachment.fileName,
+      kind: attachment.kind,
+      mimeType: attachment.mimeType,
+      size: attachment.fileSize,
+      extractedText: attachment.extractedText,
+      localPath: attachment.storagePath || null,
+    })))
+    const reference = messages.at(-1)?.createdAt ?? new Date().toISOString()
+    const timeline = this.deps.store.listRouteTimeline(batch.group.id, batch.service.id, reference, 30)
+    let decision: ThreadRouteResult | null = null
+    let lastError = "路由模型失败"
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const rawDecision = await this.deps.router.route({
+          mode,
+          group: batch.group,
+          service: batch.service,
+          messages,
+          attachments,
+          focus,
+          pending,
+          ambiguity,
+          timeline,
+        })
+        decision = mode === "classify"
+          ? classifyThreadRouteResultSchema.parse(rawDecision)
+          : resolveThreadRouteResultSchema.parse(rawDecision)
+        break
+      } catch (error) {
+        lastError = error instanceof Error ? `${error.name}: ${error.message}` : "路由模型失败"
       }
     }
     const materializedDuringRoute = this.deps.store.findThreadByBatch(batch.id)
     if (materializedDuringRoute) {
       this.assertBatchOwner(batch, materializedDuringRoute)
       this.deps.wake()
+      return null
+    }
+    if (!decision) {
+      messages.forEach((message) => this.deps.store.updateEventRoute(
+        message.id,
+        "ignored",
+        `路由连续失败两次：${lastError}`.slice(0, 1000),
+      ))
       return null
     }
     return decision

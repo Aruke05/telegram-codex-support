@@ -19,6 +19,7 @@ import {
   type SupportSenderFocus,
   type SupportSenderFocusSource,
   type SupportRouteClarification,
+  type ReplyStatus,
 } from "../runtime/types.js"
 import { resolveAnswerPolicy } from "./answer-policy.js"
 import { baselineOperatorStyleProfile, operatorStyleProfileSchema } from "./operator-style.js"
@@ -27,7 +28,7 @@ import type { ThreadRouteTimelineEntry } from "./thread-router.js"
 type SqlRow = Record<string, unknown>
 type ExpiredReplyUpdate = {
   id: string
-  status: "superseded" | "failed"
+  status: ReplyStatus
   updatedAt: string
   durationMs: number | null
 }
@@ -35,8 +36,32 @@ const THREAD_EXPIRY_MS = 30 * 60 * 1000
 const DEFAULT_PROGRESS_DELAY_SECONDS = 180
 const HARD_DEADLINE_MS = 60 * 60 * 1000
 const HUMAN_PRIORITY_WAIT_MS = 3 * 60 * 1000
+const HARD_DEADLINE_ERROR_CODE = "answer_hard_deadline"
+export const FEATURE_REQUEST_PREPARED_ERROR_CODE = "feature_request_prepared"
+export const TECHNICAL_AVAILABILITY_REPLY_PENDING = "__technical_availability_reply_pending__"
 
 export type SupportThreadNotificationKind = "progress" | "timeout_operator" | "timeout_alert"
+export type ThreadOutputClaimKind = "progress" | "handoff"
+export type ThreadOutputClaimSource =
+  | "scheduled_progress"
+  | "status_request"
+  | "human_priority"
+  | "code_defect"
+  | "technical_change"
+  | "feature_request"
+  | "service_handoff"
+  | "human_operation"
+  | "failure_after_progress"
+  | "hard_deadline"
+export type SupportThreadOutputClaim = {
+  threadId: string
+  claimKind: ThreadOutputClaimKind
+  source: ThreadOutputClaimSource
+  replyId: string | null
+  notificationId: string | null
+  createdAt: string
+  updatedAt: string
+}
 export type SupportThreadNotification = {
   id: string
   threadId: string
@@ -45,6 +70,7 @@ export type SupportThreadNotification = {
   status: "pending" | "sending" | "sent" | "failed" | "unknown"
   dueAt: string
   telegramMessageId: string | null
+  outboundText: string | null
   errorMessage: string | null
   createdAt: string
   updatedAt: string
@@ -52,11 +78,26 @@ export type SupportThreadNotification = {
 export type SupportTimeoutClaim = {
   threadId: string
   inputRevision: number
+  outcome: "closed"
+  replyId: null
   notificationKinds: [] | ["timeout_operator", "timeout_alert"]
+} | {
+  threadId: string
+  inputRevision: number
+  outcome: "prepared_escalation"
+  replyId: string
+  notificationKinds: []
+} | {
+  threadId: string
+  inputRevision: number
+  outcome: "delivery_in_flight"
+  replyId: string
+  notificationKinds: []
 }
 export type HumanPriorityClaim = {
   threadId: string
   inputRevision: number
+  notificationId: string
 }
 export type CloseThreadResult = {
   changed: boolean
@@ -91,6 +132,8 @@ export type RecordSupportEventInput = {
   routeStatus: SupportEventRouteStatus
   skipReason: string | null
   humanPriorityUserIds?: string[]
+  humanPriorityTechnicalMention?: boolean
+  humanPriorityIgnoredUserIds?: string[]
   createdAt?: string
 }
 
@@ -130,9 +173,14 @@ export type CreateRouteClarificationInput = {
 
 export type ResolveRouteClarificationInput = {
   clarificationId: string
-  answerEventId: string
+  answerEventIds: string[]
   selectedCandidate: number
   settleAt: string
+}
+
+export type ResolveRouteClarificationResult = {
+  thread: SupportThread
+  mode: "active" | "audit_only"
 }
 
 export type SenderRouteCandidate = { thread: SupportThread; label: string }
@@ -144,6 +192,18 @@ export type AppendThreadMessageInput = {
   questionFragment: string
   settleAt: string
   expectedRevision?: number
+}
+
+export type StatusOnlyBatchEntry = {
+  message: AppendThreadMessageInput
+  focus: SenderFocusUpdate
+}
+
+export type AuditBatchEntry = StatusOnlyBatchEntry
+
+export type StatusOnlyProgressCommit = {
+  thread: SupportThread
+  notification: SupportThreadNotification | null
 }
 
 export type RecordSupportAttachmentInput = {
@@ -236,6 +296,7 @@ function notificationFromRow(row: SqlRow): SupportThreadNotification {
     status: row.status as SupportThreadNotification["status"],
     dueAt: String(row.due_at),
     telegramMessageId: row.telegram_message_id === null ? null : String(row.telegram_message_id),
+    outboundText: row.outbound_text === null ? null : String(row.outbound_text),
     errorMessage: row.error_message === null ? null : String(row.error_message),
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
@@ -312,8 +373,19 @@ export class SupportThreadStore {
       createdAt: input.createdAt ?? new Date().toISOString(),
     })
     const humanPriorityUserIds = [...new Set((input.humanPriorityUserIds ?? []).filter((id) => /^\d+$/u.test(id)))]
+    const humanPriorityTechnicalMention = input.humanPriorityTechnicalMention
+      ?? this.includesEnabledTechnical(humanPriorityUserIds)
+    const humanPriorityIgnoredUserIds = [...new Set(
+      (input.humanPriorityIgnoredUserIds ?? humanPriorityUserIds.filter((id) => this.isEnabledIgnored(id)))
+        .filter((id) => humanPriorityUserIds.includes(id)),
+    )]
+    const humanPriorityTargetsJson = JSON.stringify({
+      userIds: humanPriorityUserIds,
+      mentionedTechnical: humanPriorityTechnicalMention,
+      ignoredUserIds: humanPriorityIgnoredUserIds,
+    })
     const humanPriorityDueAt = humanPriorityUserIds.length > 0
-      ? new Date(Date.parse(event.createdAt) + HUMAN_PRIORITY_WAIT_MS).toISOString()
+      ? event.createdAt
       : null
     const result = this.database.prepare(`INSERT OR IGNORE INTO support_message_events(
       id,group_id,account_id,telegram_message_id,reply_to_message_id,message_thread_id,media_group_id,sender_user_id,
@@ -334,7 +406,7 @@ export class SupportThreadStore {
       event.safeText,
       event.attachmentSummary,
       event.ingestBatchId,
-      JSON.stringify(humanPriorityUserIds),
+      humanPriorityTargetsJson,
       humanPriorityDueAt,
       event.routeStatus,
       event.skipReason,
@@ -413,11 +485,15 @@ export class SupportThreadStore {
         record.createdAt,
       ))
       this.database.prepare("UPDATE support_message_events SET attachment_summary=? WHERE id=?").run(safeSummary, eventId)
-      const threads = this.database.prepare(`SELECT DISTINCT t.id,t.status,t.settle_at FROM support_threads t
+      const threads = this.database.prepare(`SELECT DISTINCT t.id,t.status,t.revision,t.settle_at FROM support_threads t
         JOIN support_thread_messages tm ON tm.thread_id=t.id
         WHERE tm.message_event_id=? AND t.status<>'closed'`).all(eventId) as SqlRow[]
       threads.forEach((thread) => {
         const id = String(thread.id)
+        if (this.hasHandoffClaim(id)) {
+          this.database.prepare("UPDATE support_threads SET updated_at=? WHERE id=?").run(createdAt, id)
+          return
+        }
         if (thread.status === "collecting") {
           this.database.prepare(`UPDATE support_threads SET
             settle_at=CASE WHEN settle_at<? THEN ? ELSE settle_at END,updated_at=? WHERE id=?`).run(
@@ -428,6 +504,7 @@ export class SupportThreadStore {
             revision=revision+1,status='collecting',settle_at=?,generation_started_at=NULL,
             progress_due_at=NULL,hard_deadline_at=NULL,closed_at=NULL,closed_by=NULL,
             closed_reason=NULL,updated_at=? WHERE id=?`).run(createdAt, createdAt, id)
+          this.supersedeUnstartedProgress(id, Number(thread.revision), createdAt)
         }
         refreshedThreadIds.push(id)
       })
@@ -782,46 +859,84 @@ export class SupportThreadStore {
     })
   }
 
-  resolveRouteClarification(input: ResolveRouteClarificationInput): SupportThread | null {
+  resolveRouteClarification(input: ResolveRouteClarificationInput): ResolveRouteClarificationResult {
     return this.database.transaction(() => {
       const row = this.database.prepare(`SELECT * FROM support_route_clarifications
         WHERE id=? AND status='pending'`).get(input.clarificationId) as SqlRow | undefined
-      if (!row) return null
+      if (!row) throw new Error("待归属确认已失效或被其他处理领取")
       const clarification = routeClarificationFromRow(row)
       const selectedThreadId = clarification.candidateThreadIds[input.selectedCandidate - 1]
       if (!selectedThreadId) throw new Error("选择不在待归属候选集合内")
-      const answer = this.getEvent(input.answerEventId)
-      if (answer.groupId !== clarification.groupId || answer.senderUserId !== clarification.senderUserId) {
+      if (input.answerEventIds.length < 1 || new Set(input.answerEventIds).size !== input.answerEventIds.length) {
+        throw new Error("待归属回答批次必须非空且不能重复")
+      }
+      const answers = input.answerEventIds.map((eventId) => this.getEvent(eventId))
+      if (answers.some((answer) => (
+        answer.groupId !== clarification.groupId || answer.senderUserId !== clarification.senderUserId
+      ))) {
         throw new Error("待归属回答与群或发送人不匹配")
       }
-      if (clarification.expiresAt <= answer.createdAt) return null
+      if (answers.some((answer) => clarification.expiresAt <= answer.createdAt)) {
+        throw new Error("待归属确认已过期")
+      }
       const original = this.getEvent(clarification.messageEventId)
-      const first = this.appendMessage({
-        threadId: selectedThreadId,
-        eventId: original.id,
-        relation: "supplement",
-        questionFragment: original.safeText || original.attachmentSummary,
-        settleAt: input.settleAt,
-      })
-      if (!first) return null
-      const resolved = this.appendMessage({
-        threadId: selectedThreadId,
-        eventId: answer.id,
-        relation: "supplement",
-        questionFragment: answer.safeText || answer.attachmentSummary,
-        settleAt: input.settleAt,
-      })
-      if (!resolved) throw new Error("待归属回答无法追加到候选线程")
-      this.database.prepare(`UPDATE support_route_clarifications SET
+      const selected = this.getThread(selectedThreadId)
+      const auditOnly = this.hasHandoffClaim(selectedThreadId)
+      let resolved: SupportThread
+      if (auditOnly) {
+        const appended = this.appendAuditBatchWithSenderFocus(
+          [original, ...answers].map((event, index) => ({
+            message: {
+              threadId: selectedThreadId,
+              eventId: event.id,
+              relation: "supplement",
+              questionFragment: event.safeText || event.attachmentSummary,
+              settleAt: input.settleAt,
+              ...(index === 0 ? { expectedRevision: selected.revision } : {}),
+            },
+            focus: {
+              senderUserId: event.senderUserId,
+              source: "clarification_answer",
+              operatorMessageId: event.telegramMessageId,
+            },
+          })),
+        )
+        if (!appended) throw new Error("待归属回答批次无法完整追加到候选线程")
+        resolved = appended
+      } else {
+        resolved = selected
+        for (const [index, event] of [original, ...answers].entries()) {
+          const appended = this.appendMessage({
+            threadId: selectedThreadId,
+            eventId: event.id,
+            relation: "supplement",
+            questionFragment: event.safeText || event.attachmentSummary,
+            settleAt: input.settleAt,
+            ...(index === 0 ? { expectedRevision: selected.revision } : {}),
+          })
+          const linked = this.database.prepare(`SELECT 1 FROM support_thread_messages
+            WHERE thread_id=? AND message_event_id=?`).get(selectedThreadId, event.id)
+          if (!appended || !linked || this.getEvent(event.id).routeStatus !== "routed") {
+            throw new Error("待归属回答批次无法完整追加到候选线程")
+          }
+          resolved = appended
+        }
+      }
+      const firstAnswer = answers[0]!
+      const lastAnswer = answers.at(-1)!
+      const changed = Number(this.database.prepare(`UPDATE support_route_clarifications SET
         status='resolved',selected_thread_id=?,resolved_at=?,updated_at=? WHERE id=? AND status='pending'`).run(
-        selectedThreadId, answer.createdAt, answer.createdAt, clarification.id,
-      )
-      this.upsertSenderFocus(resolved, {
-        senderUserId: clarification.senderUserId,
-        source: "clarification_answer",
-        operatorMessageId: answer.telegramMessageId,
-      }, answer.createdAt)
-      return resolved
+        selectedThreadId, firstAnswer.createdAt, firstAnswer.createdAt, clarification.id,
+      ).changes)
+      if (changed !== 1) throw new Error("待归属确认状态发生冲突")
+      if (!auditOnly) {
+        this.upsertSenderFocus(resolved, {
+          senderUserId: clarification.senderUserId,
+          source: "clarification_answer",
+          operatorMessageId: lastAnswer.telegramMessageId,
+        }, lastAnswer.createdAt)
+      }
+      return { thread: resolved, mode: auditOnly ? "audit_only" : "active" }
     })
   }
 
@@ -860,6 +975,7 @@ export class SupportThreadStore {
   appendMessage(input: AppendThreadMessageInput): SupportThread | null {
     return this.database.transaction(() => {
       const current = this.getThread(input.threadId)
+      if (this.hasHandoffClaim(current.id)) return null
       const event = this.getEvent(input.eventId)
       const sameAssignedBatch = event.ingestBatchId !== null && (
         current.originBatchId === event.ingestBatchId
@@ -907,9 +1023,96 @@ export class SupportThreadStore {
         now,
         input.threadId,
       )
+      this.supersedeUnstartedProgress(input.threadId, current.revision, now)
       this.setEventRoute(input.eventId, "routed", null)
       this.applyHumanPriorityFromEvent(input.threadId, input.eventId, now)
       return this.getThread(input.threadId)
+    })
+  }
+
+  appendAuditMessage(input: AppendThreadMessageInput): SupportThread | null {
+    return this.database.transaction(() => {
+      const current = this.getThread(input.threadId)
+      if (!this.hasHandoffClaim(current.id)
+        || (input.expectedRevision !== undefined && current.revision !== input.expectedRevision)) return null
+      const event = this.getEvent(input.eventId)
+      const existingLink = this.database.prepare(
+        "SELECT 1 FROM support_thread_messages WHERE thread_id=? AND message_event_id=? LIMIT 1",
+      ).get(input.threadId, input.eventId)
+      if (existingLink) {
+        this.setEventRoute(input.eventId, "routed", "handoff_terminal:audit_only")
+        return current
+      }
+      const position = Number((this.database.prepare(
+        "SELECT COALESCE(MAX(position),-1)+1 AS position FROM support_thread_messages WHERE thread_id=?",
+      ).get(input.threadId) as SqlRow).position)
+      const inserted = this.insertThreadMessage(
+        input.threadId,
+        input.eventId,
+        "supplement",
+        input.questionFragment,
+        position,
+        event.createdAt,
+      )
+      if (!inserted) return current
+      const now = new Date().toISOString()
+      this.database.prepare(`UPDATE support_threads SET
+        latest_message_at=CASE WHEN latest_message_at<? THEN ? ELSE latest_message_at END,updated_at=?
+        WHERE id=? AND revision=? AND EXISTS(
+          SELECT 1 FROM support_thread_output_claims claim
+          WHERE claim.thread_id=support_threads.id AND claim.claim_kind='handoff'
+        )`).run(event.createdAt, event.createdAt, now, current.id, current.revision)
+      this.setEventRoute(input.eventId, "routed", "handoff_terminal:audit_only")
+      return this.getThread(current.id)
+    })
+  }
+
+  appendAuditMessageWithSenderFocus(
+    input: AppendThreadMessageInput,
+    focus: SenderFocusUpdate,
+  ): SupportThread | null {
+    return this.database.transaction(() => {
+      const appended = this.appendAuditMessage(input)
+      if (!appended) return null
+      const event = this.getEvent(input.eventId)
+      this.upsertSenderFocus(appended, focus, event.createdAt)
+      return appended
+    })
+  }
+
+  appendAuditBatchWithSenderFocus(entries: AuditBatchEntry[]): SupportThread | null {
+    if (entries.length < 1) throw new Error("handoff audit 批次不能为空")
+    if (new Set(entries.map((entry) => entry.message.eventId)).size !== entries.length) {
+      throw new Error("handoff audit 批次事件不能重复")
+    }
+    return this.database.transaction(() => {
+      const first = entries[0]!
+      const current = this.getThread(first.message.threadId)
+      if (!this.hasHandoffClaim(current.id)
+        || (first.message.expectedRevision !== undefined
+          && current.revision !== first.message.expectedRevision)) return null
+      let appended = current
+      for (const entry of entries) {
+        if (entry.message.threadId !== current.id) throw new Error("handoff audit 批次不能跨线程")
+        const event = this.getEvent(entry.message.eventId)
+        if (entry.focus.senderUserId !== event.senderUserId
+          || entry.focus.operatorMessageId !== event.telegramMessageId) {
+          throw new Error("handoff audit sender focus 与原始数字发送人不一致")
+        }
+        const next = this.appendAuditMessage(entry.message)
+        const linked = this.database.prepare(`SELECT 1 FROM support_thread_messages
+          WHERE thread_id=? AND message_event_id=?`).get(current.id, event.id)
+        if (!next || !linked || this.getEvent(event.id).routeStatus !== "routed") {
+          throw new Error("handoff audit 批次无法完整追加到终态线程")
+        }
+        this.upsertSenderFocus(next, {
+          ...entry.focus,
+          senderUserId: event.senderUserId,
+          operatorMessageId: event.telegramMessageId,
+        }, event.createdAt)
+        appended = next
+      }
+      return appended
     })
   }
 
@@ -974,6 +1177,42 @@ export class SupportThreadStore {
       const event = this.getEvent(input.eventId)
       this.upsertSenderFocus(appended, focus, event.createdAt)
       return appended
+    })
+  }
+
+  appendStatusOnlyBatchAndClaimProgress(
+    entries: StatusOnlyBatchEntry[],
+    now = new Date().toISOString(),
+  ): StatusOnlyProgressCommit | null {
+    if (entries.length === 0) return null
+    const threadId = entries[0]!.message.threadId
+    if (entries.some((entry) => entry.message.threadId !== threadId)) {
+      throw new Error("status-only 批次只能归入同一问题线程")
+    }
+    return this.database.transaction(() => {
+      let current = this.getThread(threadId)
+      if (current.status !== "collecting" && current.status !== "generating") return null
+      for (const entry of entries) {
+        const appended = this.appendStatusOnlyMessageWithSenderFocus(entry.message, entry.focus)
+        if (!appended) throw new Error("status-only 批次关联时问题版本已变化")
+        current = appended
+      }
+      const notification = current.answerOperationMode === "live"
+        ? this.claimProgressNotification(
+          current.id,
+          current.revision,
+          "status_request",
+          now,
+          now,
+        )
+        : null
+      const routeReason = current.answerOperationMode !== "live"
+        ? "status_only:telegram_output_suppressed"
+        : notification
+          ? "status_only:progress_claim_persisted"
+          : "status_only:progress_claim_already_owned"
+      entries.forEach((entry) => this.setEventRoute(entry.message.eventId, "routed", routeReason))
+      return { thread: current, notification }
     })
   }
 
@@ -1185,11 +1424,12 @@ export class SupportThreadStore {
       replyToMessageId: row.reply_to_message_id === null ? null : String(row.reply_to_message_id),
       senderId: String(row.sender_user_id),
       sender: String(row.sender_display_name || row.sender_username || row.sender_user_id),
+      senderRole: row.sender_role === null ? null : row.sender_role as ThreadRouteTimelineEntry["senderRole"],
       text: String(row.safe_text || row.attachment_summary || ""),
       threadIds: row.thread_ids ? String(row.thread_ids).split(",") : [],
       createdAt: String(row.created_at),
     }))
-    const outbound = (this.database.prepare(`SELECT r.telegram_reply_message_id,r.telegram_message_id,
+    const replyOutbound = (this.database.prepare(`SELECT r.telegram_reply_message_id,r.telegram_message_id,
       r.thread_id,r.updated_at,p.answer
       FROM support_replies r JOIN support_reply_payloads p ON p.reply_id=r.id
       WHERE r.group_id=? AND r.service_id=? AND r.telegram_reply_message_id IS NOT NULL
@@ -1206,11 +1446,44 @@ export class SupportThreadStore {
       replyToMessageId: row.telegram_message_id === null ? null : String(row.telegram_message_id),
       senderId: null,
       sender: "客服",
+      senderRole: null,
       text: String(row.answer || ""),
       threadIds: row.thread_id === null ? [] : [String(row.thread_id)],
       createdAt: String(row.updated_at),
     }))
-    return [...inbound, ...outbound]
+    const notificationOutbound = (this.database.prepare(`SELECT
+      notification.telegram_message_id,notification.outbound_text,notification.thread_id,
+      ownership.reply_to_message_id,ownership.updated_at
+      FROM support_thread_notifications notification
+      JOIN support_threads thread ON thread.id=notification.thread_id
+      JOIN telegram_output_ownership ownership ON ownership.id=(
+        SELECT sent.id FROM telegram_output_ownership sent
+        WHERE sent.notification_id=notification.id AND sent.delivery_status='sent'
+          AND sent.telegram_message_id=notification.telegram_message_id
+        ORDER BY sent.updated_at DESC,sent.id DESC LIMIT 1
+      )
+      WHERE thread.group_id=? AND thread.service_id=? AND notification.kind='progress'
+        AND notification.status='sent' AND notification.telegram_message_id IS NOT NULL
+        AND length(trim(COALESCE(notification.outbound_text,'')))>0
+        AND ownership.updated_at>? AND ownership.updated_at<=?
+      ORDER BY ownership.updated_at DESC,ownership.id DESC LIMIT ${bounded}`).all(
+      groupId,
+      serviceId,
+      cutoff,
+      typeof reference === "string" ? reference : reference.toISOString(),
+    ) as SqlRow[]).map((row): ThreadRouteTimelineEntry => ({
+      direction: "outbound",
+      eventId: null,
+      messageId: String(row.telegram_message_id),
+      replyToMessageId: row.reply_to_message_id === null ? null : String(row.reply_to_message_id),
+      senderId: null,
+      sender: "客服",
+      senderRole: null,
+      text: String(row.outbound_text),
+      threadIds: [String(row.thread_id)],
+      createdAt: String(row.updated_at),
+    }))
+    return [...inbound, ...replyOutbound, ...notificationOutbound]
       .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.messageId.localeCompare(right.messageId))
       .slice(-bounded)
   }
@@ -1266,33 +1539,76 @@ export class SupportThreadStore {
 
   claimDueHumanPriority(now = new Date().toISOString()): HumanPriorityClaim | null {
     return this.database.transaction(() => {
-      this.database.prepare(`UPDATE support_threads AS thread SET
-        human_priority_state='claimed',settle_at=?,
-        human_priority_error='同一问题此前已发送稍等，不重复发送',updated_at=?
-        WHERE thread.status='collecting' AND thread.human_priority_state='waiting'
-          AND thread.human_priority_due_at<=? AND (
-            thread.human_priority_progress_message_id IS NOT NULL
-            OR EXISTS(SELECT 1 FROM support_thread_notifications notification
-              WHERE notification.thread_id=thread.id AND notification.kind='progress'
-                AND notification.status IN ('sending','sent','unknown'))
-            OR EXISTS(SELECT 1 FROM telegram_output_ownership ownership
-              WHERE ownership.thread_id=thread.id
-                AND ownership.output_kind IN ('progress','mention_claim_progress')
-                AND ownership.delivery_status IN ('sending','sent','unknown'))
-          )`).run(now, now, now)
-      const row = this.database.prepare(`SELECT id,revision FROM support_threads
-        WHERE status='collecting' AND answer_operation_mode='live'
-          AND human_priority_state='waiting' AND human_priority_due_at<=?
-        ORDER BY human_priority_due_at,id LIMIT 1`).get(now) as SqlRow | undefined
-      if (!row) return null
-      const result = this.database.prepare(`UPDATE support_threads SET
-        human_priority_state='sending',human_priority_error=NULL,updated_at=?
-        WHERE id=? AND revision=? AND status='collecting' AND human_priority_state='waiting'`).run(
-        now, String(row.id), Number(row.revision),
-      )
-      return Number(result.changes) === 1
-        ? { threadId: String(row.id), inputRevision: Number(row.revision) }
-        : null
+      const rows = this.database.prepare(`SELECT id,revision,answer_operation_mode FROM support_threads
+        WHERE status='collecting' AND human_priority_state='waiting' AND human_priority_due_at<=?
+        ORDER BY human_priority_due_at,id`).all(now) as SqlRow[]
+      for (const row of rows) {
+        const threadId = String(row.id)
+        if (row.answer_operation_mode !== "live") {
+          this.database.prepare(`UPDATE support_threads SET
+            human_priority_state='claimed',settle_at=?,human_priority_error=?,updated_at=?
+            WHERE id=? AND revision=? AND status='collecting' AND human_priority_state='waiting'`).run(
+            now,
+            "学习模式禁止 Telegram 输出",
+            now,
+            threadId,
+            Number(row.revision),
+          )
+          continue
+        }
+        const reusableRow = this.database.prepare(`SELECT notification.*
+          FROM support_thread_notifications notification
+          JOIN support_thread_output_claims claim ON claim.notification_id=notification.id
+            AND claim.thread_id=notification.thread_id AND claim.claim_kind='progress'
+            AND claim.source_kind='human_priority'
+          WHERE notification.thread_id=? AND notification.input_revision=? AND notification.kind='progress'
+            AND notification.status IN ('pending','failed') AND notification.telegram_message_id IS NULL
+            AND NOT EXISTS(SELECT 1 FROM telegram_output_ownership ownership
+              WHERE ownership.notification_id=notification.id
+                AND (ownership.delivery_status IN ('sending','sent','unknown') OR ownership.telegram_message_id IS NOT NULL))
+          LIMIT 1`).get(threadId, Number(row.revision)) as SqlRow | undefined
+        let notification = reusableRow ? notificationFromRow(reusableRow) : null
+        if (notification) {
+          this.database.prepare(`UPDATE support_thread_notifications SET
+            status='pending',due_at=?,error_message=NULL,updated_at=? WHERE id=?`).run(
+            now,
+            now,
+            notification.id,
+          )
+          notification = { ...notification, status: "pending", dueAt: now, errorMessage: null, updatedAt: now }
+        } else {
+          notification = this.claimProgressNotification(
+            threadId,
+            Number(row.revision),
+            "human_priority",
+            now,
+            now,
+          )
+        }
+        if (!notification) {
+          this.database.prepare(`UPDATE support_threads SET
+            human_priority_state='claimed',settle_at=?,human_priority_error=?,updated_at=?
+            WHERE id=? AND revision=? AND status='collecting' AND human_priority_state='waiting'`).run(
+            now,
+            "同一问题此前已发送稍等，不重复发送",
+            now,
+            threadId,
+            Number(row.revision),
+          )
+          continue
+        }
+        const result = this.database.prepare(`UPDATE support_threads SET
+          human_priority_state='sending',human_priority_error=NULL,updated_at=?
+          WHERE id=? AND revision=? AND status='collecting' AND human_priority_state='waiting'`).run(
+          now, threadId, Number(row.revision),
+        )
+        if (Number(result.changes) === 1) {
+          return { threadId, inputRevision: Number(row.revision), notificationId: notification.id }
+        }
+        this.failNotification(notification.id, "人工优先等待状态已变化", now)
+        this.releaseFailedProgressClaim(notification.id, now)
+      }
+      return null
     })
   }
 
@@ -1302,17 +1618,30 @@ export class SupportThreadStore {
     error: string | null = null,
     now = new Date().toISOString(),
   ): boolean {
-    const result = this.database.prepare(`UPDATE support_threads SET
-      human_priority_state='claimed',human_priority_progress_message_id=?,human_priority_error=?,
-      settle_at=?,updated_at=?
-      WHERE id=? AND status='collecting' AND human_priority_state='sending'`).run(
-      telegramMessageId,
-      error?.slice(0, 1000) ?? null,
-      now,
-      now,
-      claim.threadId,
-    )
-    return Number(result.changes) === 1
+    return this.database.transaction(() => {
+      const notification = this.database.prepare(`SELECT status FROM support_thread_notifications
+        WHERE id=? AND thread_id=? AND kind='progress'`).get(
+        claim.notificationId,
+        claim.threadId,
+      ) as { status?: string } | undefined
+      const waitForHuman = notification?.status === "sent" || notification?.status === "unknown"
+      const dueAt = waitForHuman
+        ? new Date(Date.parse(now) + HUMAN_PRIORITY_WAIT_MS).toISOString()
+        : now
+      const result = this.database.prepare(`UPDATE support_threads SET
+        human_priority_state=?,human_priority_progress_message_id=?,human_priority_error=?,
+        human_priority_due_at=?,settle_at=?,updated_at=?
+        WHERE id=? AND status='collecting' AND human_priority_state='sending'`).run(
+        waitForHuman ? "waiting" : "claimed",
+        telegramMessageId,
+        error?.slice(0, 1000) ?? null,
+        dueAt,
+        dueAt,
+        now,
+        claim.threadId,
+      )
+      return Number(result.changes) === 1
+    })
   }
 
   hasClaimedHumanPriority(threadId: string): boolean {
@@ -1320,15 +1649,270 @@ export class SupportThreadStore {
       WHERE id=? AND human_priority_state='claimed' AND human_priority_source_event_id IS NOT NULL`).get(threadId))
   }
 
+  hasStartedProgress(threadId: string): boolean {
+    return Boolean(this.database.prepare(`SELECT 1 FROM support_thread_output_claims
+      WHERE thread_id=? AND claim_kind='progress'
+      LIMIT 1`).get(threadId))
+  }
+
+  claimProgressNotification(
+    threadId: string,
+    inputRevision: number,
+    source: ThreadOutputClaimSource,
+    dueAt: string,
+    now = new Date().toISOString(),
+  ): SupportThreadNotification | null {
+    if (source !== "scheduled_progress" && source !== "status_request" && source !== "human_priority") {
+      throw new Error("progress owner 来源无效")
+    }
+    return this.database.transaction(() => {
+      const notification: SupportThreadNotification = {
+        id: randomUUID(),
+        threadId,
+        inputRevision,
+        kind: "progress",
+        status: "pending",
+        dueAt,
+        telegramMessageId: null,
+        outboundText: null,
+        errorMessage: null,
+        createdAt: now,
+        updatedAt: now,
+      }
+      const insertedNotification = this.database.prepare(`INSERT INTO support_thread_notifications(
+        id,thread_id,input_revision,kind,status,due_at,telegram_message_id,error_message,created_at,updated_at
+      ) SELECT ?,id,?,'progress','pending',?,NULL,NULL,?,? FROM support_threads
+        WHERE id=? AND revision=?
+      ON CONFLICT DO NOTHING`).run(
+        notification.id,
+        inputRevision,
+        dueAt,
+        now,
+        now,
+        threadId,
+        inputRevision,
+      )
+      let claimedNotification = notification
+      if (Number(insertedNotification.changes) !== 1) {
+        const reusable = this.database.prepare(`SELECT notification.* FROM support_thread_notifications notification
+          JOIN support_threads thread ON thread.id=notification.thread_id
+          WHERE notification.thread_id=? AND notification.input_revision=? AND notification.kind='progress'
+            AND thread.revision=?
+            AND notification.status IN ('pending','failed') AND notification.telegram_message_id IS NULL
+            AND NOT EXISTS(SELECT 1 FROM support_thread_output_claims claim
+              WHERE claim.notification_id=notification.id)
+            AND NOT EXISTS(SELECT 1 FROM telegram_output_ownership ownership
+              WHERE ownership.notification_id=notification.id
+                AND (ownership.delivery_status IN ('sending','sent','unknown') OR ownership.telegram_message_id IS NOT NULL)
+            )`).get(threadId, inputRevision, inputRevision) as SqlRow | undefined
+        if (!reusable) return null
+        claimedNotification = notificationFromRow(reusable)
+      }
+      const insertedClaim = this.database.prepare(`INSERT INTO support_thread_output_claims(
+        thread_id,claim_kind,source_kind,reply_id,notification_id,created_at,updated_at
+      ) VALUES (?,'progress',?,NULL,?,?,?) ON CONFLICT DO NOTHING`).run(
+        threadId,
+        source,
+        claimedNotification.id,
+        now,
+        now,
+      )
+      if (Number(insertedClaim.changes) === 1) {
+        if (claimedNotification.id !== notification.id) {
+          const updatedNotification = this.database.prepare(`UPDATE support_thread_notifications SET
+            status='pending',due_at=?,telegram_message_id=NULL,error_message=NULL,updated_at=?
+            WHERE id=? AND status IN ('pending','failed')
+              AND EXISTS(SELECT 1 FROM support_threads thread
+                WHERE thread.id=support_thread_notifications.thread_id AND thread.revision=?)`).run(
+            dueAt,
+            now,
+            claimedNotification.id,
+            inputRevision,
+          )
+          if (Number(updatedNotification.changes) !== 1) {
+            throw new Error("progress notification 版本已变化")
+          }
+          return {
+            ...claimedNotification,
+            status: "pending",
+            dueAt,
+            telegramMessageId: null,
+            errorMessage: null,
+            updatedAt: now,
+          }
+        }
+        return notification
+      }
+      if (Number(insertedNotification.changes) === 1) {
+        this.database.prepare("DELETE FROM support_thread_notifications WHERE id=?").run(notification.id)
+      }
+      return null
+    })
+  }
+
+  claimHandoff(
+    replyId: string,
+    source: ThreadOutputClaimSource,
+    now = new Date().toISOString(),
+  ): boolean {
+    if (source === "scheduled_progress" || source === "status_request" || source === "human_priority") {
+      throw new Error("handoff owner 来源无效")
+    }
+    return this.database.transaction(() => {
+      const inserted = this.database.prepare(`INSERT INTO support_thread_output_claims(
+        thread_id,claim_kind,source_kind,reply_id,notification_id,created_at,updated_at
+      ) SELECT thread_id,'handoff',?,?,NULL,?,? FROM support_replies
+        WHERE id=? AND thread_id IS NOT NULL
+      ON CONFLICT DO NOTHING`).run(source, replyId, now, now, replyId)
+      if (Number(inserted.changes) === 1) return true
+      return Boolean(this.database.prepare(`SELECT 1 FROM support_thread_output_claims
+        WHERE claim_kind='handoff' AND reply_id=? LIMIT 1`).get(replyId))
+    })
+  }
+
+  hasHandoffClaim(threadId: string): boolean {
+    return Boolean(this.database.prepare(`SELECT 1 FROM support_thread_output_claims
+      WHERE thread_id=? AND claim_kind='handoff' LIMIT 1`).get(threadId))
+  }
+
+  handoffSource(threadId: string): ThreadOutputClaimSource | null {
+    const row = this.database.prepare(`SELECT source_kind FROM support_thread_output_claims
+      WHERE thread_id=? AND claim_kind='handoff'`).get(threadId) as SqlRow | undefined
+    return row ? row.source_kind as ThreadOutputClaimSource : null
+  }
+
+  releaseFailedProgressClaim(notificationId: string, _now = new Date().toISOString()): boolean {
+    const released = this.database.prepare(`DELETE FROM support_thread_output_claims AS claim
+      WHERE claim.claim_kind='progress' AND claim.notification_id=?
+        AND EXISTS(SELECT 1 FROM support_thread_notifications notification
+          WHERE notification.id=claim.notification_id AND notification.status='failed'
+            AND notification.telegram_message_id IS NULL)
+        AND NOT EXISTS(SELECT 1 FROM telegram_output_ownership ownership
+          WHERE ownership.notification_id=claim.notification_id
+            AND (ownership.delivery_status IN ('sending','sent','unknown') OR ownership.telegram_message_id IS NOT NULL)
+        )`).run(notificationId)
+    return Number(released.changes) === 1
+  }
+
+  private supersedeUnstartedProgress(threadId: string, inputRevision: number, now: string): void {
+    const row = this.database.prepare(`SELECT notification.id,notification.status FROM support_thread_notifications notification
+      JOIN support_thread_output_claims claim ON claim.notification_id=notification.id
+        AND claim.claim_kind='progress'
+      WHERE notification.thread_id=? AND notification.input_revision=? AND notification.kind='progress'
+      LIMIT 1`).get(threadId, inputRevision) as SqlRow | undefined
+    if (!row) return
+    const notificationId = String(row.id)
+    const ownershipStarted = Boolean(this.database.prepare(`SELECT 1 FROM telegram_output_ownership
+      WHERE notification_id=?
+        AND (delivery_status IN ('sending','sent','unknown') OR telegram_message_id IS NOT NULL)
+      LIMIT 1`).get(notificationId))
+    if (ownershipStarted) {
+      if (row.status === "sending") {
+        this.database.prepare(`UPDATE support_thread_notifications SET
+          status='unknown',error_message='新输入版本到达时发送状态未知',updated_at=?
+          WHERE id=? AND status='sending'`).run(now, notificationId)
+      }
+      return
+    }
+    if (row.status === "pending" || row.status === "sending") {
+      this.database.prepare(`UPDATE support_thread_notifications SET
+        status='failed',error_message='尚未开始发送的进度提示已被新输入版本替代',updated_at=?
+        WHERE id=? AND status IN ('pending','sending')`).run(now, notificationId)
+    }
+    this.releaseFailedProgressClaim(notificationId, now)
+  }
+
+  findPreparedEscalationReplyId(threadId: string, inputRevision: number): string | null {
+    const row = this.database.prepare(`SELECT reply.id FROM support_replies reply
+      JOIN support_reply_payloads payload ON payload.reply_id=reply.id
+      WHERE reply.thread_id=? AND reply.input_revision=? AND reply.status='generating'
+        AND reply.decision='escalate' AND length(trim(payload.answer))>0
+        AND EXISTS(SELECT 1 FROM support_thread_output_claims claim
+          WHERE claim.thread_id=reply.thread_id AND claim.claim_kind='handoff' AND claim.reply_id=reply.id)
+      ORDER BY reply.created_at DESC,reply.id DESC LIMIT 1`).get(threadId, inputRevision) as SqlRow | undefined
+    return row ? String(row.id) : null
+  }
+
+  findPreparedHardDeadlineReplyId(threadId: string, inputRevision: number): string | null {
+    const row = this.database.prepare(`SELECT reply.id FROM support_replies reply
+      JOIN support_reply_payloads payload ON payload.reply_id=reply.id
+      WHERE reply.thread_id=? AND reply.input_revision=? AND reply.status='generating'
+        AND reply.decision='escalate' AND reply.error_code=? AND length(trim(payload.answer))>0
+        AND EXISTS(SELECT 1 FROM support_thread_output_claims claim
+          WHERE claim.thread_id=reply.thread_id AND claim.claim_kind='handoff' AND claim.reply_id=reply.id)
+      ORDER BY reply.created_at DESC,reply.id DESC LIMIT 1`).get(
+      threadId,
+      inputRevision,
+      HARD_DEADLINE_ERROR_CODE,
+    ) as SqlRow | undefined
+    return row ? String(row.id) : null
+  }
+
+  listPendingTechnicalAvailabilityReplies(limit = 512): Array<{
+    threadId: string
+    inputRevision: number
+    replyId: string
+  }> {
+    const maximum = Math.max(1, Math.min(512, Math.trunc(limit)))
+    const rows = this.database.prepare(`SELECT reply.thread_id,reply.input_revision,reply.id
+      FROM support_replies reply
+      JOIN support_reply_payloads payload ON payload.reply_id=reply.id
+      JOIN support_threads thread ON thread.id=reply.thread_id
+      JOIN support_thread_output_claims claim ON claim.thread_id=reply.thread_id
+        AND claim.claim_kind='handoff' AND claim.reply_id=reply.id
+      WHERE reply.status='generating' AND reply.decision='escalate'
+        AND thread.status='generating' AND thread.revision=reply.input_revision
+        AND payload.answer=? AND claim.source_kind IN ('failure_after_progress','hard_deadline')
+      ORDER BY reply.updated_at,reply.id LIMIT ?`).all(
+      TECHNICAL_AVAILABILITY_REPLY_PENDING,
+      maximum,
+    ) as SqlRow[]
+    return rows.map((row) => ({
+      threadId: String(row.thread_id),
+      inputRevision: Number(row.input_revision),
+      replyId: String(row.id),
+    }))
+  }
+
+  findPreparedFeatureRequestReplyId(threadId: string, inputRevision: number): string | null {
+    const row = this.database.prepare(`SELECT reply.id FROM support_replies reply
+      JOIN support_reply_payloads payload ON payload.reply_id=reply.id
+      WHERE reply.thread_id=? AND reply.input_revision=? AND reply.status='generating'
+        AND reply.decision='escalate' AND reply.error_code=? AND length(trim(payload.answer))>0
+        AND EXISTS(SELECT 1 FROM support_thread_output_claims claim
+          WHERE claim.thread_id=reply.thread_id AND claim.claim_kind='handoff' AND claim.reply_id=reply.id)
+      ORDER BY reply.created_at DESC,reply.id DESC LIMIT 1`).get(
+      threadId,
+      inputRevision,
+      FEATURE_REQUEST_PREPARED_ERROR_CODE,
+    ) as SqlRow | undefined
+    return row ? String(row.id) : null
+  }
+
+  hasFeatureRequestAlertOwnership(replyId: string): boolean {
+    return Boolean(this.database.prepare(`SELECT 1 FROM telegram_output_ownership
+      WHERE reply_id=? AND output_kind='technical_alert:feature_request' LIMIT 1`).get(replyId))
+  }
+
   recoverInterruptedHumanPriorityClaims(now = new Date().toISOString()): { resumed: number; retried: number } {
     return this.database.transaction(() => {
-      const resumed = this.database.prepare(`UPDATE support_threads AS thread SET
-        human_priority_state='claimed',settle_at=?,human_priority_error='服务重启前稍等提示发送状态未知，继续 AI 处理',updated_at=?
-        WHERE human_priority_state='sending' AND EXISTS (
-          SELECT 1 FROM telegram_output_ownership ownership
-          WHERE ownership.thread_id=thread.id AND ownership.output_kind='mention_claim_progress'
-            AND ownership.delivery_status IN ('sending','sent','unknown')
-        )`).run(now, now)
+      const started = this.database.prepare(`SELECT thread.id,MAX(ownership.updated_at) AS ownership_updated_at
+        FROM support_threads thread
+        JOIN telegram_output_ownership ownership ON ownership.thread_id=thread.id
+          AND ownership.output_kind='mention_claim_progress'
+          AND ownership.delivery_status IN ('sending','sent','unknown')
+        WHERE thread.human_priority_state='sending'
+        GROUP BY thread.id`).all() as SqlRow[]
+      let resumed = 0
+      for (const row of started) {
+        const ownershipUpdatedAt = String(row.ownership_updated_at)
+        const dueAt = new Date(Date.parse(ownershipUpdatedAt) + HUMAN_PRIORITY_WAIT_MS).toISOString()
+        const result = this.database.prepare(`UPDATE support_threads SET
+          human_priority_state='waiting',human_priority_due_at=?,settle_at=?,
+          human_priority_error='服务重启前稍等提示发送状态未知，按已开始发送继续人工等待',updated_at=?
+          WHERE id=? AND human_priority_state='sending'`).run(dueAt, dueAt, now, String(row.id))
+        resumed += Number(result.changes)
+      }
       const retried = this.database.prepare(`UPDATE support_threads AS thread SET
         human_priority_state='waiting',human_priority_due_at=?,settle_at=?,
         human_priority_error='服务重启前尚未开始发送稍等提示，重新领取',updated_at=?
@@ -1337,7 +1921,7 @@ export class SupportThreadStore {
           WHERE ownership.thread_id=thread.id AND ownership.output_kind='mention_claim_progress'
             AND ownership.delivery_status IN ('sending','sent','unknown')
         )`).run(now, now, now)
-      return { resumed: Number(resumed.changes), retried: Number(retried.changes) }
+      return { resumed, retried: Number(retried.changes) }
     })
   }
 
@@ -1348,26 +1932,37 @@ export class SupportThreadStore {
     respondedAt: string,
   ): number {
     const outcome = this.database.transaction(() => {
-      const rows = this.database.prepare(`SELECT thread.id,thread.human_priority_user_ids_json,
+      const rows = this.database.prepare(`SELECT thread.id,thread.human_priority_state,
+          thread.human_priority_user_ids_json,
           source.created_at AS source_created_at
         FROM support_threads thread
         LEFT JOIN support_message_events source ON source.id=thread.human_priority_source_event_id
-        WHERE thread.group_id=? AND thread.status='collecting' AND thread.human_priority_state='waiting'
-          AND thread.human_priority_due_at>=?`).all(groupId, respondedAt) as SqlRow[]
+        WHERE thread.group_id=? AND thread.status='collecting'
+          AND thread.human_priority_state IN ('waiting','sending')
+          AND (thread.human_priority_state='sending' OR thread.human_priority_due_at>=?
+            OR NOT EXISTS(SELECT 1 FROM support_thread_output_claims claim
+              WHERE claim.thread_id=thread.id AND claim.claim_kind='progress'))`).all(groupId, respondedAt) as SqlRow[]
       const updates: ExpiredReplyUpdate[] = []
       let count = 0
       for (const row of rows) {
-        if (!this.humanPriorityUserIds(row.human_priority_user_ids_json).includes(senderUserId)) continue
+        const target = this.humanPriorityTarget(row.human_priority_user_ids_json)
+        const mentionedTechnical = target.mentionedTechnical
+        const senderIsTechnical = this.isEnabledTechnical(senderUserId)
+        const senderIsIgnored = this.isEnabledIgnored(senderUserId)
+        const eligibleTechnical = mentionedTechnical && senderIsTechnical
+        const eligibleIgnored = senderIsIgnored && target.ignoredUserIds.includes(senderUserId)
+        if (!eligibleTechnical && !eligibleIgnored) continue
         if (row.source_created_at !== null && String(row.source_created_at) > respondedAt) continue
+        const reason = eligibleTechnical ? "技术角色已在3分钟内回应" : "被@人员已在3分钟内回应"
         const changed = this.database.prepare(`UPDATE support_threads SET
           human_priority_state='answered',human_priority_error=?,updated_at=?
-          WHERE id=? AND status='collecting' AND human_priority_state='waiting'`).run(
-          `被@人员已在3分钟内回应 message_event_id=${responseEventId}`.slice(0, 1000),
+          WHERE id=? AND status='collecting' AND human_priority_state IN ('waiting','sending')`).run(
+          `${reason} message_event_id=${responseEventId}`.slice(0, 1000),
           respondedAt,
           String(row.id),
         )
         if (Number(changed.changes) !== 1) continue
-        const closed = this.closeThreadRows(String(row.id), "群内人工", "被@人员已在3分钟内回应", respondedAt)
+        const closed = this.closeThreadRows(String(row.id), "群内人工", reason, respondedAt)
         updates.push(...closed.replyUpdates)
         count += Number(closed.changed)
       }
@@ -1409,12 +2004,14 @@ export class SupportThreadStore {
         JOIN support_threads t ON t.id=r.thread_id
         WHERE (t.status='generating' AND t.updated_at<?
           AND r.status IN ('pending','queued','generating','sending'))
-          OR (t.status='closed' AND r.status='sending' AND r.updated_at<?)`).all(staleBefore, staleBefore) as SqlRow[]
+          OR (t.status='closed' AND r.status='sending' AND r.updated_at<?)
+          OR (t.status='collecting' AND r.status='sending' AND r.input_revision<t.revision
+            AND r.updated_at<?)`).all(staleBefore, staleBefore, staleBefore) as SqlRow[]
       this.database.prepare(`DELETE FROM support_reply_alert_deliveries AS delivery
         WHERE delivery.status='sending' AND delivery.alert_kind='support_delivery_failure'
           AND delivery.updated_at<? AND EXISTS (
             SELECT 1 FROM support_replies reply JOIN support_threads thread ON thread.id=reply.thread_id
-            WHERE reply.id=delivery.reply_id AND reply.status='failed' AND reply.decision='escalate'
+            WHERE reply.id=delivery.reply_id AND reply.status='failed'
               AND thread.status='escalated' AND thread.revision=reply.input_revision
           ) AND NOT EXISTS (
             SELECT 1 FROM telegram_output_ownership ownership WHERE ownership.reply_id=delivery.reply_id
@@ -1430,7 +2027,7 @@ export class SupportThreadStore {
             JOIN support_threads thread ON thread.id=reply.thread_id
             WHERE delivery.reply_id=ownership.reply_id
               AND delivery.alert_kind='support_delivery_failure' AND delivery.status='sending'
-              AND delivery.updated_at<? AND reply.status='failed' AND reply.decision='escalate'
+              AND delivery.updated_at<? AND reply.status='failed'
               AND thread.status='escalated' AND thread.revision=reply.input_revision
           )`).run(now, staleBefore)
       this.database.prepare(`UPDATE support_reply_alert_deliveries AS delivery
@@ -1438,7 +2035,7 @@ export class SupportThreadStore {
         WHERE delivery.status='sending' AND delivery.alert_kind='support_delivery_failure'
           AND delivery.updated_at<? AND EXISTS (
             SELECT 1 FROM support_replies reply JOIN support_threads thread ON thread.id=reply.thread_id
-            WHERE reply.id=delivery.reply_id AND reply.status='failed' AND reply.decision='escalate'
+            WHERE reply.id=delivery.reply_id AND reply.status='failed'
               AND thread.status='escalated' AND thread.revision=reply.input_revision
           ) AND EXISTS (
             SELECT 1 FROM telegram_output_ownership ownership WHERE ownership.reply_id=delivery.reply_id
@@ -1469,6 +2066,203 @@ export class SupportThreadStore {
             OR (thread.status='closed' AND ownership.updated_at<?)
           )
         )`).run(now, staleBefore, staleBefore)
+      this.database.prepare(`UPDATE telegram_output_ownership AS ownership
+        SET delivery_status='unknown',updated_at=?
+        WHERE ownership.output_kind='support_reply' AND ownership.delivery_status='sending'
+          AND ownership.updated_at<? AND EXISTS (
+            SELECT 1 FROM support_replies reply
+            JOIN support_threads thread ON thread.id=reply.thread_id
+            WHERE reply.id=ownership.reply_id AND reply.status='sending'
+              AND reply.input_revision<thread.revision AND reply.updated_at<?
+              AND thread.status='collecting'
+          )`).run(now, staleBefore, staleBefore)
+      this.database.prepare(`UPDATE support_replies AS reply SET
+        status=CASE WHEN error_code=? OR decision='escalate' OR EXISTS (
+          SELECT 1 FROM support_reply_alert_deliveries delivery
+          WHERE delivery.reply_id=reply.id AND delivery.alert_kind='escalation'
+        ) THEN 'escalated' ELSE 'replied' END,
+        decision=CASE WHEN error_code=? OR decision='escalate' OR EXISTS (
+          SELECT 1 FROM support_reply_alert_deliveries delivery
+          WHERE delivery.reply_id=reply.id AND delivery.alert_kind='escalation'
+        ) THEN 'escalate' ELSE 'reply' END,
+        operator_delivery_status='sent',updated_at=?,error_code=NULL,
+        telegram_reply_message_id=(SELECT ownership.telegram_message_id FROM telegram_output_ownership ownership
+          WHERE ownership.reply_id=reply.id AND ownership.output_kind='support_reply'
+            AND ownership.delivery_status='sent' AND ownership.telegram_message_id IS NOT NULL
+          ORDER BY ownership.updated_at DESC,ownership.id DESC LIMIT 1),
+        duration_ms=CASE WHEN generation_started_at IS NULL THEN duration_ms
+          ELSE CAST(MAX(0,(julianday(?) - julianday(generation_started_at))*86400000) AS INTEGER) END
+        WHERE status='sending' AND updated_at<? AND EXISTS (
+          SELECT 1 FROM support_threads thread WHERE thread.id=reply.thread_id AND (
+            thread.status='closed'
+            OR (thread.status='collecting' AND reply.input_revision<thread.revision)
+          )
+        ) AND EXISTS (
+          SELECT 1 FROM telegram_output_ownership ownership WHERE ownership.reply_id=reply.id
+            AND ownership.output_kind='support_reply' AND ownership.delivery_status='sent'
+            AND ownership.telegram_message_id IS NOT NULL
+        )`).run(
+        FEATURE_REQUEST_PREPARED_ERROR_CODE,
+        FEATURE_REQUEST_PREPARED_ERROR_CODE,
+        now,
+        now,
+        staleBefore,
+      )
+      this.database.prepare(`UPDATE support_replies AS reply SET
+        status='failed',operator_delivery_status='uncertain',updated_at=?,error_code='delivery_state_unknown',
+        decision_reason='服务重启前运营群回复发送结果未知',
+        duration_ms=CASE WHEN generation_started_at IS NULL THEN duration_ms
+          ELSE CAST(MAX(0,(julianday(?) - julianday(generation_started_at))*86400000) AS INTEGER) END
+        WHERE status='sending' AND updated_at<? AND EXISTS (
+          SELECT 1 FROM support_threads thread WHERE thread.id=reply.thread_id AND (
+            thread.status='closed'
+            OR (thread.status='collecting' AND reply.input_revision<thread.revision)
+          )
+        ) AND NOT EXISTS (
+          SELECT 1 FROM telegram_output_ownership ownership WHERE ownership.reply_id=reply.id
+            AND ownership.output_kind='support_reply' AND ownership.delivery_status='sent'
+        ) AND EXISTS (
+          SELECT 1 FROM telegram_output_ownership ownership WHERE ownership.reply_id=reply.id
+            AND ownership.output_kind='support_reply' AND ownership.delivery_status='unknown'
+        )`).run(now, now, staleBefore)
+      this.database.prepare(`UPDATE support_replies AS reply SET
+        status='failed',operator_delivery_status='failed',updated_at=?,error_code='support_delivery_failed',
+        decision_reason='服务重启前运营群回复已明确发送失败',
+        duration_ms=CASE WHEN generation_started_at IS NULL THEN duration_ms
+          ELSE CAST(MAX(0,(julianday(?) - julianday(generation_started_at))*86400000) AS INTEGER) END
+        WHERE status='sending' AND updated_at<? AND EXISTS (
+          SELECT 1 FROM support_threads thread WHERE thread.id=reply.thread_id AND (
+            thread.status='closed'
+            OR (thread.status='collecting' AND reply.input_revision<thread.revision)
+          )
+        ) AND NOT EXISTS (
+          SELECT 1 FROM telegram_output_ownership ownership WHERE ownership.reply_id=reply.id
+            AND ownership.output_kind='support_reply' AND ownership.delivery_status IN ('sent','unknown')
+        ) AND EXISTS (
+          SELECT 1 FROM telegram_output_ownership ownership WHERE ownership.reply_id=reply.id
+            AND ownership.output_kind='support_reply' AND ownership.delivery_status='failed'
+        )`).run(now, now, staleBefore)
+      this.database.prepare(`UPDATE support_replies AS reply SET
+        status='superseded',operator_delivery_status=NULL,updated_at=?,error_code=NULL,
+        decision_reason='问题关闭前运营回复 RPC 尚未开始',
+        duration_ms=CASE WHEN generation_started_at IS NULL THEN duration_ms
+          ELSE CAST(MAX(0,(julianday(?) - julianday(generation_started_at))*86400000) AS INTEGER) END
+        WHERE status='sending' AND updated_at<? AND EXISTS (
+          SELECT 1 FROM support_threads thread WHERE thread.id=reply.thread_id AND (
+            thread.status='closed'
+            OR (thread.status='collecting' AND reply.input_revision<thread.revision)
+          )
+        ) AND NOT EXISTS (
+          SELECT 1 FROM telegram_output_ownership ownership
+          WHERE ownership.reply_id=reply.id AND ownership.output_kind='support_reply'
+        )`).run(now, now, staleBefore)
+      this.database.prepare(`UPDATE support_replies AS reply SET
+        status='escalated',decision='escalate',operator_delivery_status='sent',updated_at=?,error_code=NULL,
+        telegram_reply_message_id=(SELECT ownership.telegram_message_id FROM telegram_output_ownership ownership
+          WHERE ownership.reply_id=reply.id AND ownership.output_kind='support_reply'
+            AND ownership.delivery_status='sent' AND ownership.telegram_message_id IS NOT NULL
+          ORDER BY ownership.updated_at DESC,ownership.id DESC LIMIT 1),
+        duration_ms=CASE WHEN generation_started_at IS NULL THEN duration_ms
+          ELSE CAST(MAX(0,(julianday(?) - julianday(generation_started_at))*86400000) AS INTEGER) END
+        WHERE status='sending' AND error_code=? AND EXISTS (
+          SELECT 1 FROM support_threads thread WHERE thread.id=reply.thread_id
+            AND thread.status='generating' AND thread.updated_at<?
+        ) AND EXISTS (
+          SELECT 1 FROM telegram_output_ownership ownership WHERE ownership.reply_id=reply.id
+            AND ownership.output_kind='support_reply' AND ownership.delivery_status='sent'
+            AND ownership.telegram_message_id IS NOT NULL
+        )`).run(now, now, FEATURE_REQUEST_PREPARED_ERROR_CODE, staleBefore)
+      this.database.prepare(`UPDATE support_replies AS reply SET
+        status='replied',decision='reply',operator_delivery_status='sent',updated_at=?,error_code=NULL,
+        telegram_reply_message_id=(SELECT ownership.telegram_message_id FROM telegram_output_ownership ownership
+          WHERE ownership.reply_id=reply.id AND ownership.output_kind='support_reply'
+            AND ownership.delivery_status='sent' AND ownership.telegram_message_id IS NOT NULL
+          ORDER BY ownership.updated_at DESC,ownership.id DESC LIMIT 1),
+        duration_ms=CASE WHEN generation_started_at IS NULL THEN duration_ms
+          ELSE CAST(MAX(0,(julianday(?) - julianday(generation_started_at))*86400000) AS INTEGER) END
+        WHERE status='sending' AND decision<>'escalate' AND NOT EXISTS (
+          SELECT 1 FROM support_reply_alert_deliveries delivery
+          WHERE delivery.reply_id=reply.id AND delivery.alert_kind='escalation'
+        ) AND EXISTS (
+          SELECT 1 FROM support_threads thread WHERE thread.id=reply.thread_id
+            AND thread.status='generating' AND thread.updated_at<?
+        ) AND EXISTS (
+          SELECT 1 FROM telegram_output_ownership ownership WHERE ownership.reply_id=reply.id
+            AND ownership.output_kind='support_reply' AND ownership.delivery_status='sent'
+            AND ownership.telegram_message_id IS NOT NULL
+        )`).run(now, now, staleBefore)
+      this.database.prepare(`UPDATE support_replies AS reply SET
+        status='failed',operator_delivery_status='uncertain',updated_at=?,error_code='delivery_state_unknown',
+        decision_reason='服务重启前运营群回复发送结果未知',
+        duration_ms=CASE WHEN generation_started_at IS NULL THEN duration_ms
+          ELSE CAST(MAX(0,(julianday(?) - julianday(generation_started_at))*86400000) AS INTEGER) END
+        WHERE status='sending' AND (error_code=? OR (decision<>'escalate' AND NOT EXISTS (
+          SELECT 1 FROM support_reply_alert_deliveries delivery
+          WHERE delivery.reply_id=reply.id AND delivery.alert_kind='escalation'
+        ))) AND EXISTS (
+          SELECT 1 FROM support_threads thread WHERE thread.id=reply.thread_id
+            AND thread.status='generating' AND thread.updated_at<?
+        ) AND NOT EXISTS (
+          SELECT 1 FROM telegram_output_ownership ownership WHERE ownership.reply_id=reply.id
+            AND ownership.output_kind='support_reply' AND ownership.delivery_status='sent'
+        ) AND EXISTS (
+          SELECT 1 FROM telegram_output_ownership ownership WHERE ownership.reply_id=reply.id
+            AND ownership.output_kind='support_reply' AND ownership.delivery_status='unknown'
+        )`).run(now, now, FEATURE_REQUEST_PREPARED_ERROR_CODE, staleBefore)
+      this.database.prepare(`UPDATE support_replies AS reply SET
+        status='failed',operator_delivery_status='failed',updated_at=?,error_code='support_delivery_failed',
+        decision_reason='服务重启前运营群回复已明确发送失败',
+        duration_ms=CASE WHEN generation_started_at IS NULL THEN duration_ms
+          ELSE CAST(MAX(0,(julianday(?) - julianday(generation_started_at))*86400000) AS INTEGER) END
+        WHERE status='sending' AND (error_code=? OR (decision<>'escalate' AND NOT EXISTS (
+          SELECT 1 FROM support_reply_alert_deliveries delivery
+          WHERE delivery.reply_id=reply.id AND delivery.alert_kind='escalation'
+        ))) AND EXISTS (
+          SELECT 1 FROM support_threads thread WHERE thread.id=reply.thread_id
+            AND thread.status='generating' AND thread.updated_at<?
+        ) AND NOT EXISTS (
+          SELECT 1 FROM telegram_output_ownership ownership WHERE ownership.reply_id=reply.id
+            AND ownership.output_kind='support_reply' AND ownership.delivery_status IN ('sent','unknown')
+        ) AND EXISTS (
+          SELECT 1 FROM telegram_output_ownership ownership WHERE ownership.reply_id=reply.id
+            AND ownership.output_kind='support_reply' AND ownership.delivery_status='failed'
+        )`).run(now, now, FEATURE_REQUEST_PREPARED_ERROR_CODE, staleBefore)
+      this.database.prepare(`UPDATE support_replies AS reply SET
+        status='generating',operator_delivery_status=NULL,updated_at=?
+        WHERE status='sending' AND error_code=? AND EXISTS (
+          SELECT 1 FROM support_threads thread WHERE thread.id=reply.thread_id
+            AND thread.status='generating' AND thread.revision=reply.input_revision AND thread.updated_at<?
+        ) AND NOT EXISTS (
+          SELECT 1 FROM telegram_output_ownership ownership
+          WHERE ownership.reply_id=reply.id AND ownership.output_kind='support_reply'
+        )`).run(now, FEATURE_REQUEST_PREPARED_ERROR_CODE, staleBefore)
+      this.database.prepare(`UPDATE support_replies AS reply SET
+        status='superseded',operator_delivery_status=NULL,updated_at=?,error_code=NULL,
+        decision_reason='服务重启前运营回复 RPC 尚未开始，重新生成回答',
+        duration_ms=CASE WHEN generation_started_at IS NULL THEN duration_ms
+          ELSE CAST(MAX(0,(julianday(?) - julianday(generation_started_at))*86400000) AS INTEGER) END
+        WHERE status='sending' AND decision<>'escalate' AND NOT EXISTS (
+          SELECT 1 FROM support_reply_alert_deliveries delivery
+          WHERE delivery.reply_id=reply.id AND delivery.alert_kind='escalation'
+        ) AND EXISTS (
+          SELECT 1 FROM support_threads thread WHERE thread.id=reply.thread_id
+            AND thread.status='generating' AND thread.revision=reply.input_revision AND thread.updated_at<?
+        ) AND NOT EXISTS (
+          SELECT 1 FROM telegram_output_ownership ownership
+          WHERE ownership.reply_id=reply.id AND ownership.output_kind='support_reply'
+        )`).run(now, now, staleBefore)
+      this.database.prepare(`UPDATE support_replies AS reply SET
+        status='superseded',operator_delivery_status=NULL,updated_at=?,error_code=NULL,
+        decision_reason='服务重启时旧输入版本的运营回复 RPC 尚未开始',
+        duration_ms=CASE WHEN generation_started_at IS NULL THEN duration_ms
+          ELSE CAST(MAX(0,(julianday(?) - julianday(generation_started_at))*86400000) AS INTEGER) END
+        WHERE status='sending' AND EXISTS (
+          SELECT 1 FROM support_threads thread WHERE thread.id=reply.thread_id
+            AND thread.status='generating' AND thread.revision<>reply.input_revision AND thread.updated_at<?
+        ) AND NOT EXISTS (
+          SELECT 1 FROM telegram_output_ownership ownership
+          WHERE ownership.reply_id=reply.id AND ownership.output_kind='support_reply'
+        )`).run(now, now, staleBefore)
       this.database.prepare(`UPDATE support_replies AS reply SET
         status='escalated',decision='escalate',operator_delivery_status='sent',updated_at=?,error_code=NULL,
         telegram_reply_message_id=(SELECT ownership.telegram_message_id FROM telegram_output_ownership ownership
@@ -1555,12 +2349,7 @@ export class SupportThreadStore {
         ) AND NOT EXISTS (
           SELECT 1 FROM support_reply_payloads payload
           WHERE payload.reply_id=support_replies.id AND support_replies.decision='escalate'
-            AND length(trim(payload.answer))>0 AND (
-              support_replies.decision_reason LIKE '%技术告警：发送中'
-              OR EXISTS(SELECT 1 FROM support_reply_alert_deliveries delivery
-                WHERE delivery.reply_id=support_replies.id AND delivery.alert_kind='escalation'
-                  AND delivery.status IN ('sent','not_configured','failed','uncertain'))
-            )
+            AND length(trim(payload.answer))>0
         )`).run(now, now, staleBefore)
       this.database.prepare(`UPDATE support_replies SET
         status='failed',operator_delivery_status='uncertain',updated_at=?,error_code='delivery_state_unknown',decision_reason='服务重启前发送状态未知',
@@ -1571,11 +2360,26 @@ export class SupportThreadStore {
         )`).run(now, now, staleBefore)
       const result = this.database.prepare(`UPDATE support_threads SET status='collecting',settle_at=?,updated_at=?
         WHERE status='generating' AND updated_at<?`).run(now, now, staleBefore)
+      this.database.prepare(`UPDATE support_threads AS thread SET status='answered',updated_at=?
+        WHERE status='collecting' AND EXISTS (
+          SELECT 1 FROM support_replies reply WHERE reply.thread_id=thread.id
+            AND reply.input_revision=thread.revision AND reply.status='replied'
+            AND reply.operator_delivery_status='sent'
+        )`).run(now)
+      this.database.prepare(`UPDATE support_threads AS thread SET status='escalated',updated_at=?
+        WHERE status='collecting' AND EXISTS (
+          SELECT 1 FROM support_replies reply WHERE reply.thread_id=thread.id
+            AND reply.input_revision=thread.revision AND (
+              (reply.status='escalated' AND reply.operator_delivery_status='sent')
+              OR (reply.status='failed' AND reply.operator_delivery_status IN ('failed','uncertain'))
+            )
+        )`).run(now)
       this.database.prepare(`UPDATE support_threads AS thread SET status='escalated',updated_at=?
         WHERE status='collecting' AND EXISTS (
           SELECT 1 FROM support_replies reply
           JOIN support_reply_alert_deliveries delivery ON delivery.reply_id=reply.id
-          WHERE reply.thread_id=thread.id AND delivery.alert_kind='escalation'
+          WHERE reply.thread_id=thread.id AND reply.input_revision=thread.revision
+            AND delivery.alert_kind='escalation'
             AND reply.status IN ('escalated','failed')
         )`).run(now)
       const replyUpdates = replies.length === 0 ? [] : this.database.prepare(
@@ -1585,7 +2389,7 @@ export class SupportThreadStore {
         count: Number(result.changes),
         replies: replyUpdates.map((reply) => ({
           id: String(reply.id),
-          status: reply.status as "superseded" | "failed",
+          status: reply.status as ReplyStatus,
           updatedAt: now,
           durationMs: reply.duration_ms === null ? null : Number(reply.duration_ms),
         })),
@@ -1601,9 +2405,16 @@ export class SupportThreadStore {
         WHERE delivery_status='sending' AND notification_id IN (
           SELECT id FROM support_thread_notifications WHERE status='sending'
         )`).run(now)
-      const progress = this.database.prepare(`UPDATE support_thread_notifications SET
+      const progress = this.database.prepare(`UPDATE support_thread_notifications AS notification SET
         status='unknown',error_message='服务重启前发送状态未知',updated_at=?
-        WHERE status='sending' AND kind='progress'`).run(now)
+        WHERE notification.status='sending' AND notification.kind='progress'
+          AND EXISTS(SELECT 1 FROM telegram_output_ownership ownership
+            WHERE ownership.notification_id=notification.id)`).run(now)
+      this.database.prepare(`UPDATE support_thread_notifications AS notification SET
+        status='pending',due_at=?,error_message='服务重启前发送尚未开始，重新发送',updated_at=?
+        WHERE notification.status='sending' AND notification.kind='progress'
+          AND NOT EXISTS(SELECT 1 FROM telegram_output_ownership ownership
+            WHERE ownership.notification_id=notification.id)`).run(now, now)
       this.database.prepare(`UPDATE support_thread_notifications AS notification SET
         status='unknown',error_message='服务重启前 timeout 发送状态未知',updated_at=?
         WHERE status='sending' AND kind IN ('timeout_operator','timeout_alert') AND EXISTS (
@@ -1620,40 +2431,48 @@ export class SupportThreadStore {
 
   claimDueProgress(now = new Date().toISOString()): SupportThreadNotification | null {
     return this.database.transaction(() => {
-      const row = this.database.prepare(`SELECT t.* FROM support_threads t
+      const rows = this.database.prepare(`SELECT t.* FROM support_threads t
         WHERE t.status='generating' AND t.answer_operation_mode='live'
           AND t.progress_due_at IS NOT NULL AND t.progress_due_at<=?
-          AND t.human_priority_progress_message_id IS NULL
-          AND NOT EXISTS(SELECT 1 FROM support_thread_notifications n
-            WHERE n.thread_id=t.id AND n.kind='progress' AND (
-              n.input_revision=t.revision OR n.status IN ('sending','sent','unknown')
-            ))
-          AND NOT EXISTS(SELECT 1 FROM telegram_output_ownership ownership
-            WHERE ownership.thread_id=t.id
-              AND ownership.output_kind IN ('progress','mention_claim_progress')
-              AND ownership.delivery_status IN ('sending','sent','unknown'))
-        ORDER BY t.progress_due_at,t.id LIMIT 1`).get(now) as SqlRow | undefined
-      if (!row) return null
-      const thread = threadFromRow(row)
-      const notification: SupportThreadNotification = {
-        id: randomUUID(),
-        threadId: thread.id,
-        inputRevision: thread.revision,
-        kind: "progress",
-        status: "pending",
-        dueAt: thread.progressDueAt!,
-        telegramMessageId: null,
-        errorMessage: null,
-        createdAt: now,
-        updatedAt: now,
+          AND NOT EXISTS(SELECT 1 FROM support_thread_output_claims claim
+            WHERE claim.thread_id=t.id AND claim.claim_kind='progress')
+        ORDER BY t.progress_due_at,t.id`).all(now) as SqlRow[]
+      for (const row of rows) {
+        const thread = threadFromRow(row)
+        const notification = this.claimProgressNotification(
+          thread.id,
+          thread.revision,
+          "scheduled_progress",
+          thread.progressDueAt!,
+          now,
+        )
+        this.database.prepare(`UPDATE support_threads SET progress_due_at=NULL,updated_at=?
+          WHERE id=? AND revision=? AND status='generating'`).run(now, thread.id, thread.revision)
+        if (notification) return notification
       }
-      const result = this.database.prepare(`INSERT OR IGNORE INTO support_thread_notifications(
-        id,thread_id,input_revision,kind,status,due_at,telegram_message_id,error_message,created_at,updated_at
-      ) VALUES(?,?,?,?,?,?,?,?,?,?)`).run(
-        notification.id, notification.threadId, notification.inputRevision, notification.kind,
-        notification.status, notification.dueAt, null, null, now, now,
-      )
-      return Number(result.changes) === 1 ? notification : null
+      return null
+    })
+  }
+
+  claimPendingProgressNotification(now = new Date().toISOString()): SupportThreadNotification | null {
+    return this.database.transaction(() => {
+      const claimPending = (): SupportThreadNotification | null => {
+        const row = this.database.prepare(`SELECT notification.* FROM support_thread_notifications notification
+          JOIN support_thread_output_claims claim ON claim.notification_id=notification.id
+            AND claim.claim_kind='progress'
+          JOIN support_threads thread ON thread.id=notification.thread_id
+          WHERE notification.kind='progress' AND notification.status='pending' AND notification.due_at<=?
+            AND thread.revision=notification.input_revision
+            AND thread.status IN ('collecting','generating') AND thread.answer_operation_mode='live'
+            AND NOT (claim.source_kind='human_priority' AND thread.human_priority_state='sending')
+          ORDER BY notification.due_at,notification.id LIMIT 1`).get(now) as SqlRow | undefined
+        if (!row) return null
+        return this.claimNotificationSending(String(row.id), now)
+      }
+      const pending = claimPending()
+      if (pending) return pending
+      if (!this.claimDueProgress(now)) return null
+      return claimPending()
     })
   }
 
@@ -1662,14 +2481,15 @@ export class SupportThreadStore {
       const row = this.database.prepare(`SELECT notification.* FROM support_thread_notifications notification
         JOIN support_threads thread ON thread.id=notification.thread_id
         WHERE notification.id=? AND notification.status='pending'
-          AND thread.status='generating' AND thread.revision=notification.input_revision
+          AND thread.status IN ('collecting','generating') AND thread.revision=notification.input_revision
           AND thread.answer_operation_mode='live'`).get(id) as SqlRow | undefined
       if (!row) return null
       const result = this.database.prepare(`UPDATE support_thread_notifications SET status='sending',updated_at=?
         WHERE id=? AND status='pending' AND EXISTS (
           SELECT 1 FROM support_threads thread
           WHERE thread.id=support_thread_notifications.thread_id
-            AND thread.status='generating' AND thread.revision=support_thread_notifications.input_revision
+            AND thread.status IN ('collecting','generating')
+            AND thread.revision=support_thread_notifications.input_revision
             AND thread.answer_operation_mode='live'
         )`).run(now, id)
       return Number(result.changes) === 1
@@ -1680,32 +2500,33 @@ export class SupportThreadStore {
 
   claimDueTimeout(now = new Date().toISOString()): SupportTimeoutClaim | null {
     const outcome = this.database.transaction(() => {
-      const row = this.database.prepare(`SELECT * FROM support_threads
+      const rows = this.database.prepare(`SELECT * FROM support_threads
         WHERE status='generating' AND hard_deadline_at IS NOT NULL AND hard_deadline_at<=?
-        ORDER BY hard_deadline_at,id LIMIT 1`).get(now) as SqlRow | undefined
-      if (!row) return null
-      const thread = threadFromRow(row)
-      const closed = this.closeThreadRows(thread.id, "AI 客服", "排查超过1小时", now)
-      if (!closed.changed) return null
-      const notificationKinds: SupportTimeoutClaim["notificationKinds"] = thread.answerOperationMode === "learning"
-        ? []
-        : ["timeout_operator", "timeout_alert"]
-      if (notificationKinds.length > 0) {
-        const insert = this.database.prepare(`INSERT OR IGNORE INTO support_thread_notifications(
-          id,thread_id,input_revision,kind,status,due_at,telegram_message_id,error_message,created_at,updated_at
-        ) VALUES(?,?,?,?,?,?,?,?,?,?)`)
-        notificationKinds.forEach((kind) => insert.run(
-          randomUUID(), thread.id, thread.revision, kind, "pending", now, null, null, now, now,
-        ))
+        ORDER BY hard_deadline_at,id LIMIT 512`).all(now) as SqlRow[]
+      for (const row of rows) {
+        const claimed = this.claimTimeoutRow(threadFromRow(row), now)
+        if (claimed) return claimed
       }
-      return {
-        claim: {
-          threadId: thread.id,
-          inputRevision: thread.revision,
-          notificationKinds,
-        },
-        replyUpdates: closed.replyUpdates,
-      }
+      return null
+    })
+    outcome?.replyUpdates.forEach((event) => this.onExpiredReply?.(event))
+    return outcome?.claim ?? null
+  }
+
+  claimHardDeadline(
+    threadId: string,
+    inputRevision: number,
+    now = new Date().toISOString(),
+  ): SupportTimeoutClaim | null {
+    const outcome = this.database.transaction(() => {
+      const row = this.database.prepare(`SELECT * FROM support_threads
+        WHERE id=? AND revision=? AND status='generating'
+          AND hard_deadline_at IS NOT NULL AND hard_deadline_at<=?`).get(
+        threadId,
+        inputRevision,
+        now,
+      ) as SqlRow | undefined
+      return row ? this.claimTimeoutRow(threadFromRow(row), now) : null
     })
     outcome?.replyUpdates.forEach((event) => this.onExpiredReply?.(event))
     return outcome?.claim ?? null
@@ -1738,10 +2559,19 @@ export class SupportThreadStore {
     })
   }
 
-  completeNotification(id: string, telegramMessageId: string | null, now = new Date().toISOString()): void {
+  completeNotification(
+    id: string,
+    telegramMessageId: string | null,
+    outboundText: string | null,
+    now = new Date().toISOString(),
+  ): void {
+    if (telegramMessageId !== null && !outboundText?.trim()) {
+      throw new Error("已发送线程通知缺少真实出站文本")
+    }
     this.database.prepare(`UPDATE support_thread_notifications SET
-      status='sent',telegram_message_id=?,error_message=NULL,updated_at=? WHERE id=? AND status='sending'`).run(
-      telegramMessageId, now, id,
+      status='sent',telegram_message_id=?,outbound_text=?,error_message=NULL,updated_at=?
+      WHERE id=? AND status='sending'`).run(
+      telegramMessageId, outboundText, now, id,
     )
   }
 
@@ -2036,49 +2866,131 @@ export class SupportThreadStore {
     this.database.prepare("UPDATE support_message_events SET route_status=?,skip_reason=? WHERE id=?").run(status, skipReason, id)
   }
 
-  private humanPriorityUserIds(value: unknown): string[] {
+  private humanPriorityTarget(value: unknown): {
+    userIds: string[]
+    mentionedTechnical: boolean
+    ignoredUserIds: string[]
+  } {
     try {
       const parsed = JSON.parse(String(value)) as unknown
-      return Array.isArray(parsed) && parsed.every((item) => typeof item === "string" && /^\d+$/u.test(item))
-        ? [...new Set(parsed)]
-        : []
+      if (Array.isArray(parsed) && parsed.every((item) => typeof item === "string" && /^\d+$/u.test(item))) {
+        const userIds = [...new Set(parsed)]
+        return {
+          userIds,
+          mentionedTechnical: this.includesEnabledTechnical(userIds),
+          ignoredUserIds: userIds.filter((id) => this.isEnabledIgnored(id)),
+        }
+      }
+      if (typeof parsed !== "object" || parsed === null) {
+        return { userIds: [], mentionedTechnical: false, ignoredUserIds: [] }
+      }
+      const candidate = parsed as { userIds?: unknown; mentionedTechnical?: unknown; ignoredUserIds?: unknown }
+      if (!Array.isArray(candidate.userIds)
+        || !candidate.userIds.every((item) => typeof item === "string" && /^\d+$/u.test(item))
+        || typeof candidate.mentionedTechnical !== "boolean") {
+        return { userIds: [], mentionedTechnical: false, ignoredUserIds: [] }
+      }
+      const userIds = [...new Set(candidate.userIds)]
+      const ignoredUserIds = Array.isArray(candidate.ignoredUserIds)
+        && candidate.ignoredUserIds.every((item) => typeof item === "string" && /^\d+$/u.test(item))
+        ? [...new Set(candidate.ignoredUserIds)].filter((id) => userIds.includes(id))
+        : userIds.filter((id) => this.isEnabledIgnored(id))
+      return {
+        userIds,
+        mentionedTechnical: candidate.mentionedTechnical,
+        ignoredUserIds,
+      }
     } catch {
-      return []
+      return { userIds: [], mentionedTechnical: false, ignoredUserIds: [] }
     }
   }
 
+  private includesEnabledTechnical(userIds: string[]): boolean {
+    if (userIds.length === 0) return false
+    return Boolean(this.database.prepare(`SELECT 1 FROM telegram_roles
+      WHERE enabled=1 AND role='technical' AND telegram_user_id IN (${userIds.map(() => "?").join(",")})
+      LIMIT 1`).get(...userIds))
+  }
+
+  private isEnabledTechnical(userId: string): boolean {
+    return Boolean(this.database.prepare(`SELECT 1 FROM telegram_roles
+      WHERE enabled=1 AND role='technical' AND telegram_user_id=? LIMIT 1`).get(userId))
+  }
+
+  private isEnabledIgnored(userId: string): boolean {
+    return Boolean(this.database.prepare(`SELECT 1 FROM telegram_roles
+      WHERE enabled=1 AND role='ignored' AND telegram_user_id=? LIMIT 1`).get(userId))
+  }
+
   private applyHumanPriorityFromEvent(threadId: string, eventId: string, now: string): void {
-    const mode = this.database.prepare("SELECT answer_operation_mode FROM support_threads WHERE id=?")
-      .get(threadId) as { answer_operation_mode?: string } | undefined
+    const mode = this.database.prepare(`SELECT answer_operation_mode,human_priority_state,
+      human_priority_user_ids_json,human_priority_due_at
+      FROM support_threads WHERE id=?`).get(threadId) as
+      | {
+        answer_operation_mode?: string
+        human_priority_state?: string
+        human_priority_user_ids_json?: string
+        human_priority_due_at?: string | null
+      }
+      | undefined
     if (mode?.answer_operation_mode === "learning") return
-    const event = this.database.prepare(`SELECT group_id,created_at,human_priority_user_ids_json,human_priority_due_at
+    const event = this.database.prepare(`SELECT rowid AS source_rowid,group_id,created_at,
+      human_priority_user_ids_json,human_priority_due_at
       FROM support_message_events WHERE id=?`).get(eventId) as SqlRow | undefined
     if (!event?.human_priority_due_at) return
-    const userIds = this.humanPriorityUserIds(event.human_priority_user_ids_json)
+    const eventTarget = this.humanPriorityTarget(event.human_priority_user_ids_json)
+    const progressStarted = this.hasStartedProgress(threadId)
+    const currentTarget = this.humanPriorityTarget(mode?.human_priority_user_ids_json ?? "[]")
+    const target = progressStarted ? {
+      userIds: [...new Set([...currentTarget.userIds, ...eventTarget.userIds])],
+      mentionedTechnical: currentTarget.mentionedTechnical || eventTarget.mentionedTechnical,
+      ignoredUserIds: [...new Set([...currentTarget.ignoredUserIds, ...eventTarget.ignoredUserIds])],
+    } : eventTarget
+    const userIds = target.userIds
     if (userIds.length === 0) return
-    const placeholders = userIds.map(() => "?").join(",")
-    const response = this.database.prepare(`SELECT id FROM support_message_events
-      WHERE group_id=? AND id<>? AND created_at>=? AND created_at<=?
-        AND sender_user_id IN (${placeholders})
-      ORDER BY created_at,id LIMIT 1`).get(
+    const dueAt = progressStarted
+      ? mode?.human_priority_due_at
+        ?? new Date(Date.parse(String(event.created_at)) + HUMAN_PRIORITY_WAIT_MS).toISOString()
+      : String(event.human_priority_due_at)
+    const targetJson = JSON.stringify(target)
+    const responseCandidates = this.database.prepare(`SELECT input.id,input.sender_user_id
+      FROM support_message_events input
+      WHERE input.group_id=? AND input.id<>? AND input.route_status='role_skipped' AND input.created_at<=?
+        AND (input.created_at>? OR (input.created_at=? AND input.rowid>?))
+      ORDER BY input.created_at,input.rowid`).all(
       String(event.group_id),
       eventId,
+      now,
       String(event.created_at),
-      String(event.human_priority_due_at),
-      ...userIds,
-    ) as SqlRow | undefined
+      String(event.created_at),
+      Number(event.source_rowid),
+    ) as SqlRow[]
+    const response = responseCandidates.find((candidate) => {
+      const senderUserId = String(candidate.sender_user_id)
+      return (target.mentionedTechnical && this.isEnabledTechnical(senderUserId))
+        || (target.ignoredUserIds.includes(senderUserId) && this.isEnabledIgnored(senderUserId))
+    })
     if (response) {
+      const reason = target.mentionedTechnical && this.isEnabledTechnical(String(response.sender_user_id))
+        ? "技术角色已在人工等待前回应"
+        : "被@人员已在人工等待前回应"
       this.database.prepare(`UPDATE support_threads SET
         human_priority_state='answered',human_priority_user_ids_json=?,human_priority_due_at=?,
         human_priority_source_event_id=?,human_priority_error=?,updated_at=? WHERE id=?`).run(
-        JSON.stringify(userIds),
-        String(event.human_priority_due_at),
+        targetJson,
+        dueAt,
         eventId,
-        `被@人员已在3分钟内回应 message_event_id=${String(response.id)}`.slice(0, 1000),
+        `${reason} message_event_id=${String(response.id)}`.slice(0, 1000),
         now,
         threadId,
       )
-      this.closeThreadRows(threadId, "群内人工", "被@人员已在3分钟内回应", now)
+      this.closeThreadRows(threadId, "群内人工", reason, now)
+      return
+    }
+    if (progressStarted && mode?.human_priority_state !== "none") {
+      this.database.prepare(`UPDATE support_threads SET
+        human_priority_user_ids_json=?,human_priority_error=NULL,updated_at=?
+        WHERE id=? AND status='collecting'`).run(targetJson, now, threadId)
       return
     }
     this.database.prepare(`UPDATE support_threads SET
@@ -2086,9 +2998,9 @@ export class SupportThreadStore {
       human_priority_state='waiting',human_priority_user_ids_json=?,human_priority_due_at=?,
       human_priority_source_event_id=?,human_priority_progress_message_id=NULL,human_priority_error=NULL,
       closed_at=NULL,closed_by=NULL,closed_reason=NULL,updated_at=? WHERE id=?`).run(
-      String(event.human_priority_due_at),
-      JSON.stringify(userIds),
-      String(event.human_priority_due_at),
+      dueAt,
+      targetJson,
+      dueAt,
       eventId,
       now,
       threadId,
@@ -2102,6 +3014,146 @@ export class SupportThreadStore {
       groupId, serviceId, cutoff,
     ) as SqlRow[]
     rows.forEach((row) => this.closeThread(String(row.id), "AI 客服", "超过30分钟后收到新问题", now))
+  }
+
+  private claimTimeoutRow(
+    thread: SupportThread,
+    now: string,
+  ): { claim: SupportTimeoutClaim; replyUpdates: ExpiredReplyUpdate[] } | null {
+    if (thread.answerOperationMode === "live" && this.hasStartedProgress(thread.id)) {
+      const reply = this.database.prepare(`SELECT reply.id,reply.status,reply.decision,reply.error_code,payload.answer
+        FROM support_replies reply JOIN support_reply_payloads payload ON payload.reply_id=reply.id
+        WHERE reply.thread_id=? AND reply.input_revision=?
+        ORDER BY reply.created_at DESC,reply.id DESC LIMIT 1`).get(thread.id, thread.revision) as SqlRow | undefined
+      if (!reply) return null
+      const ordinaryDeliveryAlreadyPrepared = reply.status === "generating"
+        && reply.decision === "escalate"
+        && reply.error_code !== HARD_DEADLINE_ERROR_CODE
+        && String(reply.answer ?? "").trim().length > 0
+      if (reply.status === "sending" || ordinaryDeliveryAlreadyPrepared) {
+        const updated = this.database.prepare(`UPDATE support_threads SET
+          progress_due_at=NULL,hard_deadline_at=NULL,updated_at=?
+          WHERE id=? AND revision=? AND status='generating'
+            AND hard_deadline_at IS NOT NULL AND hard_deadline_at<=?`).run(
+          now,
+          thread.id,
+          thread.revision,
+          now,
+        )
+        if (Number(updated.changes) !== 1) return null
+        return {
+          claim: {
+            threadId: thread.id,
+            inputRevision: thread.revision,
+            outcome: "delivery_in_flight",
+            replyId: String(reply.id),
+            notificationKinds: [],
+          },
+          replyUpdates: [],
+        }
+      }
+      if (reply.status !== "generating") {
+        const closed = this.closeThreadRows(
+          thread.id,
+          "AI 客服",
+          "hard deadline 到达时最终回复已进入持久发送或终态恢复边界",
+          now,
+        )
+        if (!closed.changed) return null
+        return {
+          claim: {
+            threadId: thread.id,
+            inputRevision: thread.revision,
+            outcome: "closed",
+            replyId: null,
+            notificationKinds: [],
+          },
+          replyUpdates: closed.replyUpdates,
+        }
+      }
+      const replyId = String(reply.id)
+      if (!this.claimHandoff(replyId, "hard_deadline", now)) {
+        const owner = this.database.prepare(`SELECT reply_id FROM support_thread_output_claims
+          WHERE thread_id=? AND claim_kind='handoff'`).get(thread.id) as SqlRow | undefined
+        if (!owner?.reply_id) throw new Error("handoff 领取冲突但未找到持久 owner")
+        const updated = this.database.prepare(`UPDATE support_threads SET
+          progress_due_at=NULL,hard_deadline_at=NULL,updated_at=?
+          WHERE id=? AND revision=? AND status='generating'`).run(now, thread.id, thread.revision)
+        if (Number(updated.changes) !== 1) return null
+        return {
+          claim: {
+            threadId: thread.id,
+            inputRevision: thread.revision,
+            outcome: "delivery_in_flight",
+            replyId: String(owner.reply_id),
+            notificationKinds: [],
+          },
+          replyUpdates: [],
+        }
+      }
+      const prepared = this.database.prepare(`UPDATE support_replies SET
+        decision='escalate',updated_at=?,error_code=?,decision_reason=?,decision_confidence=0
+        WHERE id=? AND thread_id=? AND input_revision=? AND status='generating'
+          AND EXISTS(SELECT 1 FROM support_threads current
+            WHERE current.id=support_replies.thread_id AND current.status='generating'
+              AND current.revision=support_replies.input_revision
+              AND current.hard_deadline_at IS NOT NULL AND current.hard_deadline_at<=?)`).run(
+        now,
+        HARD_DEADLINE_ERROR_CODE,
+        "排查超过1小时且已发送进度提示，转技术继续处理\n技术告警：发送中",
+        replyId,
+        thread.id,
+        thread.revision,
+        now,
+      )
+      if (Number(prepared.changes) !== 1) return null
+      this.database.prepare(`UPDATE support_reply_payloads SET answer=?,quote_text=NULL WHERE reply_id=?`).run(
+        TECHNICAL_AVAILABILITY_REPLY_PENDING,
+        replyId,
+      )
+      this.database.prepare("DELETE FROM reply_memory_refs WHERE reply_id=?").run(replyId)
+      this.database.prepare(`UPDATE support_thread_notifications SET
+        status='failed',error_message='hard deadline 已复用此前进度提示',updated_at=?
+        WHERE thread_id=? AND kind='progress' AND status='pending'`).run(now, thread.id)
+      const updated = this.database.prepare(`UPDATE support_threads SET
+        progress_due_at=NULL,hard_deadline_at=NULL,updated_at=?
+        WHERE id=? AND revision=? AND status='generating'`).run(now, thread.id, thread.revision)
+      if (Number(updated.changes) !== 1) throw new Error("hard deadline 技术升级未能保持当前问题版本")
+      return {
+        claim: {
+          threadId: thread.id,
+          inputRevision: thread.revision,
+          outcome: "prepared_escalation",
+          replyId,
+          notificationKinds: [],
+        },
+        replyUpdates: [],
+      }
+    }
+
+    const closed = this.closeThreadRows(thread.id, "AI 客服", "排查超过1小时", now)
+    if (!closed.changed) return null
+    const notificationKinds: [] | ["timeout_operator", "timeout_alert"] = thread.answerOperationMode === "learning"
+      ? []
+      : ["timeout_operator", "timeout_alert"]
+    if (notificationKinds.length > 0) {
+      const insert = this.database.prepare(`INSERT OR IGNORE INTO support_thread_notifications(
+        id,thread_id,input_revision,kind,status,due_at,telegram_message_id,error_message,created_at,updated_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?)`)
+      notificationKinds.forEach((kind) => insert.run(
+        randomUUID(), thread.id, thread.revision, kind, "pending", now, null, null, now, now,
+      ))
+    }
+    return {
+      claim: {
+        threadId: thread.id,
+        inputRevision: thread.revision,
+        outcome: "closed",
+        replyId: null,
+        notificationKinds,
+      },
+      replyUpdates: closed.replyUpdates,
+    }
   }
 
   private closeThreadRows(threadId: string, actor: string, reason: string, now: string): CloseThreadResult {
