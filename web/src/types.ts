@@ -571,7 +571,7 @@ export type ProjectView = {
   repositories: ProjectRepository[]; services: ProjectService[]; servers: ProjectServer[]; databases: ProjectDatabase[]
 }
 
-export type InvestigationSource = "message" | "memory" | "document" | "code" | "server" | "log" | "database" | "redis" | "inference"
+export type InvestigationSource = "message" | "document" | "code" | "server" | "log" | "database" | "redis" | "inference"
 export type InvestigationStatus = "confirmed" | "not_found" | "failed" | "skipped"
 
 export type InvestigationTrace = {

@@ -1,6 +1,6 @@
 {
   "name": "telegram-codex-support",
-  "version": "2.2.4",
+  "version": "2.4.0",
   "private": true,
   "type": "module",
   "engines": {
@@ -8,7 +8,7 @@
   },
   "scripts": {
     "build": "pnpm build:server && pnpm build:web",
-    "build:server": "node scripts/build-server.mjs",
+    "build:server": "tsc -p tsconfig.build.json",
     "build:web": "node scripts/copy-web-assets.mjs && tsc -p tsconfig.web.json",
     "dev": "pnpm build:web && tsx watch src/server.ts",
     "service:install": "zsh scripts/install-macos-launch-agent.zsh",

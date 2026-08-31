@@ -322,92 +322,27 @@ describe("运营参考回复风格", () => {
       failure: null,
       publishedAt: "2026-08-11T00:00:00.000Z",
       workspacePath: process.cwd(),
-      repositories: [{
-        role: "backend" as const,
-        repositoryId: "00000000-0000-4000-8000-000000000746",
-        name: "java-project",
-        branch: service.branch,
-        commit: "a".repeat(40),
-        snapshotPath: process.cwd(),
-      }],
+      repositories: [],
     }
-    const completeDecision = (answer: string, reason: string, summary: string) => ({
+    const execute = vi.fn()
+      .mockResolvedValueOnce({
         decision: "reply",
-        escalationType: "none",
-        humanOperation: null,
-        answer,
+        answer: "可以查，这笔还没收到上游结果",
         quote: null,
-        reason,
+        reason: "第一次结果使用机械是非开场",
         confidence: 0.9,
         usedMemoryVersionIds: [],
-        answerClaims: [{
-          factId: "F1",
-          statement: "还没收到上游结果",
-          provenance: "code",
-          evidenceSource: "code",
-          evidence: "src/support/agent.ts",
-        }],
-        responsibility: { party: "not_applicable", certainty: "not_applicable", evidenceSources: [], factIds: [] },
-        interaction: {
-          sentiment: "neutral",
-          situation: "new_request",
-          underlyingNeed: "了解订单当前处理流程",
-          responseStrategy: "direct_answer",
-        },
-        investigation: {
-          summary,
-          steps: [{
-            source: "code",
-            title: "读取当前代码",
-            status: "confirmed",
-            evidence: "当前发布代码快照",
-            conclusion: "已确认一般处理流程",
-          }],
-        },
-        evidencePacket: {
-          version: "2",
-          communication: { intent: "direct_answer", recipient: null, desiredOutcome: "解释当前处理流程" },
-          facts: [{
-            id: "F1",
-            statement: "还没收到上游结果",
-            provenance: "code",
-            evidenceSource: "code",
-            evidence: "src/support/agent.ts",
-            certainty: "confirmed",
-            outboundSafe: true,
-            subjectKind: "general",
-            businessType: "not_applicable",
-            identifiers: [],
-            associationId: null,
-            dependsOnFactIds: [],
-          }],
-          associations: [],
-          requiredAnswerPoints: ["解释当前处理流程"],
-          unknowns: [],
-          handlingNotes: [],
-          reviewLevel: "standard",
-        },
+        investigation: { summary: "第一次", steps: [] },
       })
-    const execute = vi.fn(async (_purpose: string, execution: {
-      prompt: string
-      modelSnapshot?: unknown
-      maxConcurrency?: number
-      onCommandObservations?: (observations: Array<{ command: string; output: string; exitCode: number }>) => void | Promise<void>
-    }) => {
-      if (execution.prompt.includes("你是四方支付团队的客服")) {
-        await execution.onCommandObservations?.([{
-          command: `rg --files ${process.cwd()}`,
-          output: "src/support/agent.ts",
-          exitCode: 0,
-        }])
-        return completeDecision(
-          "可以查，这笔还没收到上游结果",
-          "第一次结果使用机械是非开场",
-          "第一次",
-        )
-      }
-      return { outcome: "approve", issues: [], reason: "基线事实已通过独立审核" }
-    })
+      .mockResolvedValueOnce({
+        decision: "reply",
+        answer: "还没收到上游结果 等对方返回就行",
+        quote: null,
+        reason: "第二次结果通过发送前安全校验",
+        confidence: 0.9,
+        usedMemoryVersionIds: [],
+        investigation: { summary: "第二次", steps: [] },
+      })
     const investigation = new SupportInvestigationService({
       database,
       codeSync: {
@@ -454,7 +389,6 @@ describe("运营参考回复风格", () => {
       }, new AbortController().signal)
 
       const prompts = execute.mock.calls.map((call) => String(call[1]?.prompt))
-        .filter((prompt) => prompt.includes("你是四方支付团队的客服"))
       expect(prompts).toHaveLength(1)
       expect(prompts.map((prompt) => ({
         pinned18: prompt.includes("每句通常不超过 18 个字"),
@@ -470,9 +404,8 @@ describe("运营参考回复风格", () => {
       expect(prompts.every((prompt) => prompt.includes("技术证据只放内部依据，不得当作运营答案"))).toBe(true)
       expect(prompts.every((prompt) => prompt.includes("结构化业务值"))).toBe(true)
       expect(prompts[0]).not.toContain("上一次 answer 未通过发送要求")
-      expect(execute).toHaveBeenCalledTimes(2)
-      expect(execute.mock.calls.map((call) => call[1]?.modelSnapshot)).toEqual([modelSnapshot, modelSnapshot])
-      expect(execute.mock.calls.map((call) => call[1]?.maxConcurrency)).toEqual([3, 3])
+      expect(execute.mock.calls.map((call) => call[1]?.modelSnapshot)).toEqual([modelSnapshot])
+      expect(execute.mock.calls.map((call) => call[1]?.maxConcurrency)).toEqual([3])
     } finally {
       database.close()
     }

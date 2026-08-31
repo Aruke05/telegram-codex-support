@@ -29,7 +29,6 @@ const unreadStorageKey = "mercuryclaw.admin-chat.unread-sessions"
 
 const sourceLabels: Record<InvestigationSource, string> = {
   message: "问题证据",
-  memory: "AI 记忆",
   document: "接口文档",
   code: "当前代码",
   server: "服务器状态",

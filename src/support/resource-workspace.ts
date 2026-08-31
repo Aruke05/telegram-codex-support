@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto"
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
+import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 
@@ -12,7 +12,20 @@ export type OpenResourceWorkspace = {
   manifestPath: string
   databaseQueryAuditPath: string
   networkHosts: string[]
+  localCodeLibrary?: LocalCodeLibrary | null
+  codeLibraryRoots?: string[]
   cleanup(): Promise<void>
+}
+
+export type LocalCodeLibrary = {
+  root: string
+  worktreesRoot: string
+  branch: string
+  repositories: Array<{
+    role: "backend" | "frontend"
+    name: string
+    path: string
+  }>
 }
 
 const resourceDirectoryPrefix = "telegram-support-answer-"
@@ -138,6 +151,56 @@ function processAlive(pid: number): boolean {
 export class ResourceWorkspace {
   constructor(private readonly database: RuntimeDatabase) {}
 
+  private async resolveLocalCodeLibrary(
+    serviceId: string,
+    projectId: string,
+    branch: string,
+  ): Promise<LocalCodeLibrary | null> {
+    const configuredRoot = process.env.AI_SUPPORT_CODE_LIBRARY_ROOT?.trim()
+    if (!configuredRoot) return null
+    if (!path.isAbsolute(configuredRoot)) throw new Error("AI 客服代码库必须配置绝对路径")
+    const root = await realpath(configuredRoot)
+    if (!(await stat(root)).isDirectory()) throw new Error("AI 客服代码库目录不可用")
+    const worktreesRoot = await realpath(path.join(root, "worktrees"))
+    if (!(await stat(worktreesRoot)).isDirectory()) throw new Error("AI 客服 worktree 目录不可用")
+    const bindings = this.database.readProjectServiceRepositories(
+      "WHERE service_id=? ORDER BY CASE role WHEN 'backend' THEN 0 ELSE 1 END",
+      [serviceId],
+    )
+    const repositories = this.database.readProjectRepositories("WHERE project_id=? AND enabled=1", [projectId])
+    const resolved = await Promise.all(bindings.map(async (binding) => {
+      const repository = repositories.find((candidate) => candidate.id === binding.repositoryId)
+      if (!repository) throw new Error("当前服务代码仓库配置不存在")
+      const configuredPath = repository.localPath.trim()
+      const candidates = [
+        configuredPath,
+        path.join(root, "repositories", repository.name),
+        path.join(root, repository.name),
+      ].filter(Boolean)
+      let repositoryPath: string | null = null
+      for (const candidate of candidates) {
+        try {
+          const resolvedPath = await realpath(candidate)
+          const relative = path.relative(root, resolvedPath)
+          if (relative && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)) {
+            repositoryPath = resolvedPath
+            break
+          }
+        } catch { /* 继续尝试独立代码库中的标准目录。 */ }
+      }
+      if (!repositoryPath || !(await stat(repositoryPath)).isDirectory()) {
+        throw new Error(`当前服务缺少 ${repository.name} 的独立代码副本`)
+      }
+      const gitMetadata = await stat(path.join(repositoryPath, ".git"))
+      if (!gitMetadata.isDirectory() && !gitMetadata.isFile()) {
+        throw new Error(`当前服务的 ${repository.name} 不是可用 Git 工作树`)
+      }
+      return { role: binding.role, name: repository.name, path: repositoryPath }
+    }))
+    if (resolved.length === 0) throw new Error("当前服务没有配置可读取的独立代码仓库")
+    return { root, worktreesRoot, branch, repositories: resolved }
+  }
+
   static async cleanupOrphans(maxAgeMs = 20 * 60 * 1000): Promise<number> {
     const entries = await readdir(tmpdir(), { withFileTypes: true })
     let removed = 0
@@ -167,6 +230,7 @@ export class ResourceWorkspace {
     if (!service) throw new Error("绑定服务不存在")
     const project = this.database.readProjects("WHERE id=? AND enabled=1", [service.projectId])[0]
     if (!project) throw new Error("绑定项目不存在")
+    const localCodeLibrary = await this.resolveLocalCodeLibrary(service.id, project.id, service.branch)
     const servers = this.database.readServerResources("WHERE service_id=? AND enabled=1 ORDER BY created_at,id", [serviceId])
     const databases = this.database.readDatabaseResources("WHERE service_id=? AND enabled=1 ORDER BY created_at,id", [serviceId])
     servers.forEach((server) => assertSafeSshTarget(server.username, server.host))
@@ -236,6 +300,7 @@ export class ResourceWorkspace {
           timezone: database.timezone,
         })),
         databaseAndRedisAccess: "数据库和 Redis 必须登录以上绑定服务器后，在服务器内使用可用客户端或现有运行环境只读查询。禁止客服电脑直接连接生产地址，也禁止建立回连客服电脑的 SSH 隧道。",
+        localCodeLibrary,
         knownHostsPath,
         sshConfigPath,
         codeSnapshot: codeSnapshot ? {
@@ -275,12 +340,19 @@ export class ResourceWorkspace {
         "任何单条远程命令都必须设置 timeout，连接或命令失败后换安全只读证据，不得无限重试。",
         "同一种资源最多尝试两次；一小时硬截止由客服系统统一控制，不得自行因耗时退出。证据已足够或某项无法继续时立即形成结论，禁止安装软件、编译工具或无限寻找替代客户端。",
         "状态结论必须忠于命令原始结果：inactive 不能写成 active，非零退出码也不能自动解释成认证失败；证据冲突时写无法确认。",
+        ...(localCodeLibrary ? [
+          "本机提供了只属于 AI 客服的独立 Git 代码库，路径和当前服务分支见 resources.json 的 localCodeLibrary。不要访问四方支付原工作目录。",
+          "先由你结合当前问题现场查看分支、工作树和 worktree 状态，再决定直接读取哪个现有工作树，或者在 worktreesRoot 下建立新的隔离 worktree。父程序不使用锁、关键词、分支清单或固定占用规则替你判断。",
+          "代码库只用于调查。不得修改业务代码，不得 fetch、pull、push、commit、merge、rebase 或改写 Git 历史。不要盲目删除 worktree，因为其他回答会话可能仍在读取。",
+        ] : []),
       ].join("\n"), { encoding: "utf8", mode: 0o600 })
       return {
         path: directory,
         manifestPath,
         databaseQueryAuditPath,
         networkHosts: [...new Set(servers.map((server) => server.host))],
+        localCodeLibrary,
+        codeLibraryRoots: localCodeLibrary ? [localCodeLibrary.root] : [],
         cleanup: async () => {
           if (cleaned) return
           cleaned = true

@@ -1,15 +1,13 @@
 import { createHash, randomUUID } from "node:crypto"
-import { chmod, mkdtemp, rm, unlink } from "node:fs/promises"
-import { tmpdir } from "node:os"
+import { chmod, unlink } from "node:fs/promises"
 import path from "node:path"
-import { backup, DatabaseSync } from "node:sqlite"
+import { backup } from "node:sqlite"
 import { z } from "zod"
 
 import { redactText } from "../security/dlp.js"
 import { baselineOperatorStyleProfile, operatorStyleProfileSchema } from "../support/operator-style.js"
 import {
   assertReferenceLearningAuditStructure,
-  assertSupportThreadOutputClaimStructure,
   assertTelegramOutputOwnershipRows,
   RuntimeDatabase,
 } from "./database.js"
@@ -43,7 +41,6 @@ const portableTables = [
   "memory_version_evidence",
   "support_threads",
   "support_thread_notifications",
-  "support_thread_output_claims",
   "telegram_output_ownership",
   "telegram_outgoing_candidates",
   "support_message_events",
@@ -65,6 +62,7 @@ const portableTables = [
   "admin_chat_attachments",
   "admin_chat_corrections",
   "reply_generation_audits",
+  "user_unfreeze_actions",
   "memory_maintenance_runs",
   "model_instances",
   "model_catalog_entries",
@@ -78,13 +76,12 @@ const sensitiveScanTables = [
   "reference_learning_results",
   "memory_version_evidence", "operator_style_versions", "operator_style_version_evidence",
   "support_threads", "support_thread_notifications", "support_message_events", "support_thread_messages", "support_thread_links",
-  "support_thread_output_claims",
   "support_sender_focus", "support_route_clarifications",
   "telegram_output_ownership",
   "telegram_outgoing_candidates",
   "support_message_attachments", "support_replies", "support_reply_payloads", "reply_memory_refs",
   "shadow_answer_results", "shadow_human_answer_links", "shadow_learning_reports", "shadow_comparisons",
-  "admin_chat_attachments", "admin_chat_corrections", "reply_generation_audits",
+  "admin_chat_attachments", "admin_chat_corrections", "reply_generation_audits", "user_unfreeze_actions",
   "memory_maintenance_runs", "knowledge_documents",
   "model_profiles", "model_instances", "runtime_model_bindings", "runtime_settings", "daily_group_shutdown_schedule",
 ] as const
@@ -158,75 +155,6 @@ async function removeExisting(filePath: string): Promise<void> {
     await unlink(filePath)
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
-  }
-}
-
-function hasLegacyPortableReferenceLearningCapabilities(database: RuntimeDatabase, schemaVersion: number): boolean {
-  if (schemaVersion >= 23) return false
-  const hasObservations = Boolean(database.prepare(
-    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='learning_source_observations'",
-  ).get())
-  const hasCurrentRunId = hasObservations && (database.prepare(
-    "PRAGMA table_info(learning_source_observations)",
-  ).all() as Array<{ name: string }>).some((column) => column.name === "current_run_id")
-  const hasResults = Boolean(database.prepare(
-    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='reference_learning_results'",
-  ).get())
-  if (hasCurrentRunId !== hasResults) throw new Error("迁移数据库人工参考终态审计谱系冲突")
-  if (hasCurrentRunId && hasResults) {
-    assertReferenceLearningAuditStructure(database.connection)
-    return false
-  }
-  return true
-}
-
-function normalizeLegacyPortableGroupBindings(filePath: string, allowed: boolean): void {
-  if (!allowed) return
-  const database = new DatabaseSync(filePath)
-  try {
-    const hasGroups = Boolean(database.prepare(
-      "SELECT 1 FROM sqlite_master WHERE type='table' AND name='telegram_groups'",
-    ).get())
-    if (!hasGroups) return
-    const columns = new Set((database.prepare("PRAGMA table_info(telegram_groups)").all() as Array<{ name: string }>)
-      .map((column) => column.name))
-    if (!["purpose", "project_id", "service_id"].every((column) => columns.has(column))) return
-    database.prepare(`UPDATE telegram_groups SET project_id=NULL,service_id=NULL
-      WHERE purpose='technical_alert'`).run()
-  } finally {
-    database.close()
-  }
-}
-
-async function normalizePortableImportSource(source: string): Promise<{
-  filePath: string
-  cleanup: () => Promise<void>
-}> {
-  const temporaryDirectory = await mkdtemp(path.join(tmpdir(), "telegram-support-portable-import-"))
-  const temporaryFile = path.join(temporaryDirectory, "portable.sqlite")
-  let sourceDatabase: RuntimeDatabase | null = null
-  try {
-    sourceDatabase = RuntimeDatabase.openPortable(source, true)
-    const sourceSchemaVersion = sourceDatabase.schemaVersion()
-    const normalizeLegacyGroupBindings = hasLegacyPortableReferenceLearningCapabilities(
-      sourceDatabase,
-      sourceSchemaVersion,
-    )
-    await backup(sourceDatabase.connection, temporaryFile)
-    sourceDatabase.close()
-    sourceDatabase = null
-
-    normalizeLegacyPortableGroupBindings(temporaryFile, normalizeLegacyGroupBindings)
-    const normalized = RuntimeDatabase.openPortable(temporaryFile)
-    normalized.close()
-    return {
-      filePath: temporaryFile,
-      cleanup: () => rm(temporaryDirectory, { recursive: true, force: true }),
-    }
-  } catch (error) {
-    sourceDatabase?.close()
-    await rm(temporaryDirectory, { recursive: true, force: true })
-    throw error
   }
 }
 
@@ -354,6 +282,13 @@ export class BackupService {
           WHERE status='sending'`).run()
         portable.prepare(`UPDATE support_replies SET operator_delivery_status='uncertain'
           WHERE operator_delivery_status='sending'`).run()
+        portable.prepare(`UPDATE user_unfreeze_actions SET
+          status=CASE WHEN status='executing' THEN 'execution_unknown' ELSE 'expired' END,
+          result_code=CASE WHEN status='executing' THEN 'migration_interrupted' ELSE 'migration_expired' END,
+          safe_summary='迁移时终止了未完成的解冻审批',completed_at=?,updated_at=?
+          WHERE status IN ('awaiting_confirmation_delivery','pending_confirmation','executing')`).run(
+          new Date().toISOString(), new Date().toISOString(),
+        )
         portable.prepare("UPDATE support_message_events SET account_id=NULL").run()
         portable.prepare("UPDATE support_message_attachments SET storage_path=''").run()
         portable.prepare("UPDATE admin_chat_attachments SET storage_path=''").run()
@@ -397,15 +332,6 @@ export class BackupService {
   }
 
   async import(source: string): Promise<void> {
-    const normalized = await normalizePortableImportSource(source)
-    try {
-      this.importNormalized(normalized.filePath)
-    } finally {
-      await normalized.cleanup()
-    }
-  }
-
-  private importNormalized(source: string): void {
     const portable = RuntimeDatabase.openPortable(source, true)
     try {
       this.validatePortable(portable)
@@ -436,10 +362,10 @@ export class BackupService {
     let portableHasThreadAnswerPolicy = false
     let portableHasTelegramOutputOwnership = false
     let portableHasTelegramOutgoingCandidates = false
-    let portableHasThreadOutputClaims = false
     let portableHasAdminChatAttachments = false
     let portableHasAdminChatCorrections = false
     let portableHasReplyGenerationAudits = false
+    let portableHasUserUnfreezeActions = false
     let portableHasThreadLinks = false
     let portableHasSenderFocus = false
     let portableHasDailyGroupShutdownSchedule = false
@@ -537,9 +463,6 @@ export class BackupService {
       portableHasTelegramOutgoingCandidates = Boolean(portableStructure.prepare(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='telegram_outgoing_candidates'",
       ).get())
-      portableHasThreadOutputClaims = Boolean(portableStructure.prepare(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='support_thread_output_claims'",
-      ).get())
       portableHasAdminChatAttachments = Boolean(portableStructure.prepare(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='admin_chat_attachments'",
       ).get())
@@ -549,6 +472,12 @@ export class BackupService {
       portableHasReplyGenerationAudits = Boolean(portableStructure.prepare(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='reply_generation_audits'",
       ).get())
+      const portableUnfreezeActionColumns = Boolean(portableStructure.prepare(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='user_unfreeze_actions'",
+      ).get()) ? (portableStructure.prepare("PRAGMA table_info(user_unfreeze_actions)").all() as Array<{ name: string }>)
+        .map((column) => column.name) : []
+      portableHasUserUnfreezeActions = ["sys_user_id", "resource_fingerprint", "preflight_checked_at"]
+        .every((column) => portableUnfreezeActionColumns.includes(column))
       portableHasThreadLinks = Boolean(portableStructure.prepare(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='support_thread_links'",
       ).get())
@@ -794,7 +723,7 @@ export class BackupService {
             created_at,expires_at,resolved_at,updated_at`)
         }
         copy("support_message_attachments", "id,message_event_id,file_name,mime_type,file_size,kind,storage_path,extracted_text,created_at")
-        copy("support_thread_notifications", "id,thread_id,input_revision,kind,status,due_at,telegram_message_id,outbound_text,error_message,created_at,updated_at")
+        copy("support_thread_notifications", "id,thread_id,input_revision,kind,status,due_at,telegram_message_id,error_message,created_at,updated_at")
         copy("directives", "id,title,content,scope,source,priority,enabled,created_at,disabled_at", undefined, "WHERE source='human'")
         localSystemDirectives.forEach((directive) => this.database.insertDirective(directive))
         copy("memory_facts", "id,topic_key,title,current_version_id,created_at", "id,topic_key,title,NULL,created_at")
@@ -809,6 +738,13 @@ export class BackupService {
           project_id,service_id,telegram_message_id,telegram_reply_message_id,service,decision,status,sender_user_id,sender_username,sender_display_name,sender_role,service_source,code_revision,
           ${portableHasServiceCodeTables ? "code_snapshot_id,code_sync_batch_id" : "NULL,NULL"},${portableHasOperatorDeliveryStatus ? "operator_delivery_status" : "NULL"},created_at,updated_at,generation_started_at,heartbeat_at,duration_ms,error_code,decision_reason,decision_confidence,corrected_at`)
         copy("support_reply_payloads", "reply_id,question,answer,quote_text,has_attachment")
+        if (portableHasUserUnfreezeActions) {
+          copy("user_unfreeze_actions", `id,thread_id,input_revision,group_id,project_id,service_id,server_resource_id,database_resource_id,
+            request_message_event_id,confirmation_reply_id,username,sys_user_id,resource_fingerprint,preflight_checked_at,
+            status,confirmation_telegram_message_id,
+            confirmer_message_event_id,confirmer_user_id,confirmer_username,expires_at,execution_started_at,
+            completed_at,before_status,after_status,affected_rows,result_code,safe_summary,created_at,updated_at`)
+        }
         if (portableHasShadowLearning) {
           copy("shadow_answer_results", `id,reply_id,thread_id,input_revision,outcome_status,decision,answer,quote_text,
             reason,confidence,code_revision,memory_version_refs_json,simulated_action,output_redacted,error_code,created_at,updated_at`)
@@ -835,10 +771,6 @@ export class BackupService {
         if (portableHasReplyAlertDeliveries) {
           copy("support_reply_alert_deliveries", "reply_id,alert_kind,status,created_at,updated_at",
             "reply_id,alert_kind,CASE WHEN status='sending' THEN 'uncertain' ELSE status END,created_at,updated_at")
-        }
-        if (portableHasThreadOutputClaims) {
-          copy("support_thread_output_claims", `thread_id,claim_kind,source_kind,reply_id,notification_id,
-            created_at,updated_at`)
         }
         if (portableHasTelegramOutputOwnership) {
           copy("telegram_output_ownership", `id,account_id,delivery_group_id,telegram_chat_id,telegram_message_id,
@@ -904,7 +836,7 @@ export class BackupService {
     const integrity = portable.prepare("PRAGMA integrity_check").all() as Array<{ integrity_check: string }>
     if (integrity.length !== 1 || integrity[0]?.integrity_check !== "ok") throw new Error("迁移数据库完整性检查失败")
     const schemaVersion = portable.schemaVersion()
-    if (![12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34].includes(schemaVersion)) {
+    if (![12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38].includes(schemaVersion)) {
       throw new Error("迁移数据库版本不兼容")
     }
     const existing = new Set((portable.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>).map((row) => row.name))
@@ -925,13 +857,13 @@ export class BackupService {
       && table !== "support_reply_alert_deliveries"
       && !(schemaVersion <= 21 && table === "telegram_output_ownership")
       && !(schemaVersion <= 21 && table === "telegram_outgoing_candidates")
-      && !(schemaVersion <= 32 && table === "support_thread_output_claims")
       && !(schemaVersion <= 16 && (table === "operator_style_versions" || table === "operator_style_version_evidence"))
       && !(schemaVersion <= 24 && (
         table === "support_thread_links" || table === "support_sender_focus" || table === "support_route_clarifications"
       ))
       && !(schemaVersion <= 25 && table === "daily_group_shutdown_schedule")
       && !(schemaVersion <= 28 && ["shadow_answer_results", "shadow_human_answer_links", "shadow_learning_reports", "shadow_comparisons"].includes(table))
+      && !(schemaVersion <= 37 && table === "user_unfreeze_actions")
       && !(modelLineage === "legacy" && portableModelTables.includes(table as (typeof portableModelTables)[number]))
       && !existing.has(table)
     ))) throw new Error("迁移数据库结构不完整")
@@ -943,11 +875,6 @@ export class BackupService {
     if (hasTelegramOutputOwnership) {
       assertTelegramOutputOwnershipRows(portable.connection)
     }
-    const hasThreadOutputClaims = existing.has("support_thread_output_claims")
-    if (schemaVersion >= 33 && !hasThreadOutputClaims) {
-      throw new Error("迁移数据库线程语义输出所有权结构不完整")
-    }
-    if (hasThreadOutputClaims) assertSupportThreadOutputClaimStructure(portable.connection)
     const hasLearningObservations = existing.has("learning_source_observations")
     const observationColumns = hasLearningObservations
       ? (portable.prepare("PRAGMA table_info(learning_source_observations)").all() as Array<{ name: string }>).map((column) => column.name)

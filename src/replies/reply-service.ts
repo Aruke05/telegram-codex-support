@@ -5,7 +5,6 @@ import { z } from "zod"
 import type { RuntimeDatabase } from "../runtime/database.js"
 import type { ReplyRecord, ReplyStatus } from "../runtime/types.js"
 import type { ConfiguredSecretRedactor } from "../security/dlp.js"
-import { SupportThreadStore, type ThreadOutputClaimSource } from "../support/thread-store.js"
 import type { ReplyEventBus } from "./reply-event-bus.js"
 
 const pendingInputSchema = z.object({
@@ -27,7 +26,6 @@ const pendingInputSchema = z.object({
 
 const workStatuses: ReplyStatus[] = ["pending", "queued", "generating", "sending", "failed"]
 const terminalStatuses = new Set<ReplyStatus>(["replied", "ignored", "escalated", "failed", "corrected", "superseded"])
-const hardDeadlineErrorCode = "answer_hard_deadline"
 const allowedTransitions: Record<ReplyStatus, ReplyStatus[]> = {
   pending: ["queued", "generating", "ignored", "escalated", "failed"],
   queued: ["generating", "ignored", "escalated", "failed"],
@@ -92,16 +90,11 @@ function decodeCursor(value: string): { createdAt: string; id: string } {
 }
 
 export class ReplyService {
-  private readonly threadStore: SupportThreadStore
-
   constructor(
     private readonly database: RuntimeDatabase,
     private readonly events: ReplyEventBus,
     private readonly redactor: ConfiguredSecretRedactor,
-    threadStore?: SupportThreadStore,
-  ) {
-    this.threadStore = threadStore ?? new SupportThreadStore(database, redactor)
-  }
+  ) {}
 
   createPending(input: unknown): ReplyRecord {
     const parsed = pendingInputSchema.parse(input)
@@ -180,8 +173,7 @@ export class ReplyService {
       const result = this.database.prepare(`UPDATE support_replies SET
         status='sending',telegram_reply_message_id=?,code_revision=?,code_snapshot_id=?,code_sync_batch_id=?,
         operator_delivery_status='sending',updated_at=?,error_code=?,decision_reason=?,decision_confidence=?
-        WHERE id=? AND status='generating'
-          AND (COALESCE(error_code,'')<>? OR ?=1) AND EXISTS (
+        WHERE id=? AND status='generating' AND EXISTS (
           SELECT 1 FROM support_threads t
           WHERE t.id=support_replies.thread_id AND t.status='generating' AND t.revision=support_replies.input_revision
         )`).run(
@@ -194,8 +186,6 @@ export class ReplyService {
         metadata.decisionReason === undefined ? found.decisionReason : metadata.decisionReason,
         metadata.decisionConfidence === undefined ? found.decisionConfidence : metadata.decisionConfidence,
         id,
-        hardDeadlineErrorCode,
-        Number(found.errorCode === hardDeadlineErrorCode && metadata.errorCode === hardDeadlineErrorCode),
       )
       if (Number(result.changes) !== 1) return
       claimed = true
@@ -307,15 +297,11 @@ export class ReplyService {
       ) SELECT r.id,?,'sending',?,? FROM support_replies r
         JOIN support_threads t ON t.id=r.thread_id
         WHERE r.id=? AND r.status IN ('generating','sending','replied','escalated','failed')
-          AND (?<>'escalation' OR EXISTS(
-            SELECT 1 FROM support_thread_output_claims claim
-            WHERE claim.thread_id=r.thread_id AND claim.claim_kind='handoff' AND claim.reply_id=r.id
-          ))
           AND (
             (t.status='generating' AND t.revision=r.input_revision)
-            OR (?='support_delivery_failure' AND r.status='failed'
+            OR (?='support_delivery_failure' AND r.status='failed' AND r.decision='escalate'
               AND t.status='escalated' AND t.revision=r.input_revision)
-          )`).run(kind, now, now, id, kind, kind)
+          )`).run(kind, now, now, id, kind)
       return Number(result.changes) === 1
     })
   }
@@ -326,11 +312,7 @@ export class ReplyService {
     return Number(result.changes) === 1
   }
 
-  prepareTechnicalEscalation(
-    id: string,
-    metadata: ReplyTransitionMetadata,
-    source: ThreadOutputClaimSource,
-  ): ReplyRecord | null {
+  prepareTechnicalEscalation(id: string, metadata: ReplyTransitionMetadata): ReplyRecord | null {
     const found = this.getDetail(id)
     const answer = metadata.answer
     const decisionReason = metadata.decisionReason
@@ -338,17 +320,9 @@ export class ReplyService {
     const now = new Date().toISOString()
     let prepared = false
     this.database.transaction(() => {
-      const eligible = this.database.prepare(`SELECT 1 FROM support_replies reply
-        JOIN support_threads thread ON thread.id=reply.thread_id
-        WHERE reply.id=? AND reply.status='generating' AND COALESCE(reply.error_code,'')<>?
-          AND thread.status='generating' AND thread.revision=reply.input_revision`).get(
-        id,
-        hardDeadlineErrorCode,
-      )
-      if (!eligible || !this.threadStore.claimHandoff(id, source, now)) return
       const result = this.database.prepare(`UPDATE support_replies SET
         decision='escalate',code_revision=?,updated_at=?,error_code=?,decision_reason=?,decision_confidence=?
-        WHERE id=? AND status='generating' AND COALESCE(error_code,'')<>? AND EXISTS (
+        WHERE id=? AND status='generating' AND EXISTS (
           SELECT 1 FROM support_threads t WHERE t.id=support_replies.thread_id
             AND t.status='generating' AND t.revision=support_replies.input_revision
         )`).run(
@@ -357,9 +331,9 @@ export class ReplyService {
         metadata.errorCode === undefined ? found.errorCode : metadata.errorCode,
         decisionReason,
         metadata.decisionConfidence === undefined ? found.decisionConfidence : metadata.decisionConfidence,
-        id, hardDeadlineErrorCode,
+        id,
       )
-      if (Number(result.changes) !== 1) throw new Error("技术升级准备时问题版本已变化")
+      if (Number(result.changes) !== 1) return
       prepared = true
       this.database.prepare("UPDATE support_reply_payloads SET answer=?,quote_text=NULL WHERE reply_id=?").run(
         this.redactor.assertSafeOutbound(answer).safeText,
@@ -379,38 +353,24 @@ export class ReplyService {
       JOIN support_reply_payloads payload ON payload.reply_id=r.id
       WHERE r.thread_id=? AND r.input_revision=? AND r.status='generating' AND r.decision='escalate'
         AND length(trim(payload.answer))>0
-        AND EXISTS(SELECT 1 FROM support_thread_output_claims claim
-          WHERE claim.thread_id=r.thread_id AND claim.claim_kind='handoff' AND claim.reply_id=r.id)
+        AND (
+          r.decision_reason LIKE '%技术告警：发送中'
+          OR EXISTS(SELECT 1 FROM support_reply_alert_deliveries delivery
+            WHERE delivery.reply_id=r.id AND delivery.alert_kind='escalation'
+              AND delivery.status IN ('sent','not_configured','failed','uncertain'))
+        )
       ORDER BY r.created_at DESC,r.id DESC LIMIT 1`).get(threadId, inputRevision) as { id?: unknown } | undefined
     return typeof row?.id === "string" ? this.getDetail(row.id) : null
-  }
-
-  replacePreparedTechnicalEscalationAnswer(
-    id: string,
-    expectedAnswer: string,
-    answer: string,
-  ): ReplyRecord | null {
-    const safeAnswer = this.redactor.assertSafeOutbound(answer).safeText.trim()
-    if (!safeAnswer) return null
-    const result = this.database.prepare(`UPDATE support_reply_payloads SET answer=?
-      WHERE reply_id=? AND answer=? AND EXISTS(
-        SELECT 1 FROM support_replies reply
-        JOIN support_threads thread ON thread.id=reply.thread_id
-        JOIN support_thread_output_claims claim ON claim.thread_id=reply.thread_id
-          AND claim.claim_kind='handoff' AND claim.reply_id=reply.id
-        WHERE reply.id=support_reply_payloads.reply_id AND reply.status='generating'
-          AND reply.decision='escalate' AND thread.status='generating'
-          AND thread.revision=reply.input_revision
-      )`).run(safeAnswer, id, expectedAnswer)
-    return Number(result.changes) === 1 ? this.getDetail(id) : null
   }
 
   findPendingEscalationDeliveryFailure(): ReplyRecord | null {
       const row = this.database.prepare(`SELECT r.id FROM support_replies r
       JOIN support_threads thread ON thread.id=r.thread_id
-      WHERE r.status='failed' AND thread.status='escalated'
+      WHERE r.status='failed' AND r.decision='escalate' AND thread.status='escalated'
         AND thread.answer_operation_mode='live'
         AND r.operator_delivery_status IN ('failed','uncertain')
+        AND EXISTS(SELECT 1 FROM support_reply_alert_deliveries delivery
+          WHERE delivery.reply_id=r.id AND delivery.alert_kind='escalation')
         AND NOT EXISTS(SELECT 1 FROM support_reply_alert_deliveries delivery
           WHERE delivery.reply_id=r.id AND delivery.alert_kind='support_delivery_failure')
       ORDER BY r.updated_at,r.id LIMIT 1`).get() as { id?: unknown } | undefined

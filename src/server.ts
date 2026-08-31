@@ -45,11 +45,10 @@ import { SupportMessageProcessor } from "./support/message-processor.js"
 import { SupportThreadCoordinator } from "./support/thread-coordinator.js"
 import { CodexSupportThreadRouter } from "./support/thread-router.js"
 import { SupportThreadStore } from "./support/thread-store.js"
-import { operatorCopy } from "./support/operator-copy.js"
-import { humanizeOperatorAnswer } from "./support/operator-voice.js"
 import { LearningSourceObserver } from "./support/learning-source-observer.js"
 import { LearningSourceStore } from "./support/learning-source-store.js"
 import { TechnicalAlertService } from "./support/technical-alert-service.js"
+import { UserUnfreezeService } from "./support/user-unfreeze-service.js"
 import { SupportThreadLifecycleService } from "./support/thread-lifecycle-service.js"
 import { SupportThreadQueryService } from "./support/thread-query-service.js"
 import { CodexMemoryLearningAgent } from "./learning/agent.js"
@@ -164,6 +163,14 @@ const codeSnapshotRetentionService = new CodeSnapshotRetentionService(
   resolve(env.dataDir, "runtime"),
 )
 const supportCorrectionService = new SupportCorrectionService(runtimeDatabase, memoryAuthoringService, telegramTransport)
+const supportResourceWorkspace = new ResourceWorkspace(runtimeDatabase)
+const userUnfreezeService = new UserUnfreezeService({
+  database: runtimeDatabase,
+  replies: replyService,
+  redactor: configuredSecretRedactor,
+  transport: telegramTransport,
+  resourceWorkspace: supportResourceWorkspace,
+})
 const supportAnswerWorker = new SupportAnswerWorker({
   database: runtimeDatabase,
   store: supportThreadStore,
@@ -176,8 +183,9 @@ const supportAnswerWorker = new SupportAnswerWorker({
   transport: telegramTransport,
   technicalAlerts: technicalAlertService,
   learning: memoryLearningWorker,
-  resourceWorkspace: new ResourceWorkspace(runtimeDatabase),
+  resourceWorkspace: supportResourceWorkspace,
   resourceBroker: readonlyResourceBroker,
+  userUnfreeze: userUnfreezeService,
 })
 const adminChatStore = new AdminChatStore(runtimeDatabase)
 const supportInvestigationService = new SupportInvestigationService({
@@ -222,10 +230,7 @@ supportThreadCoordinator = new SupportThreadCoordinator({
   store: supportThreadStore,
   router: new CodexSupportThreadRouter(codexExecutor),
   batchWindowMs: () => modelConfigService.getSettings().messageDebounceMs,
-  wake: () => {
-    supportAnswerWorker.wake()
-    supportDeadlineService.wake()
-  },
+  wake: () => supportAnswerWorker.wake(),
   cancelStale: () => { supportAnswerWorker.cancelClosed() },
   sendHelp: async (group, text, replyToMessageId) => {
     await telegramTransport.sendMessage(
@@ -245,6 +250,7 @@ supportThreadCoordinator = new SupportThreadCoordinator({
     undefined,
     { groupId: group.id, serviceId: group.serviceId, kind: "presence_reply" },
   ),
+  userUnfreeze: userUnfreezeService,
   sendRouteClarification: async ({ group, service, event, clarification, text }) => {
     const activeGroup = runtimeDatabase.readGroups().find((candidate) => (
       candidate.id === group.id && candidate.enabled && candidate.telegramChatId
@@ -311,32 +317,54 @@ supportThreadCoordinator = new SupportThreadCoordinator({
       throw error
     }
   },
-  sendStatusUpdate: async ({ group, service, thread, event, notification }) => {
-    const sending = supportThreadStore.claimNotificationSending(notification.id)
-    if (!sending) return
+  sendStatusUpdate: async ({ group, service, thread, event, text }) => {
+    const outbound = configuredSecretRedactor.assertSafeOutbound(text)
+    if (!outbound.allowed || outbound.safeText !== text) throw new Error("催促进度回复未通过发送前安全校验")
+    const pending = replyService.createPending({
+      threadId: thread.id,
+      inputRevision: thread.revision,
+      groupId: group.id,
+      accountId: group.accountId,
+      projectId: service.projectId,
+      serviceId: service.id,
+      telegramMessageId: event.telegramMessageId,
+      senderUserId: event.senderUserId,
+      senderUsername: event.senderUsername,
+      senderDisplayName: event.senderDisplayName,
+      senderRole: event.senderRole,
+      service: service.key,
+      serviceSource: "group_binding",
+      question: event.safeText || event.attachmentSummary,
+    })
+    replyService.transition(pending.id, "generating")
+    const sending = replyService.claimSideMessageSending(pending.id, {
+      answer: text,
+      decisionReason: "运营仅询问当前排查进度，路由模型生成当班客服进度回复，原排查继续运行",
+      decisionConfidence: 1,
+    })
+    if (!sending) throw new Error("催促进度回复无法进入发送状态")
     try {
-      const text = humanizeOperatorAnswer(operatorCopy.progress, "", thread.operatorStyleProfile)
-      const outbound = configuredSecretRedactor.assertSafeOutbound(text)
-      if (!outbound.allowed || outbound.safeText !== text) throw new Error("催促进度回复未通过发送前安全校验")
       const telegramMessageId = await telegramTransport.sendMessage(
         group.accountId,
         group.telegramChatId!,
         text,
         event.telegramMessageId,
         undefined,
-        { groupId: group.id, threadId: thread.id, serviceId: service.id, notificationId: sending.id, kind: "progress" },
+        { groupId: group.id, threadId: thread.id, serviceId: service.id, replyId: pending.id, kind: "progress" },
       )
-      supportThreadStore.completeNotification(sending.id, telegramMessageId, text)
+      replyService.transition(pending.id, "replied", { telegramReplyMessageId: telegramMessageId })
       if (event.senderUserId) supportThreadStore.setSenderFocusAfterDeliveredReply(
         thread.id, event.senderUserId, telegramMessageId,
       )
+      return { replyId: pending.id }
     } catch (error) {
-      if (error instanceof TelegramDeliveryError && error.state === "uncertain") {
-        supportThreadStore.markNotificationUnknown(sending.id, error.message)
-      } else {
-        supportThreadStore.failNotification(sending.id, "催促进度回复发送失败")
-        supportThreadStore.releaseFailedProgressClaim(sending.id)
-      }
+      replyService.transition(pending.id, "failed", {
+        errorCode: "support_status_update_failed",
+        decisionReason: "催促进度回复发送失败，原排查继续运行",
+        operatorDeliveryStatus: error instanceof TelegramDeliveryError && error.state === "uncertain"
+          ? "uncertain"
+          : "failed",
+      })
       throw error
     }
   },

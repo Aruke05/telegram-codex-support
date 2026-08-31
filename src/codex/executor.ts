@@ -426,9 +426,7 @@ export function buildCodexArgs(invocation: CodexInvocation, schemaFile: string, 
     "-c", "shell_environment_policy.ignore_default_excludes=false",
     "-c", `shell_environment_policy.set.PATH=${JSON.stringify(commandPath)}`,
     "-c", `shell_environment_policy.set.HOME=${JSON.stringify(invocation.cwd)}`,
-    ...(referenceClassifier || shadowReport
-      ? []
-      : (invocation.imagePaths ?? []).flatMap((imagePath) => ["--image", imagePath])),
+    ...(strictProfile ? [] : (invocation.imagePaths ?? []).flatMap((imagePath) => ["--image", imagePath])),
     "--output-schema", schemaFile, "--output-last-message", outputFile, "-C", invocation.cwd, "-m", invocation.model,
     "-c", `model_reasoning_effort=${JSON.stringify(invocation.reasoningEffort)}`,
     ...(invocation.serviceTier === "fast" ? ["-c", "service_tier=\"fast\""] : []),

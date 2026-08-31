@@ -3,130 +3,25 @@ import { fileURLToPath } from "node:url"
 
 import { describe, expect, it } from "vitest"
 
-import {
-  answerDecisionModelSchema,
-  compatibleAnswerDecisionSchema,
-  evidenceFactSchema,
-} from "../../src/codex/schemas.js"
+import { answerDecisionSchema, evidenceFactSchema } from "../../src/codex/schemas.js"
 import { systemDirectivesPrompt } from "../../src/support/system-directives.js"
 
 const base = {
-  humanOperation: null,
   answer: "已经通知技术同事处理",
   quote: null,
   reason: "已确认需要技术处理",
   confidence: 1,
   usedMemoryVersionIds: [],
-  answerClaims: [{
-    factId: "F1" as const,
-    statement: "当前已发布前后端代码明确了业务角色的处理入口和权限",
-    provenance: "code" as const,
-    evidenceSource: "code" as const,
-    evidence: "当前已发布前后端代码与角色权限",
-  }],
-  responsibility: {
-    party: "not_applicable" as const,
-    certainty: "not_applicable" as const,
-    evidenceSources: [],
-    factIds: [],
-  },
-  interaction: {
-    sentiment: "neutral" as const,
-    situation: "new_request" as const,
-    underlyingNeed: "根据当前接口入口和角色权限确认处理路径",
-    responseStrategy: "direct_answer" as const,
-  },
   investigation: {
     summary: "已完成排查",
-    steps: [
-      {
-        source: "message" as const,
-        title: "读取问题",
-        status: "confirmed" as const,
-        evidence: "运营原消息",
-        conclusion: "已理解当前诉求",
-      },
-      {
-        source: "code" as const,
-        title: "核对接口入口和角色权限",
-        status: "confirmed" as const,
-        evidence: "当前已发布前后端代码与角色权限",
-        conclusion: "已确认具备对应处理入口的业务角色",
-      },
-    ],
-  },
-  evidencePacket: {
-    version: "2" as const,
-    communication: {
-      intent: "direct_answer" as const,
-      recipient: null,
-      desiredOutcome: "说明当前接口入口和业务角色处理路径",
-    },
-    facts: [{
-      id: "F1" as const,
-      statement: "当前已发布前后端代码明确了业务角色的处理入口和权限",
-      provenance: "code" as const,
-      evidenceSource: "code" as const,
-      evidence: "当前已发布前后端代码与角色权限",
-      certainty: "confirmed" as const,
-      outboundSafe: true,
-      subjectKind: "general" as const,
-      businessType: "not_applicable" as const,
-      identifiers: [],
-      associationId: null,
-      dependsOnFactIds: [],
+    steps: [{
+      source: "message" as const,
+      title: "读取问题",
+      status: "confirmed" as const,
+      evidence: "运营原消息",
+      conclusion: "已理解当前诉求",
     }],
-    associations: [],
-    requiredAnswerPoints: ["说明当前处理入口和角色权限"],
-    unknowns: [],
-    handlingNotes: [],
-    reviewLevel: "standard" as const,
   },
-}
-
-function evidenceForAnswer({
-  statement,
-  evidence,
-  provenance,
-  evidenceSource,
-  intent = "direct_answer",
-  desiredOutcome = "说明当前接口入口和业务角色处理路径",
-}: {
-  statement: string
-  evidence: string
-  provenance: "code" | "runtime"
-  evidenceSource: "code" | "database"
-  intent?: "direct_answer" | "handoff"
-  desiredOutcome?: string
-}) {
-  const fact = {
-    ...base.evidencePacket.facts[0],
-    statement,
-    provenance,
-    evidenceSource,
-    evidence,
-  }
-  return {
-    answerClaims: [{ factId: "F1" as const, statement, provenance, evidenceSource, evidence }],
-    investigation: {
-      ...base.investigation,
-      steps: [
-        ...base.investigation.steps,
-        {
-          source: evidenceSource,
-          title: "核对当前处理事实",
-          status: "confirmed" as const,
-          evidence,
-          conclusion: statement,
-        },
-      ],
-    },
-    evidencePacket: {
-      ...base.evidencePacket,
-      communication: { intent, recipient: null, desiredOutcome },
-      facts: [fact],
-    },
-  }
 }
 
 const operatorSelfServiceCases = [
@@ -136,7 +31,6 @@ const operatorSelfServiceCases = [
     runtimeFact: "商户代收开关为关闭，未生成订单",
     menu: ["【商户列表】", "【代收开关】"],
     answer: "已确认是商户代收开关关闭，所以这次没有生成订单。运营在【商户列表】打开【代收开关】并完成动态验证码后，再让前端重新拉起即可。",
-    factStatement: "已确认是商户代收开关关闭，所以这次没有生成订单。",
   },
   {
     scenario: "下单接口命中商户接口白名单",
@@ -144,7 +38,6 @@ const operatorSelfServiceCases = [
     runtimeFact: "实际出口 IP 不在该商户接口白名单，未生成订单",
     menu: ["【商户列表】", "【接口白名单】"],
     answer: "已确认这次请求的出口 IP 不在商户接口白名单，所以没有生成订单。运营在【商户列表】打开【接口白名单】，加入已确认的出口 IP 并保存后，让商户重试即可。",
-    factStatement: "已确认这次请求的出口 IP 不在商户接口白名单，所以没有生成订单。",
   },
   {
     scenario: "商户没有加入商户分组",
@@ -152,7 +45,6 @@ const operatorSelfServiceCases = [
     runtimeFact: "商户当前没有所属分组，分组路由无法生效",
     menu: ["【商户分组】"],
     answer: "已确认这个商户当前没有加入任何商户分组，所以分组路由没有生效。运营在【商户分组】把该商户加入对应分组并保存后，再重新发起即可。",
-    factStatement: "已确认这个商户当前没有加入任何商户分组，所以分组路由没有生效。",
   },
   {
     scenario: "商户通道配置缺少可用通道",
@@ -160,7 +52,6 @@ const operatorSelfServiceCases = [
     runtimeFact: "商户通道配置中没有符合当前业务条件的启用通道",
     menu: ["【商户通道配置】"],
     answer: "已确认该商户当前没有符合条件的启用通道，所以请求无法继续。运营在【商户通道配置】补充或启用对应通道并保存后，再重新发起即可。",
-    factStatement: "已确认该商户当前没有符合条件的启用通道，所以请求无法继续。",
   },
   {
     scenario: "通道管理中的现有通道被停用",
@@ -168,7 +59,6 @@ const operatorSelfServiceCases = [
     runtimeFact: "通道管理中该通道处于停用状态",
     menu: ["【通道管理】"],
     answer: "已确认该通道目前处于停用状态，所以没有参与派发。运营在【通道管理】确认业务条件后启用该通道并保存，后续新请求才会参与选择。",
-    factStatement: "已确认该通道目前处于停用状态，所以没有参与派发。",
   },
 ] as const
 
@@ -178,26 +68,18 @@ describe("技术升级由模型语义和通用记忆判断", () => {
     runtimeFact,
     menu,
     answer,
-    factStatement,
   }) => {
     expect(question).toBeTruthy()
     expect(runtimeFact).toBeTruthy()
     menu.forEach((item) => expect(answer).toContain(item))
     expect(answer).not.toContain("通知技术")
-    const parsed = answerDecisionModelSchema.safeParse({
+    expect(answerDecisionSchema.safeParse({
       ...base,
-      ...evidenceForAnswer({
-        statement: factStatement,
-        evidence: runtimeFact,
-        provenance: "runtime",
-        evidenceSource: "database",
-      }),
       decision: "reply",
       escalationType: "none",
       answer,
       reason: `当前代码和生产配置确认：${runtimeFact}；当前发布前后端存在运营操作入口。`,
-    })
-    expect(parsed.success, parsed.success ? undefined : JSON.stringify(parsed.error.issues, null, 2)).toBe(true)
+    }).success).toBe(true)
 
     const prompt = systemDirectivesPrompt()
     expect(prompt).toContain("页面实际调用的查询 导出 新增 修改 启停 审批 重试 派发和账号操作接口")
@@ -218,38 +100,27 @@ describe("技术升级由模型语义和通用记忆判断", () => {
   it("没有运营入口和权限且必须内部写入时仍允许技术升级", () => {
     const prompt = systemDirectivesPrompt()
     expect(prompt).toContain("已排除运营及其他授权业务角色通过现有功能处理")
-    const answer = "已确认这项配置没有运营后台入口。需要技术修改内部服务配置，已经通知技术同事处理。"
-    const parsed = answerDecisionModelSchema.safeParse({
+    expect(answerDecisionSchema.safeParse({
       ...base,
-      ...evidenceForAnswer({
-        statement: "已确认这项配置没有运营后台入口。",
-        evidence: "当前已发布前后端代码没有业务角色操作入口",
-        provenance: "code",
-        evidenceSource: "code",
-        intent: "handoff",
-        desiredOutcome: "通知技术修改内部服务配置",
-      }),
       decision: "escalate",
       escalationType: "technical_change",
-      answer,
+      answer: "已确认这项配置没有运营后台入口，需要技术修改内部服务配置，已经通知技术同事处理。",
       reason: "[已确认技术处理] 类型=生产配置\n当前代码和运行数据已确认唯一根源；前后端没有运营操作入口，运营角色也没有对应写权限。",
-      responsibility: { party: "our_side", certainty: "confirmed", evidenceSources: ["code"], factIds: ["F1"] },
-    })
-    expect(parsed.success, parsed.success ? undefined : JSON.stringify(parsed.error.issues, null, 2)).toBe(true)
+    }).success).toBe(true)
   })
 
   it("结构协议只保证升级类型与决定一致", () => {
-    expect(compatibleAnswerDecisionSchema.safeParse({
+    expect(answerDecisionSchema.safeParse({
       ...base,
       decision: "escalate",
       escalationType: "technical_change",
     }).success).toBe(true)
-    expect(compatibleAnswerDecisionSchema.safeParse({
+    expect(answerDecisionSchema.safeParse({
       ...base,
       decision: "reply",
       escalationType: "technical_change",
     }).success).toBe(false)
-    expect(compatibleAnswerDecisionSchema.safeParse({
+    expect(answerDecisionSchema.safeParse({
       ...base,
       decision: "escalate",
       escalationType: "none",
@@ -257,13 +128,13 @@ describe("技术升级由模型语义和通用记忆判断", () => {
   })
 
   it("专人操作只做结构完整性校验", () => {
-    expect(compatibleAnswerDecisionSchema.safeParse({
+    expect(answerDecisionSchema.safeParse({
       ...base,
       decision: "escalate",
       escalationType: "human_operation",
       humanOperation: { action: "解冻账号", identifiers: ["merchant-1001"] },
     }).success).toBe(true)
-    expect(compatibleAnswerDecisionSchema.safeParse({
+    expect(answerDecisionSchema.safeParse({
       ...base,
       decision: "escalate",
       escalationType: "human_operation",
@@ -281,13 +152,13 @@ describe("技术升级由模型语义和通用记忆判断", () => {
       handlingNotes: [],
       reviewLevel: "standard" as const,
     }
-    expect(compatibleAnswerDecisionSchema.safeParse({
+    expect(answerDecisionSchema.safeParse({
       ...base,
       decision: "ignore",
       escalationType: "none",
       evidencePacket,
     }).success).toBe(true)
-    expect(compatibleAnswerDecisionSchema.safeParse({
+    expect(answerDecisionSchema.safeParse({
       ...base,
       decision: "reply",
       escalationType: "none",
@@ -306,11 +177,6 @@ describe("技术升级由模型语义和通用记忆判断", () => {
       evidenceSource: "inference" as const,
       evidence: "基于前述证据推断",
       outboundSafe: true,
-      subjectKind: "general" as const,
-      businessType: "not_applicable" as const,
-      identifiers: [],
-      associationId: null,
-      dependsOnFactIds: ["F2"],
     }
     expect(evidenceFactSchema.safeParse({ ...baseFact, certainty: "inferred" }).success).toBe(true)
     expect(evidenceFactSchema.safeParse({ ...baseFact, certainty: "confirmed" }).success).toBe(false)

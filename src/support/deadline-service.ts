@@ -1,16 +1,10 @@
 import type { RuntimeDatabase } from "../runtime/database.js"
 import type { ConfiguredSecretRedactor } from "../security/dlp.js"
 import type { TelegramOutputOwnership } from "../telegram/runtime.js"
-import { TelegramDeliveryError } from "../telegram/runtime.js"
 import { operatorCopy } from "./operator-copy.js"
 import { humanizeOperatorAnswer } from "./operator-voice.js"
 import type { SupportAnswerCancellationPort } from "./thread-lifecycle-service.js"
-import type {
-  HumanPriorityClaim,
-  SupportThreadNotification,
-  SupportThreadStore,
-  SupportTimeoutClaim,
-} from "./thread-store.js"
+import type { HumanPriorityClaim, SupportThreadNotification, SupportThreadStore } from "./thread-store.js"
 
 type TransportPort = {
   sendMessage(
@@ -27,9 +21,7 @@ export type SupportDeadlineServiceDependencies = {
   database: RuntimeDatabase
   store: SupportThreadStore
   redactor: ConfiguredSecretRedactor
-  cancellation: SupportAnswerCancellationPort & {
-    resumeHardDeadline(threadId: string, inputRevision: number): Promise<void>
-  }
+  cancellation: SupportAnswerCancellationPort
   transport: TransportPort
 }
 
@@ -70,14 +62,13 @@ export class SupportDeadlineService {
   private readonly active = new Set<Promise<void>>()
   private running = false
   private busy = false
-  private wakePending = false
 
   constructor(private readonly deps: SupportDeadlineServiceDependencies) {}
 
   start(intervalMs = 5_000): void {
     if (this.running) return
-    this.deps.store.recoverInterruptedHumanPriorityClaims()
     this.deps.store.recoverInterruptedNotifications()
+    this.deps.store.recoverInterruptedHumanPriorityClaims()
     this.running = true
     this.timer = setInterval(() => this.wake(), Math.max(250, intervalMs))
     this.timer.unref()
@@ -92,45 +83,19 @@ export class SupportDeadlineService {
   }
 
   wake(): void {
-    if (!this.running) return
-    if (this.busy) {
-      this.wakePending = true
-      return
-    }
+    if (!this.running || this.busy) return
     this.busy = true
-    const task = this.runOnce().finally(() => {
-      this.busy = false
-      if (!this.wakePending) return
-      this.wakePending = false
-      this.wake()
-    })
+    const task = this.runOnce().finally(() => { this.busy = false })
     this.track(task)
   }
 
   async runOnce(now = new Date()): Promise<void> {
     const current = now.toISOString()
     this.deps.cancellation.cancelClosed()
-    const preparedTimeouts: SupportTimeoutClaim[] = []
     for (let index = 0; index < hardDeadlineBatchSize; index += 1) {
       const timeout = this.deps.store.claimDueTimeout(current)
       if (!timeout) break
-      if (timeout.outcome !== "delivery_in_flight") {
-        this.deps.cancellation.cancel(timeout.threadId, timeout.inputRevision)
-      }
-      if (timeout.outcome === "prepared_escalation") preparedTimeouts.push(timeout)
-    }
-    const preparedKeys = new Set(preparedTimeouts.map((claim) => `${claim.threadId}:${claim.inputRevision}`))
-    for (const pending of this.deps.store.listPendingTechnicalAvailabilityReplies(hardDeadlineBatchSize)) {
-      const key = `${pending.threadId}:${pending.inputRevision}`
-      if (preparedKeys.has(key)) continue
-      preparedKeys.add(key)
-      preparedTimeouts.push({
-        threadId: pending.threadId,
-        inputRevision: pending.inputRevision,
-        outcome: "prepared_escalation",
-        replyId: pending.replyId,
-        notificationKinds: [],
-      })
+      this.deps.cancellation.cancel(timeout.threadId, timeout.inputRevision)
     }
     const humanPriority: HumanPriorityClaim[] = []
     for (let index = 0; index < 100; index += 1) {
@@ -140,7 +105,7 @@ export class SupportDeadlineService {
     }
     const progress: SupportThreadNotification[] = []
     for (let index = 0; index < 100; index += 1) {
-      const notification = this.deps.store.claimPendingProgressNotification(current)
+      const notification = this.deps.store.claimDueProgress(current)
       if (!notification) break
       progress.push(notification)
     }
@@ -151,10 +116,6 @@ export class SupportDeadlineService {
       pending.push(notification)
     }
     await Promise.allSettled([
-      eachConcurrent(preparedTimeouts, 4, (claim) => this.deps.cancellation.resumeHardDeadline(
-        claim.threadId,
-        claim.inputRevision,
-      )),
       eachConcurrent(humanPriority, 4, (claim) => this.sendHumanPriorityClaim(claim)),
       eachConcurrent(progress, 4, (notification) => this.sendProgress(notification)),
       eachConcurrent(pending, 4, (notification) => this.sendTimeout(notification)),
@@ -165,7 +126,6 @@ export class SupportDeadlineService {
     try {
       const thread = this.deps.store.getThread(claim.threadId)
       if (thread.answerOperationMode === "learning") {
-        this.failAndReleaseProgress(claim.notificationId, "学习模式禁止 Telegram 输出")
         this.deps.store.completeHumanPriorityClaim(claim, null, "学习模式禁止 Telegram 输出")
         return
       }
@@ -176,16 +136,47 @@ export class SupportDeadlineService {
         | { human_priority_state: string }
         | undefined
       if (state?.human_priority_state !== "sending" || !group?.enabled || !group.telegramChatId) {
-        this.failAndReleaseProgress(claim.notificationId, "问题版本已变化或来源群不可用")
         this.deps.store.completeHumanPriorityClaim(claim, null, "问题版本已变化或来源群不可用")
         return
       }
-      const sending = this.deps.store.claimNotificationSending(claim.notificationId)
-      if (!sending) {
-        this.failAndReleaseProgress(claim.notificationId, "人工优先进度提示未取得发送资格")
-        this.deps.store.completeHumanPriorityClaim(claim, null, "人工优先进度提示未取得发送资格")
+      const replyTargetMessageId = detail.messages.at(-1)?.event.telegramMessageId ?? thread.anchorMessageId
+      const messageId = await withSendTimeout(this.deps.transport.sendMessage(
+        group.accountId,
+        group.telegramChatId,
+        operatorCopy.progress,
+        replyTargetMessageId,
+        undefined,
+        {
+          groupId: group.id,
+          threadId: thread.id,
+          serviceId: thread.serviceId,
+          kind: "mention_claim_progress",
+        },
+      ))
+      this.deps.store.completeHumanPriorityClaim(claim, messageId)
+    } catch (error) {
+      const reason = error instanceof TelegramSendTimeoutError
+        ? error.message
+        : "人工优先等待结束后的稍等提示发送失败"
+      this.deps.store.completeHumanPriorityClaim(claim, null, reason)
+    }
+  }
+
+  private async sendProgress(notification: SupportThreadNotification): Promise<void> {
+    try {
+      const thread = this.deps.store.getThread(notification.threadId)
+      if (thread.answerOperationMode === "learning") {
+        this.deps.store.failNotification(notification.id, "学习模式禁止 Telegram 输出")
         return
       }
+      const detail = this.deps.store.getThreadDetail(thread.id)
+      const group = this.deps.database.readGroups().find((item) => item.id === thread.groupId)
+      if (thread.status !== "generating" || thread.revision !== notification.inputRevision || !group?.enabled || !group.telegramChatId) {
+        this.deps.store.failNotification(notification.id, "问题版本已变化或来源群不可用")
+        return
+      }
+      const sending = this.deps.store.claimNotificationSending(notification.id)
+      if (!sending) return
       const progressText = humanizeOperatorAnswer(operatorCopy.progress, "", thread.operatorStyleProfile)
       const replyTargetMessageId = detail.messages.at(-1)?.event.telegramMessageId ?? thread.anchorMessageId
       const messageId = await withSendTimeout(this.deps.transport.sendMessage(
@@ -199,53 +190,12 @@ export class SupportDeadlineService {
           threadId: thread.id,
           serviceId: thread.serviceId,
           notificationId: sending.id,
-          kind: "mention_claim_progress",
-        },
-      ))
-      this.deps.store.completeNotification(claim.notificationId, messageId, progressText)
-      this.deps.store.completeHumanPriorityClaim(claim, messageId)
-    } catch (error) {
-      const reason = error instanceof TelegramSendTimeoutError
-        ? error.message
-        : "人工优先稍等提示发送失败"
-      this.finishProgressSend(claim.notificationId, error, reason)
-      this.deps.store.completeHumanPriorityClaim(claim, null, reason)
-    }
-  }
-
-  private async sendProgress(notification: SupportThreadNotification): Promise<void> {
-    try {
-      const thread = this.deps.store.getThread(notification.threadId)
-      if (thread.answerOperationMode === "learning") {
-        this.failAndReleaseProgress(notification.id, "学习模式禁止 Telegram 输出")
-        return
-      }
-      const detail = this.deps.store.getThreadDetail(thread.id)
-      const group = this.deps.database.readGroups().find((item) => item.id === thread.groupId)
-      if ((thread.status !== "collecting" && thread.status !== "generating")
-        || thread.revision !== notification.inputRevision || !group?.enabled || !group.telegramChatId) {
-        this.failAndReleaseProgress(notification.id, "问题版本已变化或来源群不可用")
-        return
-      }
-      const progressText = humanizeOperatorAnswer(operatorCopy.progress, "", thread.operatorStyleProfile)
-      const replyTargetMessageId = detail.messages.at(-1)?.event.telegramMessageId ?? thread.anchorMessageId
-      const messageId = await withSendTimeout(this.deps.transport.sendMessage(
-        group.accountId,
-        group.telegramChatId,
-        progressText,
-        replyTargetMessageId,
-        undefined,
-        {
-          groupId: group.id,
-          threadId: thread.id,
-          serviceId: thread.serviceId,
-          notificationId: notification.id,
           kind: "progress",
         },
       ))
-      this.deps.store.completeNotification(notification.id, messageId, progressText)
+      this.deps.store.completeNotification(notification.id, messageId)
     } catch (error) {
-      this.finishProgressSend(notification.id, error, "三分钟进度提示发送失败")
+      this.finishFailedSend(notification.id, error, "三分钟进度提示发送失败")
     }
   }
 
@@ -281,36 +231,21 @@ export class SupportDeadlineService {
             kind: "timeout_operator",
           },
         ))
-        this.deps.store.completeNotification(notification.id, messageId, safe)
+        this.deps.store.completeNotification(notification.id, messageId)
         return
       }
-      this.deps.store.completeNotification(notification.id, null, null)
+      this.deps.store.completeNotification(notification.id, null)
     } catch (error) {
       this.finishFailedSend(notification.id, error, "一小时超时通知发送失败")
     }
   }
 
   private finishFailedSend(notificationId: string, error: unknown, fallback: string): void {
-    if (error instanceof TelegramSendTimeoutError
-      || (error instanceof TelegramDeliveryError && error.state === "uncertain")) {
+    if (error instanceof TelegramSendTimeoutError) {
       this.deps.store.markNotificationUnknown(notificationId, error.message)
       return
     }
     this.deps.store.failNotification(notificationId, fallback)
-  }
-
-  private finishProgressSend(notificationId: string, error: unknown, fallback: string): void {
-    if (error instanceof TelegramSendTimeoutError
-      || (error instanceof TelegramDeliveryError && error.state === "uncertain")) {
-      this.deps.store.markNotificationUnknown(notificationId, error.message)
-      return
-    }
-    this.failAndReleaseProgress(notificationId, fallback)
-  }
-
-  private failAndReleaseProgress(notificationId: string, reason: string): void {
-    this.deps.store.failNotification(notificationId, reason)
-    this.deps.store.releaseFailedProgressClaim(notificationId)
   }
 
   private track(task: Promise<void>): void {

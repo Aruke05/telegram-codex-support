@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 
-import { afterEach, describe, expect, it, vi } from "vitest"
+import { afterEach, describe, expect, it } from "vitest"
 
 import routingReplayJson from "../fixtures/chat-export-2026-08-14-routing-replay.json" with { type: "json" }
 import { threadRouteResultSchema, type ThreadRouteResult } from "../../src/codex/schemas.js"
@@ -13,7 +13,6 @@ import { BackupService } from "../../src/runtime/backup-service.js"
 import { RuntimeDatabase } from "../../src/runtime/database.js"
 import type { ProjectServiceRecord, RuntimeGroup, SupportMessageEvent } from "../../src/runtime/types.js"
 import { ConfiguredSecretRedactor } from "../../src/security/dlp.js"
-import { SupportDeadlineService } from "../../src/support/deadline-service.js"
 import { systemDirectivesPrompt } from "../../src/support/system-directives.js"
 import { SupportThreadCoordinator } from "../../src/support/thread-coordinator.js"
 import { SupportThreadStore } from "../../src/support/thread-store.js"
@@ -67,14 +66,13 @@ function seedCatalog(database: RuntimeDatabase): { group: RuntimeGroup; service:
 async function createHarness() {
   const directory = await mkdtemp(path.join(tmpdir(), "sender-focus-routing-"))
   temporaryDirectories.push(directory)
-  const filePath = path.join(directory, "runtime.sqlite")
-  const database = await RuntimeDatabase.open(filePath)
+  const database = await RuntimeDatabase.open(path.join(directory, "runtime.sqlite"))
   openDatabases.push(database)
   const { group, service } = seedCatalog(database)
   const redactor = new ConfiguredSecretRedactor(database)
   const store = new SupportThreadStore(database, redactor)
   const replies = new ReplyService(database, new ReplyEventBus(), redactor)
-  return { database, filePath, group, service, store, replies }
+  return { database, group, service, store, replies }
 }
 
 function recordQuestion(
@@ -112,7 +110,7 @@ function createFocusedQuestion(
     projectId: harness.service.projectId,
     serviceId: harness.service.id,
     originBatchId: recorded.batchId,
-    settleAt: new Date(Date.parse(recorded.event.createdAt) + 30_000).toISOString(),
+    settleAt: new Date(Date.now() + 30_000).toISOString(),
     anchorMessageId: recorded.event.telegramMessageId,
     latestMessageAt: recorded.event.createdAt,
     summary: recorded.event.safeText,
@@ -214,110 +212,6 @@ describe("sender conversation focus store", () => {
       "30002",
       event.createdAt,
     )).toBeNull()
-  })
-
-  it("原子提交 status-only 关联与进度 claim 后可由重启 deadline 沿同一 notification 发送", async () => {
-    const harness = await createHarness()
-    const question = createFocusedQuestion(harness, {
-      messageId: "status-crash-1", senderUserId: "30001", text: "帮我查这笔订单为什么一直处理中",
-    })
-    startGenerating(harness, question)
-    const current = harness.store.getThread(question.thread.id)
-    const reminder = recordQuestion(harness, {
-      messageId: "status-crash-2",
-      senderUserId: "30001",
-      text: "现在查得怎么样了",
-      createdAt: new Date(Date.parse(question.event.createdAt) + 32_000).toISOString(),
-    }).event
-
-    const committed = harness.store.appendStatusOnlyBatchAndClaimProgress([{
-      message: {
-        threadId: current.id,
-        eventId: reminder.id,
-        relation: "supplement",
-        questionFragment: reminder.safeText,
-        settleAt: current.settleAt,
-        expectedRevision: current.revision,
-      },
-      focus: {
-        senderUserId: reminder.senderUserId,
-        source: "operator_reply",
-        operatorMessageId: reminder.telegramMessageId,
-      },
-    }], reminder.createdAt)
-
-    expect(committed?.notification).toMatchObject({
-      threadId: current.id,
-      inputRevision: current.revision,
-      kind: "progress",
-      status: "pending",
-    })
-    expect(harness.store.findThreadByEvent(reminder.id)?.id).toBe(current.id)
-    expect(harness.store.getEvent(reminder.id)).toMatchObject({
-      routeStatus: "routed",
-      skipReason: "status_only:progress_claim_persisted",
-    })
-
-    const competingReminder = recordQuestion(harness, {
-      messageId: "status-crash-3",
-      senderUserId: "30001",
-      text: "还没好吗",
-      createdAt: new Date(Date.parse(question.event.createdAt) + 33_000).toISOString(),
-    }).event
-    const conflicted = harness.store.appendStatusOnlyBatchAndClaimProgress([{
-      message: {
-        threadId: current.id,
-        eventId: competingReminder.id,
-        relation: "supplement",
-        questionFragment: competingReminder.safeText,
-        settleAt: current.settleAt,
-        expectedRevision: current.revision,
-      },
-      focus: {
-        senderUserId: competingReminder.senderUserId,
-        source: "operator_reply",
-        operatorMessageId: competingReminder.telegramMessageId,
-      },
-    }], competingReminder.createdAt)
-
-    expect(conflicted).toMatchObject({ thread: { id: current.id }, notification: null })
-    expect(harness.store.getEvent(competingReminder.id)).toMatchObject({
-      routeStatus: "routed",
-      skipReason: "status_only:progress_claim_already_owned",
-    })
-    expect(harness.store.hasPendingRoutingEventForThread(current.id)).toBe(false)
-
-    const restartedDatabase = await RuntimeDatabase.open(harness.filePath)
-    openDatabases.push(restartedDatabase)
-    const restartedStore = new SupportThreadStore(
-      restartedDatabase,
-      new ConfiguredSecretRedactor(restartedDatabase),
-    )
-    const sentNotificationIds: string[] = []
-    const deadline = new SupportDeadlineService({
-      database: restartedDatabase,
-      store: restartedStore,
-      redactor: new ConfiguredSecretRedactor(restartedDatabase),
-      cancellation: { cancel: () => false, cancelClosed: () => 0, resumeHardDeadline: async () => undefined },
-      transport: {
-        sendMessage: async (_accountId, _chatId, _text, _replyTo, _quote, ownership) => {
-          sentNotificationIds.push(ownership!.notificationId!)
-          return "status-progress-message"
-        },
-      },
-    })
-
-    await deadline.runOnce(new Date(Date.parse(competingReminder.createdAt) + 1))
-
-    expect(sentNotificationIds).toEqual([committed!.notification!.id])
-    expect(restartedStore.getEvent(reminder.id).routeStatus).toBe("routed")
-    expect(restartedStore.getEvent(competingReminder.id).routeStatus).toBe("routed")
-    expect(restartedStore.hasPendingRoutingEventForThread(current.id)).toBe(false)
-    expect(restartedDatabase.prepare(`SELECT status,telegram_message_id FROM support_thread_notifications
-      WHERE id=?`).get(committed!.notification!.id)).toEqual({
-      status: "sent",
-      telegram_message_id: "status-progress-message",
-    })
   })
 
   it("moves only the same sender focus when an explicit reply appends another thread", async () => {
@@ -433,18 +327,18 @@ describe("sender conversation focus store", () => {
     }).event
     expect(() => harness.store.resolveRouteClarification({
       clarificationId: second.id,
-      answerEventIds: [answer.id],
+      answerEventId: answer.id,
       selectedCandidate: 3,
       settleAt: new Date(Date.now() + 30_000).toISOString(),
     })).toThrow(/候选/u)
 
     const resolved = harness.store.resolveRouteClarification({
       clarificationId: second.id,
-      answerEventIds: [answer.id],
+      answerEventId: answer.id,
       selectedCandidate: 2,
       settleAt: new Date(Date.now() + 30_000).toISOString(),
     })
-    expect(resolved).toMatchObject({ thread: { id: reset.thread.id }, mode: "active" })
+    expect(resolved?.id).toBe(reset.thread.id)
     expect(harness.store.getSenderFocus(
       harness.group.id, harness.service.id, "30001", answer.createdAt,
     )).toMatchObject({ threadId: reset.thread.id, source: "clarification_answer" })
@@ -641,7 +535,7 @@ describe("sender conversation focus store", () => {
 })
 
 describe("bounded sender route model contract", () => {
-  it("催促路由只要求模型判断语义且实际文案由宿主统一生成", async () => {
+  it("催促路由提示要求模型生成真人客服进度解释而不是固定模板", async () => {
     const harness = await createHarness()
     const { event } = recordQuestion(harness, {
       messageId: "570", senderUserId: "30001", text: "现在查得怎么样了",
@@ -652,10 +546,10 @@ describe("bounded sender route model contract", () => {
         prompt = input.prompt
         return {
           action: "follow_up",
-          messageIntent: "progress_request",
           questionFragment: event.safeText,
           issues: null,
           investigationEffect: "status_only",
+          progressReply: "稍等一下，这笔还要把数据库、服务器记录和应用后端日志一起核对完。",
           reason: "只询问进度",
           confidence: 1,
           clarificationReply: null,
@@ -668,15 +562,15 @@ describe("bounded sender route model contract", () => {
       group: harness.group,
       service: harness.service,
       messages: [event],
-      focus: { summary: "查询订单", status: "generating", handoffSource: null, recentMessages: [] },
+      focus: { summary: "查询订单", recentMessages: [] },
       pending: null,
       ambiguity: null,
-      timeline: [],
     })
 
-    expect(prompt).toContain("路由模型只判断是不是状态催促")
-    expect(prompt).toContain("不生成任何进度文案")
-    expect(prompt).toContain("宿主统一发送")
+    expect(prompt).toContain("最高优先级身份要求")
+    expect(prompt).toContain("真实的当班客服")
+    expect(prompt).toContain("数据库、服务器记录和应用后端日志")
+    expect(prompt).toContain("不要照抄固定模板")
     expect(prompt).toContain("不得仅因为它出现在排查期间就臆测成催促进度")
     expect(prompt).toContain("无法确认对方意图时也不得使用 status_only")
     expect(prompt).not.toContain("‘1’等短追问")
@@ -700,10 +594,10 @@ describe("bounded sender route model contract", () => {
         executions.push(input)
         return {
           action: "new_thread",
-          messageIntent: "actionable",
           questionFragment: event.safeText,
           issues: null,
           investigationEffect: "changes_input",
+          progressReply: null,
           reason: "服务器所在地和业务地区都有可靠答案，应一次说明",
           confidence: 1,
           clarificationReply: null,
@@ -731,7 +625,6 @@ describe("bounded sender route model contract", () => {
         latestQuestion: event.safeText,
         candidateLabels: ["服务器所在地", "业务地区"],
       },
-      timeline: [],
     })
 
     expect(executions).toHaveLength(1)
@@ -749,31 +642,22 @@ describe("bounded sender route model contract", () => {
   it("accepts only bounded classifications without a target thread id", () => {
     expect(threadRouteResultSchema.parse({
       action: "follow_up",
-      messageIntent: "actionable",
       questionFragment: "这个加急一下",
-      issues: null,
-      investigationEffect: "changes_input",
       reason: "承接发送人的当前事项",
       confidence: 0.98,
       clarificationReply: null,
     })).toMatchObject({ action: "follow_up" })
     expect(() => threadRouteResultSchema.parse({
       action: "follow_up",
-      messageIntent: "actionable",
       targetThreadId: randomUUID(),
       questionFragment: "这个加急一下",
-      issues: null,
-      investigationEffect: "changes_input",
       reason: "尝试直接选择线程",
       confidence: 0.98,
       clarificationReply: null,
     })).toThrow()
     expect(() => threadRouteResultSchema.parse({
       action: "append",
-      messageIntent: "actionable",
       questionFragment: "这个加急一下",
-      issues: null,
-      investigationEffect: "changes_input",
       reason: "旧协议",
       confidence: 0.98,
       clarificationReply: null,
@@ -783,20 +667,18 @@ describe("bounded sender route model contract", () => {
   it("只允许后续追问声明为不改变排查输入", () => {
     expect(threadRouteResultSchema.safeParse({
       action: "follow_up",
-      messageIntent: "progress_request",
       questionFragment: "现在查得怎么样了",
-      issues: null,
       investigationEffect: "status_only",
+      progressReply: "稍等一下，我还要把数据库、服务器记录和应用后端日志一起核对完，确认准确后马上回复你。",
       reason: "只询问当前进度",
       confidence: 1,
       clarificationReply: null,
     }).success).toBe(true)
     expect(threadRouteResultSchema.safeParse({
       action: "new_thread",
-      messageIntent: "progress_request",
       questionFragment: "现在查得怎么样了",
-      issues: null,
       investigationEffect: "status_only",
+      progressReply: "稍等一下，我还在逐项核对。",
       reason: "非法组合",
       confidence: 1,
       clarificationReply: null,
@@ -806,10 +688,7 @@ describe("bounded sender route model contract", () => {
   it("待归属文案只校验结构 不按句式做业务门禁", () => {
     expect(threadRouteResultSchema.safeParse({
       action: "uncertain",
-      messageIntent: "unclear",
       questionFragment: "这个呢",
-      issues: null,
-      investigationEffect: null,
       reason: "当前存在两个可能事项",
       confidence: 0.5,
       clarificationReply: "Aropay 是要开账号，还是重置密码？",
@@ -833,24 +712,24 @@ describe("sender-focused coordinator routing", () => {
     })
     const running = startGenerating(harness, question)
     const before = harness.store.getThread(question.thread.id)
-    const progressNotifications: string[] = []
+    const progressReplies: string[] = []
     const coordinator = new SupportThreadCoordinator({
       database: harness.database,
       store: harness.store,
       router: { route: async () => ({
         action: "follow_up",
-        messageIntent: "progress_request",
         questionFragment: "这个问题现在排查得怎么样了",
-        issues: null,
         investigationEffect: "status_only",
+        progressReply: "稍等一下，这笔除了系统本身，还要一起核对数据库、服务器记录和应用后端日志，确认准确需要一点时间。",
         reason: "只询问当前排查进度，没有新增排查事实",
         confidence: 1,
         clarificationReply: null,
       }) },
       batchWindowMs: 0,
       wake: () => undefined,
-      sendStatusUpdate: async ({ notification }) => {
-        progressNotifications.push(notification.id)
+      sendStatusUpdate: async ({ text }) => {
+        progressReplies.push(text)
+        return { replyId: null }
       },
     })
     const reminder = coordinator.accept({
@@ -888,88 +767,9 @@ describe("sender-focused coordinator routing", () => {
       routeStatus: "routed",
       skipReason: "仅询问当前排查进度，已由当班客服回复且不改变排查输入",
     })
-    expect(progressNotifications).toHaveLength(1)
-    expect(harness.database.prepare(`SELECT source_kind,notification_id FROM support_thread_output_claims
-      WHERE thread_id=? AND claim_kind='progress'`).get(question.thread.id)).toEqual({
-      source_kind: "status_request",
-      notification_id: progressNotifications[0],
-    })
-    expect(harness.database.readReplies("WHERE r.thread_id=?", [question.thread.id])).toHaveLength(1)
-
-    const secondReminder = coordinator.accept({
-      groupId: harness.group.id,
-      messageId: "582",
-      senderId: "30001",
-      senderUsername: null,
-      senderDisplayName: "运营",
-      fromBot: false,
-      replyToMessageId: null,
-      messageThreadId: null,
-      replyTargetIsBot: false,
-      text: "还没好吗？",
-      attachments: [],
-      createdAt: new Date(Date.parse(question.event.createdAt) + 33_000).toISOString(),
-    })!
-    await coordinator.drain()
-
-    expect(progressNotifications).toHaveLength(1)
-    expect(harness.store.findThreadByEvent(secondReminder.id)?.id).toBe(question.thread.id)
-    expect(harness.store.getEvent(secondReminder.id)).toMatchObject({
-      routeStatus: "routed",
-      skipReason: "仅询问当前排查进度，同一问题已有进度提示发送资格，不重复发送",
-    })
-    expect(harness.database.prepare(`SELECT COUNT(*) AS count FROM support_thread_output_claims
-      WHERE thread_id=? AND claim_kind='progress'`).get(question.thread.id)).toEqual({ count: 1 })
-    expect(harness.database.readReplies("WHERE r.thread_id=?", [question.thread.id])).toHaveLength(1)
-  })
-
-  it("单独 1 只有路由模型明确判为 status_only 才能发送进度", async () => {
-    const harness = await createHarness()
-    const question = createFocusedQuestion(harness, {
-      messageId: "583", senderUserId: "30001", text: "帮我查这笔订单为什么一直处理中",
-    })
-    startGenerating(harness, question)
-    let statusUpdates = 0
-    const coordinator = new SupportThreadCoordinator({
-      database: harness.database,
-      store: harness.store,
-      router: { route: async () => ({
-        action: "follow_up",
-        messageIntent: "actionable",
-        questionFragment: "1",
-        issues: null,
-        investigationEffect: "changes_input",
-        reason: "孤立数字不能确定为催促进度",
-        confidence: 1,
-        clarificationReply: null,
-      }) },
-      batchWindowMs: 0,
-      wake: () => undefined,
-      sendStatusUpdate: async () => {
-        statusUpdates += 1
-      },
-    })
-
-    coordinator.accept({
-      groupId: harness.group.id,
-      messageId: "584",
-      senderId: "30001",
-      senderUsername: null,
-      senderDisplayName: "运营",
-      fromBot: false,
-      replyToMessageId: null,
-      messageThreadId: null,
-      replyTargetIsBot: false,
-      text: "1",
-      attachments: [],
-      createdAt: new Date(Date.parse(question.event.createdAt) + 32_000).toISOString(),
-    })
-    await coordinator.drain()
-
-    expect(statusUpdates).toBe(0)
-    expect(harness.store.getThread(question.thread.id).revision).toBe(2)
-    expect(harness.database.prepare(`SELECT COUNT(*) AS count FROM support_thread_output_claims
-      WHERE thread_id=? AND claim_kind='progress'`).get(question.thread.id)).toEqual({ count: 0 })
+    expect(progressReplies).toEqual([
+      "稍等一下，这笔除了系统本身，还要一起核对数据库、服务器记录和应用后端日志，确认准确需要一点时间。",
+    ])
   })
 
   it("催促中带补充证据时仍使旧版本失效并按新证据重新排查", async () => {
@@ -984,10 +784,9 @@ describe("sender-focused coordinator routing", () => {
       store: harness.store,
       router: { route: async () => ({
         action: "follow_up",
-        messageIntent: "actionable",
         questionFragment: "怎么还没查完，上游后台刚刚已经显示成功",
-        issues: null,
         investigationEffect: "changes_input",
+        progressReply: null,
         reason: "催促同时补充了会改变排查结论的新状态证据",
         confidence: 1,
         clarificationReply: null,
@@ -1022,13 +821,12 @@ describe("sender-focused coordinator routing", () => {
     })
   })
 
-  it("路由模型连续失败时重试一次后忽略且不默认建立问题", async () => {
+  it("路由模型失败时安全建立独立问题而不丢弃运营消息", async () => {
     const harness = await createHarness()
-    const route = vi.fn(async () => { throw new Error("route unavailable") })
     const coordinator = new SupportThreadCoordinator({
       database: harness.database,
       store: harness.store,
-      router: { route },
+      router: { route: async () => { throw new Error("route unavailable") } },
       batchWindowMs: 0,
       wake: () => undefined,
     })
@@ -1049,15 +847,11 @@ describe("sender-focused coordinator routing", () => {
 
     await coordinator.drain()
 
-    expect(route).toHaveBeenCalledTimes(2)
-    expect(harness.store.findThreadByEvent(event.id)).toBeNull()
-    expect(harness.store.getEvent(event.id)).toMatchObject({
-      routeStatus: "ignored",
-      skipReason: expect.stringContaining("路由连续失败两次"),
-    })
+    expect(harness.store.findThreadByEvent(event.id)).not.toBeNull()
+    expect(harness.store.getEvent(event.id)).toMatchObject({ routeStatus: "routed", skipReason: null })
   })
 
-  it("分类阶段意外返回候选动作时忽略且不默认建立问题", async () => {
+  it("分类阶段意外返回候选动作时也建立独立问题而不标记忽略", async () => {
     const harness = await createHarness()
     const coordinator = new SupportThreadCoordinator({
       database: harness.database,
@@ -1065,10 +859,7 @@ describe("sender-focused coordinator routing", () => {
       router: {
         route: async () => ({
           action: "candidate_1",
-          messageIntent: "actionable",
           questionFragment: "这笔谁的问题",
-          issues: null,
-          investigationEffect: "changes_input",
           reason: "模拟旧模型非法结果",
           confidence: 1,
           clarificationReply: null,
@@ -1094,19 +885,16 @@ describe("sender-focused coordinator routing", () => {
 
     await coordinator.drain()
 
-    expect(harness.store.findThreadByEvent(event.id)).toBeNull()
-    expect(harness.store.getEvent(event.id)).toMatchObject({
-      routeStatus: "ignored",
-      skipReason: expect.stringContaining("路由连续失败两次"),
-    })
+    expect(harness.store.findThreadByEvent(event.id)).not.toBeNull()
+    expect(harness.store.getEvent(event.id).routeStatus).toBe("routed")
   })
 
   it("keeps a short follow-up on the same sender focus across interleaved senders", async () => {
     const harness = await createHarness()
     const decisions: ThreadRouteResult[] = [
-      { action: "new_thread", messageIntent: "actionable", questionFragment: "创建 kakaxi 账号", issues: null, investigationEffect: "changes_input", reason: "独立问题", confidence: 1, clarificationReply: null },
-      { action: "new_thread", messageIntent: "actionable", questionFragment: "PopPay 订单延迟", issues: null, investigationEffect: "changes_input", reason: "独立问题", confidence: 1, clarificationReply: null },
-      { action: "follow_up", messageIntent: "actionable", questionFragment: "kakaxi", issues: null, investigationEffect: "changes_input", reason: "承接当前账号创建", confidence: 1, clarificationReply: null },
+      { action: "new_thread", questionFragment: "创建 kakaxi 账号", reason: "独立问题", confidence: 1, clarificationReply: null },
+      { action: "new_thread", questionFragment: "PopPay 订单延迟", reason: "独立问题", confidence: 1, clarificationReply: null },
+      { action: "follow_up", questionFragment: "kakaxi", reason: "承接当前账号创建", confidence: 1, clarificationReply: null },
     ]
     const routeInputs: ThreadRouteInput[] = []
     const coordinator = new SupportThreadCoordinator({
@@ -1166,10 +954,7 @@ describe("sender-focused coordinator routing", () => {
           routeInputs.push(input)
           return {
             action: "new_thread",
-            messageIntent: "actionable",
             questionFragment: "截图中的服务区信息",
-            issues: null,
-            investigationEffect: "changes_input",
             reason: "图片已经解析完成",
             confidence: 1,
             clarificationReply: null,
@@ -1266,10 +1051,7 @@ describe("sender-focused coordinator routing", () => {
           routeModes.push(input.mode)
           return {
             action: "uncertain",
-            messageIntent: "unclear",
             questionFragment: ambiguous.safeText,
-            issues: null,
-            investigationEffect: null,
             reason: "两个操作会产生不同结果，必须确认",
             confidence: 0.6,
             clarificationReply: "你问的是 Aropay 新账号，还是 Aropay 密码重置？",
@@ -1326,10 +1108,7 @@ describe("sender-focused coordinator routing", () => {
       store: harness.store,
       router: { route: async () => ({
         action: "new_thread",
-        messageIntent: "actionable",
         questionFragment: "服务区可能指服务器所在地或业务地区，两项都有答案，需一起说明",
-        issues: null,
-        investigationEffect: "changes_input",
         reason: "并列回答安全且信息完整",
         confidence: 1,
         clarificationReply: null,
@@ -1372,22 +1151,18 @@ describe("sender-focused coordinator routing", () => {
   it("asks about two concrete same-sender topics and resolves only the selected candidate", async () => {
     const harness = await createHarness()
     const decisions: ThreadRouteResult[] = [
-      { action: "new_thread", messageIntent: "actionable", questionFragment: "创建 Aropay 新账号", issues: null, investigationEffect: "changes_input", reason: "独立问题", confidence: 1, clarificationReply: null },
-      { action: "new_thread", messageIntent: "actionable", questionFragment: "重置 Aropay 密码", issues: null, investigationEffect: "changes_input", reason: "独立问题", confidence: 1, clarificationReply: null },
+      { action: "new_thread", questionFragment: "创建 Aropay 新账号", reason: "独立问题", confidence: 1, clarificationReply: null },
+      { action: "new_thread", questionFragment: "重置 Aropay 密码", reason: "独立问题", confidence: 1, clarificationReply: null },
       {
         action: "uncertain",
-        messageIntent: "unclear",
         questionFragment: "这个好了没",
-        issues: null,
-        investigationEffect: null,
         reason: "两个事项同样可能",
         confidence: 0.6,
         clarificationReply: "你问的是 Aropay 新账号，还是 Aropay 密码重置？",
       },
-      { action: "candidate_2", messageIntent: "actionable", questionFragment: "新账号那个", issues: null, investigationEffect: "changes_input", reason: "明确选择第二项", confidence: 1, clarificationReply: null },
+      { action: "candidate_2", questionFragment: "新账号那个", reason: "明确选择第二项", confidence: 1, clarificationReply: null },
     ]
     const sent: string[] = []
-    const wake = vi.fn()
     const coordinator = new SupportThreadCoordinator({
       database: harness.database,
       store: harness.store,
@@ -1399,7 +1174,7 @@ describe("sender-focused coordinator routing", () => {
         },
       },
       batchWindowMs: 0,
-      wake,
+      wake: () => undefined,
       sendRouteClarification: async ({ text, event }) => {
         sent.push(text)
         return { replyId: createUnthreadedReply(harness, event).id }
@@ -1431,62 +1206,23 @@ describe("sender-focused coordinator routing", () => {
     expect(harness.store.findThreadByEvent(ambiguous.id)).toBeNull()
     expect(sent).toEqual(["你问的是 Aropay 新账号，还是 Aropay 密码重置？"])
 
-    const wakeBeforeSelection = wake.mock.calls.length
-    const selection = coordinator.accept({
-      groupId: harness.group.id,
-      messageId: "704",
-      senderId: "30001",
-      senderUsername: null,
-      senderDisplayName: "运营",
-      fromBot: false,
-      replyToMessageId: null,
-      messageThreadId: null,
-      replyTargetIsBot: false,
-      text: "新账号那个",
-      attachments: [],
-      createdAt: new Date(base + 3_000).toISOString(),
-    })!
-    const continuation = coordinator.accept({
-      groupId: harness.group.id,
-      messageId: "705",
-      senderId: "30001",
-      senderUsername: null,
-      senderDisplayName: "运营",
-      fromBot: false,
-      replyToMessageId: null,
-      messageThreadId: null,
-      replyTargetIsBot: false,
-      text: "补充姓名是测试账号",
-      attachments: [],
-      createdAt: new Date(base + 4_000).toISOString(),
-    })!
-    await coordinator.drain()
+    const selection = await accept("704", "新账号那个", 3_000)
     const accountThread = harness.store.findThreadByEvent(account.id)!
     expect(harness.store.findThreadByEvent(ambiguous.id)?.id).toBe(accountThread.id)
     expect(harness.store.findThreadByEvent(selection.id)?.id).toBe(accountThread.id)
-    expect(harness.store.findThreadByEvent(continuation.id)?.id).toBe(accountThread.id)
     expect(harness.store.getSenderFocus(
-      harness.group.id, harness.service.id, "30001", continuation.createdAt,
-    )).toMatchObject({
-      threadId: accountThread.id,
-      source: "clarification_answer",
-      lastOperatorMessageId: continuation.telegramMessageId,
-      focusedAt: continuation.createdAt,
-    })
-    expect(wake).toHaveBeenCalledTimes(wakeBeforeSelection + 1)
+      harness.group.id, harness.service.id, "30001", selection.createdAt,
+    )).toMatchObject({ threadId: accountThread.id, source: "clarification_answer" })
   })
 
   it("cancels an unseen pending clarification when Telegram delivery fails", async () => {
     const harness = await createHarness()
     const decisions: ThreadRouteResult[] = [
-      { action: "new_thread", messageIntent: "actionable", questionFragment: "创建新账号", issues: null, investigationEffect: "changes_input", reason: "独立问题", confidence: 1, clarificationReply: null },
-      { action: "new_thread", messageIntent: "actionable", questionFragment: "重置密码", issues: null, investigationEffect: "changes_input", reason: "独立问题", confidence: 1, clarificationReply: null },
+      { action: "new_thread", questionFragment: "创建新账号", reason: "独立问题", confidence: 1, clarificationReply: null },
+      { action: "new_thread", questionFragment: "重置密码", reason: "独立问题", confidence: 1, clarificationReply: null },
       {
         action: "uncertain",
-        messageIntent: "unclear",
         questionFragment: "这个好了没",
-        issues: null,
-        investigationEffect: null,
         reason: "两个事项同样可能",
         confidence: 0.6,
         clarificationReply: "你问的是创建新账号，还是重置密码？",
@@ -1538,10 +1274,7 @@ describe("sender-focused coordinator routing", () => {
         const harness = await createHarness()
         const decisions = replayCase.steps.map((step): ThreadRouteResult => ({
           action: step.action,
-          messageIntent: "actionable",
           questionFragment: step.text,
-          issues: null,
-          investigationEffect: "changes_input",
           reason: `脱敏回放：${replayCase.name}`,
           confidence: 1,
           clarificationReply: null,
@@ -1588,909 +1321,5 @@ describe("sender-focused coordinator routing", () => {
         }
       }
     }
-  })
-})
-
-describe("Task 3 handoff 终态路由", () => {
-  it.each([
-    { action: "candidate_1" as const, selectedCandidate: 1 as const },
-    { action: "candidate_2" as const, selectedCandidate: 2 as const },
-  ])("待归属回答选择 $action handoff 候选时原子收口并让同批后续只审计", async ({ action, selectedCandidate }) => {
-    const harness = await createHarness()
-    const base = Date.now()
-    const senderUserId = "33001"
-    const terminalQuestion = createFocusedQuestion(harness, {
-      messageId: `clarification-terminal-${selectedCandidate}`,
-      senderUserId,
-      text: "已转技术的原问题",
-      createdAt: new Date(base).toISOString(),
-    })
-    const activeQuestion = createFocusedQuestion(harness, {
-      messageId: `clarification-active-${selectedCandidate}`,
-      senderUserId,
-      text: "仍在处理的另一个问题",
-      createdAt: new Date(base + 1_000).toISOString(),
-    })
-    const candidates = selectedCandidate === 1
-      ? [terminalQuestion, activeQuestion]
-      : [activeQuestion, terminalQuestion]
-    harness.database.prepare("UPDATE support_threads SET settle_at=? WHERE id=?").run(
-      new Date(base + 10_000).toISOString(), terminalQuestion.thread.id,
-    )
-    harness.database.prepare("UPDATE support_threads SET settle_at=? WHERE id=?").run(
-      new Date(base + 60_000).toISOString(), activeQuestion.thread.id,
-    )
-    const running = startGenerating(harness, terminalQuestion)
-    expect(harness.store.claimHandoff(running.reply.id, "technical_change")).toBe(true)
-    expect(harness.store.finishGeneration(
-      terminalQuestion.thread.id,
-      running.claim.inputRevision,
-      "escalated",
-    )).toBe(true)
-    const terminalBefore = harness.store.getThread(terminalQuestion.thread.id)
-    const ambiguous = recordQuestion(harness, {
-      messageId: `clarification-original-${selectedCandidate}`,
-      senderUserId,
-      text: "这个继续补充",
-      createdAt: new Date(base + 32_000).toISOString(),
-    }).event
-    const clarification = harness.store.createRouteClarification({
-      groupId: harness.group.id,
-      serviceId: harness.service.id,
-      senderUserId,
-      messageEventId: ambiguous.id,
-      candidates: candidates.map((candidate, index) => ({
-        threadId: candidate.thread.id,
-        label: `候选 ${index + 1}`,
-      })),
-      createdAt: ambiguous.createdAt,
-    })
-    const wake = vi.fn()
-    const sendStatusUpdate = vi.fn(async () => undefined)
-    const sendRouteClarification = vi.fn(async () => ({ replyId: randomUUID() }))
-    const coordinator = new SupportThreadCoordinator({
-      database: harness.database,
-      store: harness.store,
-      router: { route: async () => ({
-        action,
-        messageIntent: "actionable",
-        questionFragment: "选中的已转技术事项补充",
-        issues: null,
-        investigationEffect: "changes_input",
-        reason: "明确选择已转技术候选",
-        confidence: 1,
-        clarificationReply: null,
-      }) },
-      batchWindowMs: 30_000,
-      wake,
-      sendStatusUpdate,
-      sendRouteClarification,
-    })
-    const answerOne = coordinator.accept({
-      groupId: harness.group.id,
-      messageId: `clarification-answer-${selectedCandidate}-1`,
-      senderId: senderUserId,
-      senderUsername: null,
-      senderDisplayName: "运营",
-      fromBot: false,
-      replyToMessageId: null,
-      messageThreadId: null,
-      replyTargetIsBot: false,
-      text: "选已转技术那个",
-      attachments: [],
-      createdAt: new Date(base + 33_000).toISOString(),
-    })!
-    const answerTwo = coordinator.accept({
-      groupId: harness.group.id,
-      messageId: `clarification-answer-${selectedCandidate}-2`,
-      senderId: senderUserId,
-      senderUsername: null,
-      senderDisplayName: "运营",
-      fromBot: false,
-      replyToMessageId: null,
-      messageThreadId: null,
-      replyTargetIsBot: false,
-      text: "补充订单时间 14:30",
-      attachments: [],
-      createdAt: new Date(base + 34_000).toISOString(),
-    })!
-
-    await coordinator.drain()
-
-    expect(harness.store.getThread(terminalQuestion.thread.id)).toMatchObject({
-      status: terminalBefore.status,
-      revision: terminalBefore.revision,
-      settleAt: terminalBefore.settleAt,
-      generationStartedAt: terminalBefore.generationStartedAt,
-      closedAt: terminalBefore.closedAt,
-    })
-    expect(harness.database.prepare(`SELECT status,selected_thread_id,resolved_at
-      FROM support_route_clarifications WHERE id=?`).get(clarification.id)).toEqual({
-      status: "resolved",
-      selected_thread_id: terminalQuestion.thread.id,
-      resolved_at: answerOne.createdAt,
-    })
-    for (const event of [ambiguous, answerOne, answerTwo]) {
-      expect(harness.store.findThreadByEvent(event.id)?.id).toBe(terminalQuestion.thread.id)
-      expect(harness.store.getEvent(event.id)).toMatchObject({
-        routeStatus: "routed",
-        skipReason: "handoff_terminal:audit_only",
-      })
-    }
-    expect(harness.store.getSenderFocus(
-      harness.group.id,
-      harness.service.id,
-      senderUserId,
-      answerTwo.createdAt,
-    )).toMatchObject({
-      threadId: terminalQuestion.thread.id,
-      source: "clarification_answer",
-      lastOperatorMessageId: answerTwo.telegramMessageId,
-      focusedAt: answerTwo.createdAt,
-    })
-    expect(wake).not.toHaveBeenCalled()
-    expect(sendStatusUpdate).not.toHaveBeenCalled()
-    expect(sendRouteClarification).not.toHaveBeenCalled()
-  })
-
-  it.each([
-    { action: "candidate_1" as const, selectedCandidate: 1 as const },
-    { action: "candidate_2" as const, selectedCandidate: 2 as const },
-  ])("待归属回答选择 $action handoff 候选且第二条写入失败时整批回滚", async ({ action, selectedCandidate }) => {
-    const harness = await createHarness()
-    const base = Date.now()
-    const senderUserId = "33002"
-    const terminalQuestion = createFocusedQuestion(harness, {
-      messageId: `rollback-terminal-${selectedCandidate}`,
-      senderUserId,
-      text: "已转技术的原问题",
-      createdAt: new Date(base).toISOString(),
-    })
-    const activeQuestion = createFocusedQuestion(harness, {
-      messageId: `rollback-active-${selectedCandidate}`,
-      senderUserId,
-      text: "仍在处理的另一个问题",
-      createdAt: new Date(base + 1_000).toISOString(),
-    })
-    const candidates = selectedCandidate === 1
-      ? [terminalQuestion, activeQuestion]
-      : [activeQuestion, terminalQuestion]
-    harness.database.prepare("UPDATE support_threads SET settle_at=? WHERE id=?").run(
-      new Date(base + 10_000).toISOString(), terminalQuestion.thread.id,
-    )
-    harness.database.prepare("UPDATE support_threads SET settle_at=? WHERE id=?").run(
-      new Date(base + 60_000).toISOString(), activeQuestion.thread.id,
-    )
-    const running = startGenerating(harness, terminalQuestion)
-    expect(harness.store.claimHandoff(running.reply.id, "technical_change")).toBe(true)
-    expect(harness.store.finishGeneration(
-      terminalQuestion.thread.id,
-      running.claim.inputRevision,
-      "escalated",
-    )).toBe(true)
-    const terminalBefore = harness.store.getThread(terminalQuestion.thread.id)
-    const ambiguous = recordQuestion(harness, {
-      messageId: `rollback-original-${selectedCandidate}`,
-      senderUserId,
-      text: "这个继续补充",
-      createdAt: new Date(base + 2_000).toISOString(),
-    }).event
-    const clarification = harness.store.createRouteClarification({
-      groupId: harness.group.id,
-      serviceId: harness.service.id,
-      senderUserId,
-      messageEventId: ambiguous.id,
-      candidates: candidates.map((candidate, index) => ({
-        threadId: candidate.thread.id,
-        label: `候选 ${index + 1}`,
-      })),
-      createdAt: ambiguous.createdAt,
-    })
-    const focusBefore = harness.database.prepare(`SELECT thread_id,source,last_operator_message_id,
-      focused_at,expires_at FROM support_sender_focus
-      WHERE group_id=? AND service_id=? AND sender_user_id=?`).get(
-      harness.group.id,
-      harness.service.id,
-      senderUserId,
-    )
-    const wake = vi.fn()
-    const sendStatusUpdate = vi.fn(async () => undefined)
-    const sendRouteClarification = vi.fn(async () => ({ replyId: randomUUID() }))
-    const coordinator = new SupportThreadCoordinator({
-      database: harness.database,
-      store: harness.store,
-      router: { route: async () => ({
-        action,
-        messageIntent: "actionable",
-        questionFragment: "选中的已转技术事项补充",
-        issues: null,
-        investigationEffect: "changes_input",
-        reason: "明确选择已转技术候选",
-        confidence: 1,
-        clarificationReply: null,
-      }) },
-      batchWindowMs: 30_000,
-      wake,
-      sendStatusUpdate,
-      sendRouteClarification,
-    })
-    const answerOne = coordinator.accept({
-      groupId: harness.group.id,
-      messageId: `rollback-answer-${selectedCandidate}-1`,
-      senderId: senderUserId,
-      senderUsername: null,
-      senderDisplayName: "运营",
-      fromBot: false,
-      replyToMessageId: null,
-      messageThreadId: null,
-      replyTargetIsBot: false,
-      text: "选已转技术那个",
-      attachments: [],
-      createdAt: new Date(base + 3_000).toISOString(),
-    })!
-    const answerTwo = coordinator.accept({
-      groupId: harness.group.id,
-      messageId: `rollback-answer-${selectedCandidate}-2`,
-      senderId: senderUserId,
-      senderUsername: null,
-      senderDisplayName: "运营",
-      fromBot: false,
-      replyToMessageId: null,
-      messageThreadId: null,
-      replyTargetIsBot: false,
-      text: "补充订单时间 14:30",
-      attachments: [],
-      createdAt: new Date(base + 4_000).toISOString(),
-    })!
-    harness.database.prepare(`CREATE TRIGGER fail_second_clarification_answer_${selectedCandidate}
-      BEFORE INSERT ON support_thread_messages
-      WHEN NEW.message_event_id='${answerTwo.id}'
-      BEGIN SELECT RAISE(ABORT,'second clarification answer rejected'); END;`).run()
-
-    await coordinator.drain()
-
-    expect(harness.database.prepare(`SELECT status,selected_thread_id,resolved_at
-      FROM support_route_clarifications WHERE id=?`).get(clarification.id)).toEqual({
-      status: "pending",
-      selected_thread_id: null,
-      resolved_at: null,
-    })
-    for (const event of [ambiguous, answerOne, answerTwo]) {
-      expect(harness.store.findThreadByEvent(event.id)).toBeNull()
-      expect(harness.store.getEvent(event.id).routeStatus).not.toBe("routed")
-    }
-    expect(harness.database.prepare(`SELECT thread_id,source,last_operator_message_id,
-      focused_at,expires_at FROM support_sender_focus
-      WHERE group_id=? AND service_id=? AND sender_user_id=?`).get(
-      harness.group.id,
-      harness.service.id,
-      senderUserId,
-    )).toEqual(focusBefore)
-    expect(harness.store.getThread(terminalQuestion.thread.id)).toMatchObject({
-      status: terminalBefore.status,
-      revision: terminalBefore.revision,
-      settleAt: terminalBefore.settleAt,
-      generationStartedAt: terminalBefore.generationStartedAt,
-      closedAt: terminalBefore.closedAt,
-    })
-    expect(wake).not.toHaveBeenCalled()
-    expect(sendStatusUpdate).not.toHaveBeenCalled()
-    expect(sendRouteClarification).not.toHaveBeenCalled()
-  })
-
-  it("handoff audit 整批任一事件写入失败时关联、路由和 sender focus 全部回滚", async () => {
-    const harness = await createHarness()
-    const base = Date.now()
-    const senderUserId = "34001"
-    const question = createFocusedQuestion(harness, {
-      messageId: "audit-batch-rollback-origin",
-      senderUserId,
-      text: "已转技术的原问题",
-      createdAt: new Date(base).toISOString(),
-    })
-    const running = startGenerating(harness, question)
-    expect(harness.store.claimHandoff(running.reply.id, "technical_change")).toBe(true)
-    expect(harness.store.finishGeneration(question.thread.id, running.claim.inputRevision, "escalated")).toBe(true)
-    const terminalBefore = harness.store.getThread(question.thread.id)
-    const focusBefore = harness.database.prepare(`SELECT thread_id,source,last_operator_message_id,
-      focused_at,expires_at FROM support_sender_focus
-      WHERE group_id=? AND service_id=? AND sender_user_id=?`).get(
-      harness.group.id,
-      harness.service.id,
-      senderUserId,
-    )
-    const first = recordQuestion(harness, {
-      messageId: "audit-batch-rollback-1",
-      senderUserId,
-      text: "第一条补充",
-      createdAt: new Date(base + 1_000).toISOString(),
-    }).event
-    const second = recordQuestion(harness, {
-      messageId: "audit-batch-rollback-2",
-      senderUserId,
-      text: "第二条补充",
-      createdAt: new Date(base + 2_000).toISOString(),
-    }).event
-    harness.database.prepare(`CREATE TRIGGER fail_second_audit_batch_event
-      BEFORE INSERT ON support_thread_messages
-      WHEN NEW.message_event_id='${second.id}'
-      BEGIN SELECT RAISE(ABORT,'second audit event rejected'); END;`).run()
-
-    expect(() => harness.store.appendAuditBatchWithSenderFocus([
-      {
-        message: {
-          threadId: question.thread.id,
-          eventId: first.id,
-          relation: "supplement",
-          questionFragment: first.safeText,
-          settleAt: terminalBefore.settleAt,
-          expectedRevision: terminalBefore.revision,
-        },
-        focus: {
-          senderUserId: first.senderUserId,
-          source: "operator_reply",
-          operatorMessageId: first.telegramMessageId,
-        },
-      },
-      {
-        message: {
-          threadId: question.thread.id,
-          eventId: second.id,
-          relation: "supplement",
-          questionFragment: second.safeText,
-          settleAt: terminalBefore.settleAt,
-        },
-        focus: {
-          senderUserId: second.senderUserId,
-          source: "operator_reply",
-          operatorMessageId: second.telegramMessageId,
-        },
-      },
-    ])).toThrow(/second audit event rejected/)
-
-    expect(harness.store.findThreadByEvent(first.id)).toBeNull()
-    expect(harness.store.findThreadByEvent(second.id)).toBeNull()
-    expect(harness.store.getEvent(first.id).routeStatus).not.toBe("routed")
-    expect(harness.store.getEvent(second.id).routeStatus).not.toBe("routed")
-    expect(harness.database.prepare(`SELECT thread_id,source,last_operator_message_id,
-      focused_at,expires_at FROM support_sender_focus
-      WHERE group_id=? AND service_id=? AND sender_user_id=?`).get(
-      harness.group.id,
-      harness.service.id,
-      senderUserId,
-    )).toEqual(focusBefore)
-    expect(harness.store.getThread(question.thread.id)).toMatchObject({
-      status: terminalBefore.status,
-      revision: terminalBefore.revision,
-      latestMessageAt: terminalBefore.latestMessageAt,
-      generationStartedAt: terminalBefore.generationStartedAt,
-      closedAt: terminalBefore.closedAt,
-    })
-  })
-
-  it("handoff audit 批次首条已关联后重启一次补齐余下事件且二次恢复 no-op", async () => {
-    const harness = await createHarness()
-    const base = Date.now()
-    const senderUserId = "34002"
-    const question = createFocusedQuestion(harness, {
-      messageId: "audit-batch-recovery-origin",
-      senderUserId,
-      text: "已转技术的原问题",
-      createdAt: new Date(base).toISOString(),
-    })
-    const running = startGenerating(harness, question)
-    expect(harness.store.claimHandoff(running.reply.id, "service_handoff")).toBe(true)
-    expect(harness.store.finishGeneration(question.thread.id, running.claim.inputRevision, "escalated")).toBe(true)
-    const terminalBefore = harness.store.getThread(question.thread.id)
-    const batchId = randomUUID()
-    const first = harness.store.recordEvent({
-      groupId: harness.group.id,
-      accountId: null,
-      telegramMessageId: "audit-batch-recovery-1",
-      replyToMessageId: null,
-      messageThreadId: null,
-      senderUserId,
-      senderUsername: null,
-      senderDisplayName: "运营",
-      senderRole: null,
-      text: "第一条补充",
-      attachmentSummary: "",
-      routeStatus: "batched",
-      skipReason: null,
-      createdAt: new Date(base + 1_000).toISOString(),
-    }).event
-    const second = harness.store.recordEvent({
-      groupId: harness.group.id,
-      accountId: null,
-      telegramMessageId: "audit-batch-recovery-2",
-      replyToMessageId: null,
-      messageThreadId: null,
-      senderUserId,
-      senderUsername: null,
-      senderDisplayName: "运营",
-      senderRole: null,
-      text: "第二条补充",
-      attachmentSummary: "",
-      routeStatus: "batched",
-      skipReason: null,
-      createdAt: new Date(base + 2_000).toISOString(),
-    }).event
-    harness.store.assignEventBatch(first.id, batchId)
-    harness.store.assignEventBatch(second.id, batchId)
-    expect(harness.store.appendAuditMessageWithSenderFocus({
-      threadId: question.thread.id,
-      eventId: first.id,
-      relation: "supplement",
-      questionFragment: first.safeText,
-      settleAt: terminalBefore.settleAt,
-      expectedRevision: terminalBefore.revision,
-    }, {
-      senderUserId: first.senderUserId,
-      source: "operator_reply",
-      operatorMessageId: first.telegramMessageId,
-    })).not.toBeNull()
-    expect(harness.store.findThreadByEvent(second.id)).toBeNull()
-
-    harness.database.close()
-    openDatabases.splice(openDatabases.indexOf(harness.database), 1)
-    const restartedDatabase = await RuntimeDatabase.open(harness.filePath)
-    openDatabases.push(restartedDatabase)
-    const restartedStore = new SupportThreadStore(restartedDatabase, new ConfiguredSecretRedactor(restartedDatabase))
-    const wake = vi.fn()
-    const route = vi.fn(async () => { throw new Error("handoff batch 恢复不应重新路由") })
-    const coordinator = new SupportThreadCoordinator({
-      database: restartedDatabase,
-      store: restartedStore,
-      router: { route },
-      batchWindowMs: 0,
-      wake,
-    })
-
-    expect(coordinator.recover()).toBe(1)
-    await coordinator.drain()
-
-    for (const event of [first, second]) {
-      expect(restartedStore.findThreadByEvent(event.id)?.id).toBe(question.thread.id)
-      expect(restartedStore.getEvent(event.id)).toMatchObject({
-        routeStatus: "routed",
-        skipReason: "handoff_terminal:audit_only",
-      })
-    }
-    expect(restartedStore.getSenderFocus(
-      harness.group.id,
-      harness.service.id,
-      senderUserId,
-      second.createdAt,
-    )).toMatchObject({
-      threadId: question.thread.id,
-      lastOperatorMessageId: second.telegramMessageId,
-      focusedAt: second.createdAt,
-    })
-    expect(restartedStore.getThread(question.thread.id)).toMatchObject({
-      status: terminalBefore.status,
-      revision: terminalBefore.revision,
-      generationStartedAt: terminalBefore.generationStartedAt,
-      closedAt: terminalBefore.closedAt,
-    })
-    const messageCountAfterRecovery = restartedStore.getThreadDetail(question.thread.id).messages.length
-    expect(coordinator.recover()).toBe(0)
-    await coordinator.drain()
-    expect(restartedStore.getThreadDetail(question.thread.id).messages).toHaveLength(messageCountAfterRecovery)
-    expect(route).not.toHaveBeenCalled()
-    expect(wake).not.toHaveBeenCalled()
-  })
-
-  it("handoff 后业务补充和连续两个 1 只追加审计且完整独立问题仍可新建", async () => {
-    const harness = await createHarness()
-    const question = createFocusedQuestion(harness, {
-      messageId: "handoff-origin",
-      senderUserId: "task3-operator",
-      text: "原订单一直处理中",
-    })
-    const running = startGenerating(harness, question)
-    expect(harness.store.claimHandoff(running.reply.id, "technical_change")).toBe(true)
-    expect(harness.store.finishGeneration(question.thread.id, running.claim.inputRevision, "escalated")).toBe(true)
-    const terminal = harness.store.getThread(question.thread.id)
-    const wake = vi.fn()
-    const sendStatusUpdate = vi.fn(async () => undefined)
-    const sendRouteClarification = vi.fn(async () => ({ replyId: randomUUID() }))
-    const decisions: ThreadRouteResult[] = [
-      { action: "follow_up", messageIntent: "actionable", investigationEffect: "changes_input", questionFragment: "补充订单时间", issues: null, reason: "同一事项补充", confidence: 1, clarificationReply: null },
-      { action: "follow_up", messageIntent: "actionable", investigationEffect: "changes_input", questionFragment: "1", issues: null, reason: "已接管事项的后续审计", confidence: 1, clarificationReply: null },
-      { action: "follow_up", messageIntent: "actionable", investigationEffect: "changes_input", questionFragment: "1", issues: null, reason: "已接管事项的后续审计", confidence: 1, clarificationReply: null },
-      { action: "new_thread", messageIntent: "actionable", investigationEffect: "changes_input", questionFragment: "另一个商户创建账号", issues: null, reason: "完整独立新问题", confidence: 1, clarificationReply: null },
-    ]
-    const coordinator = new SupportThreadCoordinator({
-      database: harness.database,
-      store: harness.store,
-      router: { route: async () => decisions.shift()! },
-      batchWindowMs: 0,
-      wake,
-      sendStatusUpdate,
-      sendRouteClarification,
-    })
-    const base = Date.parse(question.event.createdAt) + 1_000
-    const accept = async (messageId: string, text: string, offset: number) => {
-      const event = coordinator.accept({
-        groupId: harness.group.id,
-        messageId,
-        senderId: "task3-operator",
-        senderUsername: null,
-        senderDisplayName: "运营",
-        fromBot: false,
-        replyToMessageId: null,
-        messageThreadId: null,
-        replyTargetIsBot: false,
-        text,
-        attachments: [],
-        createdAt: new Date(base + offset).toISOString(),
-      })!
-      await coordinator.drain()
-      return event
-    }
-
-    const supplement = await accept("handoff-followup", "补充订单时间 14:30", 0)
-    const firstOne = await accept("handoff-one-1", "1", 1_000)
-    const secondOne = await accept("handoff-one-2", "1", 2_000)
-
-    for (const event of [supplement, firstOne, secondOne]) {
-      expect(harness.store.findThreadByEvent(event.id)?.id).toBe(question.thread.id)
-      expect(harness.store.getEvent(event.id).routeStatus).toBe("routed")
-    }
-    expect(harness.store.getThread(question.thread.id)).toMatchObject({
-      status: terminal.status,
-      revision: terminal.revision,
-      generationStartedAt: terminal.generationStartedAt,
-      closedAt: terminal.closedAt,
-    })
-    expect(harness.store.getThreadDetail(question.thread.id).messages).toHaveLength(4)
-    expect(wake).not.toHaveBeenCalled()
-    expect(sendStatusUpdate).not.toHaveBeenCalled()
-    expect(sendRouteClarification).not.toHaveBeenCalled()
-
-    const independent = await accept("handoff-independent", "另一个商户需要创建新账号", 3_000)
-    expect(harness.store.findThreadByEvent(independent.id)?.id).not.toBe(question.thread.id)
-    expect(wake).toHaveBeenCalledTimes(1)
-  })
-
-  it("路由输入包含最近 30 条混合时间线、角色和 handoff 焦点终态", async () => {
-    const harness = await createHarness()
-    const base = Date.now()
-    const question = createFocusedQuestion(harness, {
-      messageId: "timeline-origin",
-      senderUserId: "timeline-operator",
-      text: "原问题",
-      createdAt: new Date(base).toISOString(),
-    })
-    const running = startGenerating(harness, question)
-    const progressSentAt = new Date(base + 29_500).toISOString()
-    const progress = harness.store.claimProgressNotification(
-      question.thread.id,
-      running.claim.inputRevision,
-      "scheduled_progress",
-      new Date(base + 1_000).toISOString(),
-      new Date(base + 1_000).toISOString(),
-    )!
-    expect(harness.store.claimNotificationSending(progress.id, new Date(base + 1_000).toISOString())).not.toBeNull()
-    harness.database.prepare(`INSERT INTO telegram_output_ownership(
-      id,account_id,delivery_group_id,telegram_chat_id,telegram_message_id,thread_id,service_id,reply_id,
-      notification_id,output_kind,delivery_status,request_key,content_sha256,reply_to_message_id,created_at,updated_at
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
-      randomUUID(), null, harness.group.id, harness.group.telegramChatId, "timeline-progress",
-      question.thread.id, harness.service.id, null, progress.id, "progress", "sent", randomUUID(),
-      "a".repeat(64), question.event.telegramMessageId, progressSentAt, progressSentAt,
-    )
-    harness.store.completeNotification(progress.id, "timeline-progress", "稍等", progressSentAt)
-    const unknownQuestion = createFocusedQuestion(harness, {
-      messageId: "timeline-unknown-origin",
-      senderUserId: "timeline-unknown-operator",
-      text: "另一问题",
-      createdAt: new Date(base + 500).toISOString(),
-    })
-    const unknownNotificationId = randomUUID()
-    const unknownAt = new Date(base + 29_700).toISOString()
-    harness.database.prepare(`INSERT INTO support_thread_notifications(
-      id,thread_id,input_revision,kind,status,due_at,telegram_message_id,outbound_text,error_message,created_at,updated_at
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(
-      unknownNotificationId, unknownQuestion.thread.id, unknownQuestion.thread.revision, "progress", "unknown",
-      unknownAt, "timeline-unknown-progress", "未确认送达的稍等", "发送结果未知", unknownAt, unknownAt,
-    )
-    harness.database.prepare(`INSERT INTO telegram_output_ownership(
-      id,account_id,delivery_group_id,telegram_chat_id,telegram_message_id,thread_id,service_id,reply_id,
-      notification_id,output_kind,delivery_status,request_key,content_sha256,reply_to_message_id,created_at,updated_at
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
-      randomUUID(), null, harness.group.id, harness.group.telegramChatId, "timeline-unknown-progress",
-      unknownQuestion.thread.id, harness.service.id, null, unknownNotificationId, "progress", "unknown", randomUUID(),
-      "b".repeat(64), unknownQuestion.event.telegramMessageId, unknownAt, unknownAt,
-    )
-    expect(harness.store.claimHandoff(running.reply.id, "service_handoff")).toBe(true)
-    expect(harness.replies.prepareTechnicalEscalation(running.reply.id, {
-      answer: "已经通知技术接手",
-      decisionReason: "服务接管",
-    }, "service_handoff")).not.toBeNull()
-    expect(harness.replies.claimSending(running.reply.id, {
-      answer: "已经通知技术接手",
-      decisionReason: "服务接管",
-    })).not.toBeNull()
-    harness.replies.transition(running.reply.id, "escalated", { telegramReplyMessageId: "timeline-outbound" })
-    harness.database.prepare("UPDATE support_replies SET updated_at=? WHERE id=?").run(
-      new Date(base + 29_000).toISOString(),
-      running.reply.id,
-    )
-    expect(harness.store.finishGeneration(question.thread.id, running.claim.inputRevision, "escalated")).toBe(true)
-    for (let index = 0; index < 28; index += 1) {
-      harness.store.recordEvent({
-        groupId: harness.group.id,
-        accountId: null,
-        telegramMessageId: `timeline-${index}`,
-        replyToMessageId: null,
-        messageThreadId: null,
-        senderUserId: index === 27 ? "20001" : `timeline-observer-${index}`,
-        senderUsername: null,
-        senderDisplayName: index === 27 ? "技术" : "运营",
-        senderRole: index === 27 ? "technical" : null,
-        text: `时间线消息 ${index}`,
-        attachmentSummary: "",
-        routeStatus: index === 27 ? "role_skipped" : "ignored",
-        skipReason: null,
-        createdAt: new Date(base + (index + 1) * 1_000).toISOString(),
-      })
-    }
-    let routeInput: ThreadRouteInput | null = null
-    const coordinator = new SupportThreadCoordinator({
-      database: harness.database,
-      store: harness.store,
-      router: { route: async (input) => {
-        routeInput = input
-        return {
-          action: "idle",
-          messageIntent: "non_actionable",
-          investigationEffect: null,
-          questionFragment: "收到",
-          issues: null,
-          reason: "无需客服介入",
-          confidence: 1,
-          clarificationReply: null,
-        }
-      } },
-      batchWindowMs: 0,
-      wake: () => undefined,
-    })
-    coordinator.accept({
-      groupId: harness.group.id,
-      messageId: "timeline-latest",
-      senderId: "timeline-operator",
-      senderUsername: null,
-      senderDisplayName: "运营",
-      fromBot: false,
-      replyToMessageId: null,
-      messageThreadId: null,
-      replyTargetIsBot: false,
-      text: "收到",
-      attachments: [],
-      createdAt: new Date(base + 30_000).toISOString(),
-    })
-    await coordinator.drain()
-
-    const captured = routeInput as ThreadRouteInput | null
-    const timeline = captured?.timeline
-    expect(timeline).toHaveLength(30)
-    expect(new Set(timeline?.map((entry) => entry.direction))).toEqual(new Set(["inbound", "outbound"]))
-    expect(timeline).toContainEqual(expect.objectContaining({
-      direction: "inbound",
-      senderRole: "technical",
-      text: "时间线消息 27",
-    }))
-    expect(timeline).toContainEqual(expect.objectContaining({
-      direction: "outbound",
-      messageId: "timeline-outbound",
-      text: "已经通知技术接手",
-    }))
-    expect(timeline).toContainEqual(expect.objectContaining({
-      direction: "outbound",
-      messageId: "timeline-progress",
-      replyToMessageId: "timeline-origin",
-      text: "稍等",
-      threadIds: [question.thread.id],
-    }))
-    expect(timeline).not.toContainEqual(expect.objectContaining({ messageId: "timeline-unknown-progress" }))
-    expect(captured?.focus).toMatchObject({ status: "escalated", handoffSource: "service_handoff" })
-  })
-
-  it("内部 router 返回缺少必填语义字段时重试一次后 ignored", async () => {
-    const harness = await createHarness()
-    const route = vi.fn(async () => ({
-      action: "new_thread",
-      questionFragment: "完整业务问题",
-      reason: "旧内部端口结果",
-      confidence: 1,
-      clarificationReply: null,
-    }) as never)
-    const wake = vi.fn()
-    const coordinator = new SupportThreadCoordinator({
-      database: harness.database,
-      store: harness.store,
-      router: { route },
-      batchWindowMs: 0,
-      wake,
-    })
-    const event = coordinator.accept({
-      groupId: harness.group.id,
-      messageId: "invalid-internal-route",
-      senderId: "invalid-internal-route-operator",
-      senderUsername: null,
-      senderDisplayName: "运营",
-      fromBot: false,
-      replyToMessageId: null,
-      messageThreadId: null,
-      replyTargetIsBot: false,
-      text: "完整业务问题",
-      attachments: [],
-    })!
-
-    await coordinator.drain()
-
-    expect(route).toHaveBeenCalledTimes(2)
-    expect(harness.store.findThreadByEvent(event.id)).toBeNull()
-    expect(harness.store.getEvent(event.id)).toMatchObject({
-      routeStatus: "ignored",
-      skipReason: expect.stringContaining("路由连续失败两次"),
-    })
-    expect(wake).not.toHaveBeenCalled()
-  })
-
-  it("handoff audit 在原 focus 临界过期前按最新发送人消息原子续期", async () => {
-    const harness = await createHarness()
-    const base = Date.now()
-    const atMinute = (minute: number) => new Date(base + minute * 60_000).toISOString()
-    const originAt = atMinute(0)
-    const question = createFocusedQuestion(harness, {
-      messageId: "focus-renew-origin",
-      senderUserId: "focus-renew-operator",
-      text: "原问题",
-      createdAt: originAt,
-    })
-    const running = startGenerating(harness, question)
-    expect(harness.store.claimHandoff(running.reply.id, "service_handoff", originAt)).toBe(true)
-    expect(harness.store.finishGeneration(question.thread.id, running.claim.inputRevision, "escalated")).toBe(true)
-    const terminal = harness.store.getThread(question.thread.id)
-    const decisions: ThreadRouteResult[] = [
-      { action: "follow_up", messageIntent: "actionable", investigationEffect: "changes_input", questionFragment: "第一次补充", issues: null, reason: "同一事项", confidence: 1, clarificationReply: null },
-      { action: "follow_up", messageIntent: "actionable", investigationEffect: "changes_input", questionFragment: "第二次补充", issues: null, reason: "同一事项", confidence: 1, clarificationReply: null },
-    ]
-    const wake = vi.fn()
-    const coordinator = new SupportThreadCoordinator({
-      database: harness.database,
-      store: harness.store,
-      router: { route: async () => decisions.shift()! },
-      batchWindowMs: 0,
-      wake,
-    })
-    const accept = async (messageId: string, text: string, createdAt: string) => {
-      const event = coordinator.accept({
-        groupId: harness.group.id,
-        messageId,
-        senderId: "focus-renew-operator",
-        senderUsername: null,
-        senderDisplayName: "运营",
-        fromBot: false,
-        replyToMessageId: null,
-        messageThreadId: null,
-        replyTargetIsBot: false,
-        text,
-        attachments: [],
-        createdAt,
-      })!
-      await coordinator.drain()
-      return event
-    }
-
-    const first = await accept("focus-renew-first", "第一次补充", atMinute(29))
-    const renewed = harness.store.getSenderFocus(
-      harness.group.id,
-      harness.service.id,
-      "focus-renew-operator",
-      atMinute(31),
-    )
-    expect(renewed).toMatchObject({
-      threadId: question.thread.id,
-      lastOperatorMessageId: "focus-renew-first",
-      focusedAt: atMinute(29),
-      expiresAt: atMinute(59),
-    })
-    const second = await accept("focus-renew-second", "第二次补充", atMinute(31))
-
-    expect(harness.store.findThreadByEvent(first.id)?.id).toBe(question.thread.id)
-    expect(harness.store.findThreadByEvent(second.id)?.id).toBe(question.thread.id)
-    expect(harness.store.getThread(question.thread.id)).toMatchObject({
-      status: terminal.status,
-      revision: terminal.revision,
-      settleAt: terminal.settleAt,
-      generationStartedAt: terminal.generationStartedAt,
-      closedAt: terminal.closedAt,
-    })
-    expect(harness.store.getSenderFocus(
-      harness.group.id,
-      harness.service.id,
-      "focus-renew-operator",
-      atMinute(31),
-    )).toMatchObject({
-      lastOperatorMessageId: "focus-renew-second",
-      focusedAt: atMinute(31),
-      expiresAt: atMinute(61),
-    })
-    expect(wake).not.toHaveBeenCalled()
-  })
-
-  it("路由连续失败两次后 ignored 且绝不默认新建线程", async () => {
-    const harness = await createHarness()
-    const route = vi.fn(async () => { throw new Error("router unavailable") })
-    const wake = vi.fn()
-    const coordinator = new SupportThreadCoordinator({
-      database: harness.database,
-      store: harness.store,
-      router: { route },
-      batchWindowMs: 0,
-      wake,
-    })
-    const event = coordinator.accept({
-      groupId: harness.group.id,
-      messageId: "route-failure",
-      senderId: "route-failure-operator",
-      senderUsername: null,
-      senderDisplayName: "运营",
-      fromBot: false,
-      replyToMessageId: null,
-      messageThreadId: null,
-      replyTargetIsBot: false,
-      text: "完整问题但路由暂不可用",
-      attachments: [],
-    })!
-    await coordinator.drain()
-
-    expect(route).toHaveBeenCalledTimes(2)
-    expect(harness.store.getEvent(event.id).routeStatus).toBe("ignored")
-    expect(harness.database.prepare("SELECT COUNT(*) AS count FROM support_threads").get()).toEqual({ count: 0 })
-    expect(wake).not.toHaveBeenCalled()
-  })
-
-  it("uncertain 没有两个有效候选时静默 ignored 且不建线程", async () => {
-    const harness = await createHarness()
-    const sendRouteClarification = vi.fn(async () => ({ replyId: randomUUID() }))
-    const coordinator = new SupportThreadCoordinator({
-      database: harness.database,
-      store: harness.store,
-      router: { route: async () => ({
-        action: "uncertain",
-        messageIntent: "unclear",
-        investigationEffect: null,
-        questionFragment: "1",
-        issues: null,
-        reason: "无法可靠读出完整意图",
-        confidence: 0.1,
-        clarificationReply: "你是问哪个事项？",
-      }) },
-      batchWindowMs: 0,
-      wake: () => undefined,
-      sendRouteClarification,
-    })
-    const event = coordinator.accept({
-      groupId: harness.group.id,
-      messageId: "uncertain-without-candidates",
-      senderId: "uncertain-operator",
-      senderUsername: null,
-      senderDisplayName: "运营",
-      fromBot: false,
-      replyToMessageId: null,
-      messageThreadId: null,
-      replyTargetIsBot: false,
-      text: "1",
-      attachments: [],
-    })!
-    await coordinator.drain()
-
-    expect(harness.store.getEvent(event.id).routeStatus).toBe("ignored")
-    expect(harness.database.prepare("SELECT COUNT(*) AS count FROM support_threads").get()).toEqual({ count: 0 })
-    expect(sendRouteClarification).not.toHaveBeenCalled()
   })
 })

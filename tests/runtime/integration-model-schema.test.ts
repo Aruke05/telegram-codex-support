@@ -37,7 +37,7 @@ function columnNames(database: RuntimeDatabase, table: string): string[] {
 }
 
 function expectCombinedCapabilities(database: RuntimeDatabase): void {
-  expect(database.schemaVersion()).toBe(34)
+  expect(database.schemaVersion()).toBe(38)
   expect(tableNames(database)).toEqual(expect.arrayContaining([
     "model_instances",
     "reply_generation_audits",

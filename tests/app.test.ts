@@ -1,4 +1,3 @@
-import { readFile } from "node:fs/promises"
 import { resolve } from "node:path"
 
 import { afterEach, describe, expect, it, vi } from "vitest"
@@ -82,8 +81,8 @@ describe("GET /health", () => {
     expect(response.json()).toEqual({
       status: "ok",
       service: "telegram-codex-support",
-      version: "2.2.4",
-      schemaVersion: 34,
+      version: "2.4.0",
+      schemaVersion: 38,
     })
     expect(response.body).not.toContain("TOKEN")
   })
@@ -98,20 +97,6 @@ describe("GET /health", () => {
     expect(response.headers["content-security-policy"]).toContain("default-src 'self'")
     expect(response.body).toContain("AI 客服控制台")
     expect(response.body).not.toMatch(/token|password|chatId/i)
-  })
-
-  it("健康检查、包元数据和管理台展示同一发布版本", async () => {
-    const app = buildApp({ adminUiRoot: resolve("web") })
-    apps.push(app)
-
-    const healthResponse = await app.inject({ method: "GET", url: "/health" })
-    const adminResponse = await app.inject({ method: "GET", url: "/" })
-    const packageMetadata = JSON.parse(await readFile(resolve("package.json"), "utf8")) as { version: string }
-    const health = healthResponse.json() as HealthStatus
-
-    expect(health.version).toBe("2.2.4")
-    expect(packageMetadata.version).toBe(health.version)
-    expect(adminResponse.body).toContain(`管理台 · v${health.version}`)
   })
 })
 

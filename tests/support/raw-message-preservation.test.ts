@@ -53,10 +53,7 @@ class CapturingRouter implements SupportThreadRouterPort {
     this.inputs.push(input.messages.map((message) => message.safeText))
     return {
       action: "new_thread",
-      messageIntent: "actionable",
       questionFragment: input.messages.map((message) => message.safeText).join("\n"),
-      issues: null,
-      investigationEffect: "changes_input",
       reason: "测试原文与路由副本分离",
       confidence: 1,
       clarificationReply: null,
@@ -71,20 +68,14 @@ class SequencedRouter implements SupportThreadRouterPort {
     this.calls += 1
     if (this.calls === 1) return {
       action: "idle",
-      messageIntent: "non_actionable",
       questionFragment: input.messages[0]?.safeText ?? "",
-      issues: null,
-      investigationEffect: null,
       reason: "原操作由专人处理",
       confidence: 1,
       clarificationReply: null,
     }
     return {
       action: "new_thread",
-      messageIntent: "actionable",
       questionFragment: input.messages.map((message) => message.safeText).join("\n"),
-      issues: null,
-      investigationEffect: "changes_input",
       reason: "独立产品需求",
       confidence: 1,
       clarificationReply: null,
@@ -97,13 +88,11 @@ class SplitRouter implements SupportThreadRouterPort {
     const eventId = input.messages[0]!.id
     return {
       action: "split",
-      messageIntent: "actionable",
       questionFragment: "",
       issues: [
         { eventIds: [eventId], questionFragment: "查询订单当前状态和处理结果" },
         { eventIds: [eventId], questionFragment: "确认首次第三方响应应由哪一方负责" },
       ],
-      investigationEffect: "changes_input",
       reason: "同一条消息包含两个需要分别排查和答复的事项",
       confidence: 1,
       clarificationReply: null,

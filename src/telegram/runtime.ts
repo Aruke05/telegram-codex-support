@@ -44,6 +44,7 @@ type BotMessage = {
 type BotUpdate = { update_id: number; message?: BotMessage }
 const attachmentShutdownGraceMs = 3_000
 const outgoingOwnershipPollMs = 10
+const userReconnectGraceMs = 10_000
 
 export type TelegramDeliveryErrorType = "account_unavailable" | "rate_limited" | "forbidden" | "chat_not_found" | "timeout" | "network" | "unknown"
 export type TelegramDeliveryState = "failed" | "uncertain"
@@ -217,6 +218,8 @@ export class TelegramRuntime {
   private readonly botPolling = new Set<string>()
   private readonly userConnecting = new Set<string>()
   private readonly userClients = new Map<string, TelegramClient<sessions.StringSession>>()
+  private readonly userDisconnectedSince = new Map<string, number>()
+  private readonly userCatchingUp = new Set<string>()
   private readonly attachmentTasks = new Set<Promise<void>>()
   private discardLateAttachmentResults = false
   private timer: ReturnType<typeof setInterval> | null = null
@@ -262,6 +265,8 @@ export class TelegramRuntime {
     this.discardLateAttachmentResults = true
     await Promise.allSettled([...this.userClients.values()].map((client) => client.disconnect()))
     this.userClients.clear()
+    this.userDisconnectedSince.clear()
+    this.userCatchingUp.clear()
     await this.processor.stop()
   }
 
@@ -269,7 +274,7 @@ export class TelegramRuntime {
     return {
       running: this.running,
       botLoops: this.botPolling.size,
-      userConnections: this.userClients.size,
+      userConnections: [...this.userClients.values()].filter((client) => client.connected).length,
       lastUpdateAt: this.lastUpdateAt,
       lastErrorAt: this.lastErrorAt,
       lastErrorCode: this.lastErrorCode,
@@ -427,6 +432,28 @@ export class TelegramRuntime {
     if (!this.running || !this.config.getSettings().telegramEnabled) return
     const accounts = this.admin.listAccounts().filter((item) => item.enabled && item.status === "ready")
     const groups = this.database.readGroups().filter((item) => item.enabled && item.telegramChatId)
+    const eligibleUserAccounts = new Set(accounts.filter((account) => (
+      account.type === "user" && groups.some((group) => group.accountId === account.id && group.accessMode === "user")
+    )).map((account) => account.id))
+    for (const [accountId, client] of this.userClients) {
+      if (!eligibleUserAccounts.has(accountId)) {
+        this.userClients.delete(accountId)
+        this.userDisconnectedSince.delete(accountId)
+        void client.disconnect().catch(() => undefined)
+        continue
+      }
+      if (client.connected) {
+        const recovered = this.userDisconnectedSince.delete(accountId)
+        if (recovered) void this.catchUpUser(accountId, client)
+        continue
+      }
+      const disconnectedSince = this.userDisconnectedSince.get(accountId) ?? Date.now()
+      this.userDisconnectedSince.set(accountId, disconnectedSince)
+      if (Date.now() - disconnectedSince < userReconnectGraceMs) continue
+      this.userClients.delete(accountId)
+      this.userDisconnectedSince.delete(accountId)
+      void client.disconnect().catch(() => undefined)
+    }
     accounts.forEach((account) => {
       if (!groups.some((group) => group.accountId === account.id && group.accessMode === account.type)) return
       if (account.type === "bot" && !this.botPolling.has(account.id)) void this.pollBot(account.id)
@@ -516,19 +543,35 @@ export class TelegramRuntime {
     const credentials = this.admin.getAccountCredentials(accountId)
     const client = new TelegramClient(
       new sessions.StringSession(credentials.session ?? ""), Number(credentials.apiId), credentials.apiHash ?? "",
-      { connectionRetries: 3, timeout: 10 },
+      { connectionRetries: 3, reconnectRetries: Infinity, retryDelay: 1_000, autoReconnect: true, timeout: 10 },
     )
     try {
       await client.connect()
       if (!await client.checkAuthorization()) throw new Error("未登录")
       client.addEventHandler((event) => { void this.handleUserMessage(accountId, event) }, new NewMessage({}))
       this.userClients.set(accountId, client)
+      this.userDisconnectedSince.delete(accountId)
+      await this.catchUpUser(accountId, client)
     } catch {
       await client.disconnect().catch(() => undefined)
       this.lastErrorAt = new Date().toISOString()
       this.lastErrorCode = "user_connect_failed"
     } finally {
       this.userConnecting.delete(accountId)
+    }
+  }
+
+  private async catchUpUser(accountId: string, client: TelegramClient<sessions.StringSession>): Promise<void> {
+    if (this.userCatchingUp.has(accountId) || this.userClients.get(accountId) !== client || !client.connected) return
+    this.userCatchingUp.add(accountId)
+    try {
+      await client.catchUp()
+      this.lastUpdateAt = new Date().toISOString()
+    } catch {
+      this.lastErrorAt = new Date().toISOString()
+      this.lastErrorCode = "user_catch_up_failed"
+    } finally {
+      this.userCatchingUp.delete(accountId)
     }
   }
 

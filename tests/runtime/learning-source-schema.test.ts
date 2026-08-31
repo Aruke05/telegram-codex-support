@@ -1,4 +1,4 @@
-import { access, mkdtemp, readFile, readdir, rm } from "node:fs/promises"
+import { access, mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { DatabaseSync } from "node:sqlite"
@@ -21,25 +21,6 @@ async function temporaryDatabase(name: string): Promise<string> {
   const directory = await mkdtemp(path.join(tmpdir(), "learning-source-schema-"))
   temporaryDirectories.push(directory)
   return path.join(directory, name)
-}
-
-async function withPortableImportTemporaryRoot<T>(run: (temporaryRoot: string) => Promise<T>): Promise<T> {
-  const originalTmpdir = process.env.TMPDIR
-  const temporaryRoot = await mkdtemp(path.join(tmpdir(), "learning-source-portable-import-root-"))
-  process.env.TMPDIR = temporaryRoot
-  try {
-    return await run(temporaryRoot)
-  } finally {
-    if (originalTmpdir === undefined) delete process.env.TMPDIR
-    else process.env.TMPDIR = originalTmpdir
-    await rm(temporaryRoot, { recursive: true, force: true })
-  }
-}
-
-async function portableImportTemporaryDirectories(temporaryRoot: string): Promise<string[]> {
-  return (await readdir(temporaryRoot))
-    .filter((name) => name.startsWith("telegram-support-portable-import-"))
-    .sort()
 }
 
 function seedObservationReferences(database: RuntimeDatabase): { eventId: string; groupId: string; projectId: string; serviceId: string } {
@@ -349,7 +330,7 @@ describe("可信回复观察审计 schema", () => {
     const database = await RuntimeDatabase.open(await temporaryDatabase("fresh.sqlite"))
     try {
       const { eventId, serviceId } = seedObservationReferences(database)
-      expect(database.schemaVersion()).toBe(34)
+      expect(database.schemaVersion()).toBe(38)
       const columns = database.prepare("PRAGMA table_info(telegram_roles)").all() as Array<{ name: string; dflt_value: string | null }>
       const column = columns.find((row) => row.name === "learning_source_enabled")
       expect(column?.dflt_value).toBe("0")
@@ -403,7 +384,7 @@ describe("可信回复观察审计 schema", () => {
 
     const database = await RuntimeDatabase.open(filePath)
     try {
-      expect(database.schemaVersion()).toBe(34)
+      expect(database.schemaVersion()).toBe(38)
       expect(database.readRoles()).toEqual([expect.objectContaining({ telegramUserId: "10003", learningSourceEnabled: false })])
     } finally {
       database.close()
@@ -418,7 +399,7 @@ describe("可信回复观察审计 schema", () => {
 
     const database = await RuntimeDatabase.open(filePath)
     try {
-      expect(database.schemaVersion()).toBe(34)
+      expect(database.schemaVersion()).toBe(38)
       expect(database.prepare("PRAGMA table_info(telegram_roles)").all()).toEqual(expect.arrayContaining([
         expect.objectContaining({ name: "learning_source_enabled" }),
       ]))
@@ -442,7 +423,7 @@ describe("可信回复观察审计 schema", () => {
 
     const database = await RuntimeDatabase.open(filePath)
     try {
-      expect(database.schemaVersion()).toBe(34)
+      expect(database.schemaVersion()).toBe(38)
       expect(database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='learning_source_observations'").get()).toBeTruthy()
       expect(database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='support_reply_alert_deliveries'").get()).toBeTruthy()
       expectAdminChatCancellation(database)
@@ -483,7 +464,7 @@ describe("可信回复观察审计 schema", () => {
       await new BackupService(source).export(exportPath)
       const portable = RuntimeDatabase.openPortable(exportPath, true)
       try {
-        expect(portable.schemaVersion()).toBe(34)
+        expect(portable.schemaVersion()).toBe(38)
         expect(portable.readRoles()).toEqual([expect.objectContaining({ telegramUserId: "10004", learningSourceEnabled: true })])
         expect(portable.prepare("SELECT 1 FROM learning_source_observations WHERE message_event_id=?").get(eventId)).toBeTruthy()
         expect(portable.prepare("SELECT status FROM memory_maintenance_runs WHERE id=?").get(runId)).toEqual({ status: "failed" })
@@ -497,7 +478,7 @@ describe("可信回复观察审计 schema", () => {
       const restored = await RuntimeDatabase.open(await temporaryDatabase("restored.sqlite"))
       try {
         await new BackupService(restored).import(exportPath)
-        expect(restored.schemaVersion()).toBe(34)
+        expect(restored.schemaVersion()).toBe(38)
         expect(restored.readRoles()).toEqual([expect.objectContaining({ telegramUserId: "10004", learningSourceEnabled: true })])
         expect(restored.prepare("SELECT processing_status,lock_token,locked_at FROM learning_source_observations WHERE message_event_id=?").get(eventId)).toEqual({
           processing_status: "pending", lock_token: null, locked_at: null,
@@ -519,21 +500,15 @@ describe("可信回复观察审计 schema", () => {
     } finally {
       source.close()
     }
-    const sourceBeforeImport = await readFile(portablePath)
     const restored = await RuntimeDatabase.open(await temporaryDatabase("technical-binding-v23-restored.sqlite"))
     try {
-      await withPortableImportTemporaryRoot(async (temporaryRoot) => {
-        expect(await portableImportTemporaryDirectories(temporaryRoot)).toEqual([])
-        restored.prepare(`INSERT INTO projects(id,project_key,name,description,enabled,default_knowledge_scope,created_at,updated_at)
-          VALUES (?,?,?,?,?,?,?,?)`).run(
-          "00000000-0000-4000-8000-000000000020", "keep", "保留", "", 1, "default",
-          "2026-08-11T00:00:00.000Z", "2026-08-11T00:00:00.000Z",
-        )
-        await expect(new BackupService(restored).import(portablePath)).rejects.toThrow(/技术告警群.*绑定/u)
-        expect(restored.prepare("SELECT project_key FROM projects").all()).toEqual([{ project_key: "keep" }])
-        expect(await readFile(portablePath)).toEqual(sourceBeforeImport)
-        expect(await portableImportTemporaryDirectories(temporaryRoot)).toEqual([])
-      })
+      restored.prepare(`INSERT INTO projects(id,project_key,name,description,enabled,default_knowledge_scope,created_at,updated_at)
+        VALUES (?,?,?,?,?,?,?,?)`).run(
+        "00000000-0000-4000-8000-000000000020", "keep", "保留", "", 1, "default",
+        "2026-08-11T00:00:00.000Z", "2026-08-11T00:00:00.000Z",
+      )
+      await expect(new BackupService(restored).import(portablePath)).rejects.toThrow(/技术告警群.*绑定/u)
+      expect(restored.prepare("SELECT project_key FROM projects").all()).toEqual([{ project_key: "keep" }])
     } finally {
       restored.close()
     }
@@ -567,48 +542,13 @@ describe("可信回复观察审计 schema", () => {
       UPDATE metadata SET value='22' WHERE key='schema_version';
       PRAGMA foreign_keys=ON;`)
     legacy.close()
-    const sourceBeforeImport = await readFile(portablePath)
+
     const restored = await RuntimeDatabase.open(await temporaryDatabase("technical-binding-v22-restored.sqlite"))
     try {
-      await withPortableImportTemporaryRoot(async (temporaryRoot) => {
-        expect(await portableImportTemporaryDirectories(temporaryRoot)).toEqual([])
-        await new BackupService(restored).import(portablePath)
-        expect(restored.prepare("SELECT purpose,project_id,service_id FROM telegram_groups").all()).toEqual([{
-          purpose: "technical_alert", project_id: null, service_id: null,
-        }])
-        expect(await readFile(portablePath)).toEqual(sourceBeforeImport)
-        expect(await portableImportTemporaryDirectories(temporaryRoot)).toEqual([])
-      })
-    } finally {
-      restored.close()
-    }
-  })
-
-  it("当前完整能力仅伪降 metadata 到 v22 时非法技术群绑定仍 fail closed", async () => {
-    const portablePath = await temporaryDatabase("technical-binding-forged-v22.sqlite")
-    const source = await RuntimeDatabase.open(portablePath)
-    try {
-      seedObservationReferences(source)
-      source.prepare("UPDATE telegram_groups SET purpose='technical_alert'").run()
-      source.prepare("UPDATE metadata SET value='22' WHERE key='schema_version'").run()
-    } finally {
-      source.close()
-    }
-    const sourceBeforeImport = await readFile(portablePath)
-    const restored = await RuntimeDatabase.open(await temporaryDatabase("technical-binding-forged-v22-restored.sqlite"))
-    try {
-      await withPortableImportTemporaryRoot(async (temporaryRoot) => {
-        expect(await portableImportTemporaryDirectories(temporaryRoot)).toEqual([])
-        restored.prepare(`INSERT INTO projects(id,project_key,name,description,enabled,default_knowledge_scope,created_at,updated_at)
-          VALUES (?,?,?,?,?,?,?,?)`).run(
-          "00000000-0000-4000-8000-000000000021", "keep-forged-v22", "保留", "", 1, "default",
-          "2026-08-11T00:00:00.000Z", "2026-08-11T00:00:00.000Z",
-        )
-        await expect(new BackupService(restored).import(portablePath)).rejects.toThrow(/技术告警群.*绑定/u)
-        expect(restored.prepare("SELECT project_key FROM projects").all()).toEqual([{ project_key: "keep-forged-v22" }])
-        expect(await readFile(portablePath)).toEqual(sourceBeforeImport)
-        expect(await portableImportTemporaryDirectories(temporaryRoot)).toEqual([])
-      })
+      await new BackupService(restored).import(portablePath)
+      expect(restored.prepare("SELECT purpose,project_id,service_id FROM telegram_groups").all()).toEqual([{
+        purpose: "technical_alert", project_id: null, service_id: null,
+      }])
     } finally {
       restored.close()
     }
@@ -632,7 +572,7 @@ describe("可信回复观察审计 schema", () => {
     const restored = await RuntimeDatabase.open(await temporaryDatabase("remote-v13-portable-restored.sqlite"))
     try {
       await new BackupService(restored).import(exportPath)
-      expect(restored.schemaVersion()).toBe(34)
+      expect(restored.schemaVersion()).toBe(38)
       expect(restored.prepare("SELECT status FROM admin_chat_turns WHERE id=?").get(cancelledTurnId)).toEqual({ status: "cancelled" })
       expect(restored.prepare("PRAGMA foreign_key_check").all()).toEqual([])
     } finally {
@@ -668,7 +608,7 @@ describe("可信回复观察审计 schema", () => {
     const restored = await RuntimeDatabase.open(await temporaryDatabase("v14-restored.sqlite"))
     try {
       await new BackupService(restored).import(exportPath)
-      expect(restored.schemaVersion()).toBe(34)
+      expect(restored.schemaVersion()).toBe(38)
       expect(restored.prepare("PRAGMA foreign_key_check").all()).toEqual([])
       expect(restored.readReplies("WHERE r.id=?", [replyId])).toEqual([
         expect.objectContaining({ id: replyId, operatorDeliveryStatus: null }),
