@@ -49,6 +49,7 @@ import { LearningSourceObserver } from "./support/learning-source-observer.js"
 import { LearningSourceStore } from "./support/learning-source-store.js"
 import { TechnicalAlertService } from "./support/technical-alert-service.js"
 import { UserUnfreezeService } from "./support/user-unfreeze-service.js"
+import { UserCredentialResetService } from "./support/user-credential-reset-service.js"
 import { SupportThreadLifecycleService } from "./support/thread-lifecycle-service.js"
 import { SupportThreadQueryService } from "./support/thread-query-service.js"
 import { CodexMemoryLearningAgent } from "./learning/agent.js"
@@ -139,6 +140,9 @@ const telegramTransport = {
     messageIds: string[],
     ownership?: import("./telegram/runtime.js").TelegramOutputOwnership,
   ) => telegramRuntime.forwardMessages(accountId, targetChatId, sourceChatId, messageIds, ownership),
+  deleteMessage: (accountId: string, chatId: string, messageId: string) => (
+    telegramRuntime.deleteMessage(accountId, chatId, messageId)
+  ),
 }
 const supportThreadStore = new SupportThreadStore(
   runtimeDatabase,
@@ -171,6 +175,13 @@ const userUnfreezeService = new UserUnfreezeService({
   transport: telegramTransport,
   resourceWorkspace: supportResourceWorkspace,
 })
+const userCredentialResetService = new UserCredentialResetService({
+  database: runtimeDatabase,
+  replies: replyService,
+  redactor: configuredSecretRedactor,
+  transport: telegramTransport,
+  resourceWorkspace: supportResourceWorkspace,
+})
 const supportAnswerWorker = new SupportAnswerWorker({
   database: runtimeDatabase,
   store: supportThreadStore,
@@ -186,6 +197,7 @@ const supportAnswerWorker = new SupportAnswerWorker({
   resourceWorkspace: supportResourceWorkspace,
   resourceBroker: readonlyResourceBroker,
   userUnfreeze: userUnfreezeService,
+  userCredentialReset: userCredentialResetService,
 })
 const adminChatStore = new AdminChatStore(runtimeDatabase)
 const supportInvestigationService = new SupportInvestigationService({
@@ -251,6 +263,7 @@ supportThreadCoordinator = new SupportThreadCoordinator({
     { groupId: group.id, serviceId: group.serviceId, kind: "presence_reply" },
   ),
   userUnfreeze: userUnfreezeService,
+  userCredentialReset: userCredentialResetService,
   sendRouteClarification: async ({ group, service, event, clarification, text }) => {
     const activeGroup = runtimeDatabase.readGroups().find((candidate) => (
       candidate.id === group.id && candidate.enabled && candidate.telegramChatId
@@ -430,6 +443,7 @@ app.addHook("onClose", async () => {
   await adminChatWorker.stop()
   await referenceLearningWorker.stop()
   await shadowReportWorker.stop()
+  userCredentialResetService.stop()
   await codexExecutor.shutdown()
   await telegramRuntime.stop()
   runtimeDatabase.close()
@@ -544,6 +558,7 @@ await app.listen({ host: env.host, port: env.port })
 dailyGroupShutdownWorker.start()
 adminChatWorker.start()
 telegramRuntime.start()
+userCredentialResetService.start()
 hourlyCodeSyncWorker.start()
 supportDeadlineService.start()
 referenceLearningWorker.start()

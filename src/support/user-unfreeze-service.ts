@@ -337,7 +337,15 @@ export class UserUnfreezeService {
       : this.deps.database.prepare(`SELECT id FROM user_unfreeze_actions
           WHERE group_id=? AND service_id=? AND status='pending_confirmation' AND expires_at>?
           ORDER BY created_at DESC,id DESC LIMIT 2`).all(input.group.id, input.group.serviceId, now) as Array<{ id: string }>
-    return rows.length === 1 ? { actionId: rows[0]!.id, decision } : null
+    if (rows.length !== 1) return null
+    if (!input.replyToMessageId) {
+      const credentialResets = this.deps.database.prepare(`SELECT id FROM user_credential_reset_actions
+        WHERE group_id=? AND service_id=? AND status='pending_confirmation' AND expires_at>? LIMIT 1`).all(
+        input.group.id, input.group.serviceId, now,
+      ) as Array<{ id: string }>
+      if (credentialResets.length > 0) return null
+    }
+    return { actionId: rows[0]!.id, decision }
   }
 
   async handleConfirmation(

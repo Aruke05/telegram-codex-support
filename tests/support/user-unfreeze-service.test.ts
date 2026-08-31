@@ -194,7 +194,7 @@ describe("sys_user 自然语言审批解冻", () => {
       databases.splice(databases.indexOf(harness.database), 1)
       const reopened = await RuntimeDatabase.open(harness.filePath)
       databases.push(reopened)
-      expect(reopened.schemaVersion()).toBe(38)
+      expect(reopened.schemaVersion()).toBe(39)
       expect(reopened.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='user_unfreeze_operations'`).get())
         .toEqual({ name: "user_unfreeze_operations" })
       expect(reopened.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='user_unfreeze_actions'`).get())

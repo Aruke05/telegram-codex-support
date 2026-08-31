@@ -21,6 +21,10 @@ import type {
 } from "./thread-router.js"
 import { SupportThreadStore } from "./thread-store.js"
 import type { UserUnfreezeConfirmationMatch, UserUnfreezeService } from "./user-unfreeze-service.js"
+import type {
+  UserCredentialResetConfirmationMatch,
+  UserCredentialResetService,
+} from "./user-credential-reset-service.js"
 
 export type IncomingThreadMessage = {
   groupId: string
@@ -93,6 +97,7 @@ export type SupportThreadCoordinatorDependencies = {
     text: string
   }): Promise<string>
   userUnfreeze?: Pick<UserUnfreezeService, "matchConfirmation" | "handleConfirmation">
+  userCredentialReset?: Pick<UserCredentialResetService, "matchConfirmation" | "handleConfirmation">
 }
 
 const presenceReplyDelayMs = 5_000
@@ -184,15 +189,24 @@ export class SupportThreadCoordinator {
       hasAttachments: input.attachmentsPending === true || input.attachments.length > 0,
       now: new Date().toISOString(),
     }) ?? null
+    const credentialResetConfirmation: UserCredentialResetConfirmationMatch | null =
+      this.deps.userCredentialReset?.matchConfirmation({
+        group,
+        text: input.text,
+        replyToMessageId: input.replyToMessageId,
+        hasAttachments: input.attachmentsPending === true || input.attachments.length > 0,
+        now: new Date().toISOString(),
+      }) ?? null
+    const operationConfirmation = unfreezeConfirmation ?? credentialResetConfirmation
     const route = routeSupportMessage({
       purpose: group.purpose,
       senderRole: role?.role ?? null,
       canCorrect: role?.canCorrect ?? false,
       text: input.text,
     })
-    if (route.action === "drop" && !unfreezeConfirmation) return null
+    if (route.action === "drop" && !operationConfirmation) return null
 
-    const eventStatus = unfreezeConfirmation ? "received"
+    const eventStatus = operationConfirmation ? "received"
       : route.action === "correct" ? "correction"
       : route.action === "process" && route.immediate ? "command"
         : route.action === "ignore" && role && (group.purpose === "support" || role.learningSourceEnabled) ? "role_skipped"
@@ -216,7 +230,7 @@ export class SupportThreadCoordinator {
       text: input.text,
       attachmentSummary,
       routeStatus: eventStatus,
-      skipReason: !unfreezeConfirmation && route.action === "ignore" ? route.reason : null,
+      skipReason: !operationConfirmation && route.action === "ignore" ? route.reason : null,
       humanPriorityUserIds,
       ...(input.createdAt ? { createdAt: input.createdAt } : {}),
     })
@@ -227,6 +241,18 @@ export class SupportThreadCoordinator {
       if (recorded.created) {
         const handling = this.deps.userUnfreeze!.handleConfirmation(unfreezeConfirmation, recorded.event)
         this.deps.store.updateEventRoute(recorded.event.id, "routed", `用户解冻${unfreezeConfirmation.decision === "approve" ? "确认" : "取消"}`)
+        this.track(handling)
+      }
+      return recorded.event
+    }
+    if (credentialResetConfirmation) {
+      if (recorded.created) {
+        const handling = this.deps.userCredentialReset!.handleConfirmation(credentialResetConfirmation, recorded.event)
+        this.deps.store.updateEventRoute(
+          recorded.event.id,
+          "routed",
+          `客服账号重置${credentialResetConfirmation.decision === "approve" ? "确认" : "取消"}`,
+        )
         this.track(handling)
       }
       return recorded.event

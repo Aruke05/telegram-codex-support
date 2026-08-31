@@ -103,11 +103,20 @@ export const userUnfreezeRequestSchema = z.object({
   username: z.string().trim().min(1).max(120).regex(/^[\p{L}\p{N}_.@+\-]+$/u),
 }).strict()
 
+export const userCredentialResetRequestSchema = z.object({
+  username: z.string().trim().min(1).max(120).regex(/^[A-Za-z0-9_.@+\-]+$/u),
+  resetPassword: z.boolean(),
+  resetTotp: z.boolean(),
+}).strict().refine((value) => value.resetPassword || value.resetTotp, {
+  message: "密码和谷歌验证至少选择一项重置",
+})
+
 export const answerDecisionSchema = z.object({
   decision: z.enum(["reply", "ignore", "escalate"]),
   escalationType: z.enum(["none", "code_defect", "technical_change", "feature_request", "service_handoff", "human_operation"]),
   humanOperation: humanOperationSchema.nullable().optional(),
   userUnfreeze: userUnfreezeRequestSchema.nullable().optional(),
+  userCredentialReset: userCredentialResetRequestSchema.nullable().optional(),
   answer: z.string().max(12000),
   quote: z.string().max(1000).nullable(),
   reason: z.string().trim().min(1).max(1000),
@@ -143,6 +152,15 @@ export const answerDecisionSchema = z.object({
       code: "custom",
       path: ["userUnfreeze"],
       message: "用户解冻确认只能随普通回复提出，不能与升级或专人操作同时出现",
+    })
+  }
+  if (value.userCredentialReset && (
+    value.decision !== "reply" || value.escalationType !== "none" || value.humanOperation || value.userUnfreeze
+  )) {
+    context.addIssue({
+      code: "custom",
+      path: ["userCredentialReset"],
+      message: "客服账号重置确认只能单独随普通回复提出",
     })
   }
   if (value.decision !== "ignore" && value.evidencePacket?.requiredAnswerPoints.length === 0) {
@@ -380,7 +398,7 @@ const evidencePacketJsonSchema = {
 export const answerDecisionJsonSchema = {
   type: "object",
   additionalProperties: false,
-  required: ["decision", "escalationType", "humanOperation", "userUnfreeze", "answer", "quote", "reason", "confidence", "usedMemoryVersionIds", "answerClaims", "responsibility", "interaction", "investigation", "evidencePacket"],
+  required: ["decision", "escalationType", "humanOperation", "userUnfreeze", "userCredentialReset", "answer", "quote", "reason", "confidence", "usedMemoryVersionIds", "answerClaims", "responsibility", "interaction", "investigation", "evidencePacket"],
   properties: {
     decision: { type: "string", enum: ["reply", "ignore", "escalate"] },
     escalationType: { type: "string", enum: ["none", "code_defect", "technical_change", "feature_request", "service_handoff", "human_operation"] },
@@ -407,6 +425,18 @@ export const answerDecisionJsonSchema = {
         required: ["username"],
         properties: {
           username: { type: "string", minLength: 1, maxLength: 120 },
+        },
+      }, { type: "null" }],
+    },
+    userCredentialReset: {
+      anyOf: [{
+        type: "object",
+        additionalProperties: false,
+        required: ["username", "resetPassword", "resetTotp"],
+        properties: {
+          username: { type: "string", minLength: 1, maxLength: 120 },
+          resetPassword: { type: "boolean" },
+          resetTotp: { type: "boolean" },
         },
       }, { type: "null" }],
     },

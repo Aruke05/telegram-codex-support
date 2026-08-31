@@ -169,6 +169,87 @@ BEFORE UPDATE OF thread_id,input_revision,group_id,project_id,service_id,server_
 BEGIN SELECT RAISE(ABORT, 'user unfreeze target is immutable'); END;
 `
 
+const userCredentialResetSchema = `
+CREATE TABLE IF NOT EXISTS user_credential_reset_actions (
+  id TEXT PRIMARY KEY,
+  thread_id TEXT NOT NULL REFERENCES support_threads(id) ON DELETE CASCADE,
+  input_revision INTEGER NOT NULL CHECK(input_revision >= 1),
+  group_id TEXT NOT NULL REFERENCES telegram_groups(id) ON DELETE CASCADE,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE RESTRICT,
+  service_id TEXT NOT NULL REFERENCES project_services(id) ON DELETE RESTRICT,
+  server_resource_id TEXT NOT NULL REFERENCES project_servers(id) ON DELETE RESTRICT,
+  database_resource_id TEXT NOT NULL REFERENCES project_databases(id) ON DELETE RESTRICT,
+  request_message_event_id TEXT NOT NULL REFERENCES support_message_events(id) ON DELETE RESTRICT,
+  confirmation_reply_id TEXT NOT NULL UNIQUE REFERENCES support_replies(id) ON DELETE CASCADE,
+  username TEXT NOT NULL CHECK(length(trim(username)) BETWEEN 1 AND 120),
+  sys_user_id TEXT NOT NULL CHECK(length(trim(sys_user_id)) BETWEEN 1 AND 120),
+  state_token TEXT NOT NULL CHECK(length(state_token)=64),
+  resource_fingerprint TEXT NOT NULL CHECK(length(resource_fingerprint)=64),
+  reset_password INTEGER NOT NULL CHECK(reset_password IN (0,1)),
+  reset_totp INTEGER NOT NULL CHECK(reset_totp IN (0,1)),
+  requester_user_id TEXT NOT NULL CHECK(length(requester_user_id) BETWEEN 1 AND 80),
+  preflight_checked_at TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN (
+    'awaiting_confirmation_delivery','pending_confirmation','executing','succeeded',
+    'cancelled','expired','superseded','failed','delivery_unknown','execution_unknown'
+  )),
+  confirmation_telegram_message_id TEXT,
+  confirmer_message_event_id TEXT REFERENCES support_message_events(id) ON DELETE SET NULL,
+  confirmer_user_id TEXT,
+  confirmer_username TEXT,
+  expires_at TEXT NOT NULL,
+  execution_started_at TEXT,
+  completed_at TEXT,
+  result_code TEXT,
+  password_delivery_status TEXT CHECK(password_delivery_status IS NULL OR password_delivery_status IN (
+    'not_required','sending','sent','failed','unknown'
+  )),
+  safe_summary TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  CHECK(reset_password=1 OR reset_totp=1),
+  UNIQUE(thread_id,input_revision)
+);
+CREATE INDEX IF NOT EXISTS user_credential_reset_pending_idx
+  ON user_credential_reset_actions(group_id,service_id,status,expires_at,id);
+CREATE INDEX IF NOT EXISTS user_credential_reset_thread_idx
+  ON user_credential_reset_actions(thread_id,created_at DESC,id DESC);
+CREATE TRIGGER IF NOT EXISTS user_credential_reset_immutable_target
+BEFORE UPDATE OF thread_id,input_revision,group_id,project_id,service_id,server_resource_id,database_resource_id,
+  request_message_event_id,confirmation_reply_id,username,sys_user_id,state_token,resource_fingerprint,
+  reset_password,reset_totp,requester_user_id,preflight_checked_at
+  ON user_credential_reset_actions
+BEGIN SELECT RAISE(ABORT, 'user credential reset target is immutable'); END;
+
+CREATE TABLE IF NOT EXISTS secret_message_deletions (
+  id TEXT PRIMARY KEY,
+  action_id TEXT NOT NULL UNIQUE REFERENCES user_credential_reset_actions(id) ON DELETE CASCADE,
+  account_id TEXT NOT NULL REFERENCES telegram_accounts(id) ON DELETE RESTRICT,
+  telegram_chat_id TEXT NOT NULL CHECK(length(telegram_chat_id) BETWEEN 1 AND 80),
+  telegram_message_id TEXT NOT NULL CHECK(length(telegram_message_id) BETWEEN 1 AND 80),
+  status TEXT NOT NULL CHECK(status IN ('pending','deleting','deleted','failed')),
+  due_at TEXT NOT NULL,
+  attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count BETWEEN 0 AND 10),
+  last_error_code TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS secret_message_deletions_due_idx
+  ON secret_message_deletions(status,due_at,id);
+
+CREATE TABLE IF NOT EXISTS telegram_user_chat_cursors (
+  account_id TEXT NOT NULL REFERENCES telegram_accounts(id) ON DELETE CASCADE,
+  group_id TEXT NOT NULL REFERENCES telegram_groups(id) ON DELETE CASCADE,
+  telegram_chat_id TEXT NOT NULL CHECK(length(telegram_chat_id) BETWEEN 1 AND 80),
+  last_message_id INTEGER NOT NULL CHECK(last_message_id >= 0),
+  initialized_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(account_id,group_id)
+);
+CREATE INDEX IF NOT EXISTS telegram_user_chat_cursors_account_idx
+  ON telegram_user_chat_cursors(account_id,updated_at,group_id);
+`
+
 const referenceLearningResultsTableDefinition = `(
   id TEXT PRIMARY KEY,
   run_id TEXT NOT NULL REFERENCES memory_maintenance_runs(id) ON DELETE CASCADE,
@@ -1131,6 +1212,7 @@ CREATE INDEX IF NOT EXISTS reply_generation_audits_created_idx
   ON reply_generation_audits(created_at,id);
 
 ${userUnfreezeActionsSchema}
+${userCredentialResetSchema}
 
 CREATE TABLE IF NOT EXISTS shadow_answer_results (
   id TEXT PRIMARY KEY,
@@ -3589,6 +3671,20 @@ function migrateToV38(connection: DatabaseSync): void {
   }
 }
 
+function migrateV38ToV39(connection: DatabaseSync): void {
+  connection.exec("BEGIN IMMEDIATE")
+  try {
+    connection.exec(`
+      ${userCredentialResetSchema}
+      UPDATE metadata SET value='39' WHERE key='schema_version';
+    `)
+    connection.exec("COMMIT")
+  } catch (error) {
+    try { connection.exec("ROLLBACK") } catch { /* 事务已结束时无需处理。 */ }
+    throw error
+  }
+}
+
 function ensureAdminChatConversationExtensions(connection: DatabaseSync): void {
   connection.exec("DROP INDEX IF EXISTS admin_chat_turns_one_active_idx")
   connection.exec(adminChatConversationExtensionSchema)
@@ -3683,6 +3779,7 @@ export class RuntimeDatabase {
       if (current === 30) { migrateV30ToV31(connection); current = 31 }
       if (current === 31) { migrateV31ToV32(connection); current = 32 }
       if ([32, 33, 34, 35, 36, 37].includes(current)) { migrateToV38(connection); current = 38 }
+      if (current === 38) { migrateV38ToV39(connection); current = 39 }
       const allowNewerLocalSchema = process.env.AI_SUPPORT_ALLOW_NEWER_DATABASE_SCHEMA === "1"
       if (current !== DATABASE_SCHEMA_VERSION && !(allowNewerLocalSchema && current > DATABASE_SCHEMA_VERSION)) {
         connection.close()
@@ -3763,6 +3860,7 @@ export class RuntimeDatabase {
       if (current === 30) { migrateV30ToV31(connection); current = 31 }
       if (current === 31) { migrateV31ToV32(connection); current = 32 }
       if ([32, 33, 34, 35, 36, 37].includes(current)) { migrateToV38(connection); current = 38 }
+      if (current === 38) { migrateV38ToV39(connection); current = 39 }
       const allowNewerLocalSchema = process.env.AI_SUPPORT_ALLOW_NEWER_DATABASE_SCHEMA === "1"
       if (current !== DATABASE_SCHEMA_VERSION && !(allowNewerLocalSchema && current > DATABASE_SCHEMA_VERSION)) {
         connection.close()

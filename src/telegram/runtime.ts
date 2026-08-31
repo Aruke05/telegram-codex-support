@@ -45,6 +45,8 @@ type BotUpdate = { update_id: number; message?: BotMessage }
 const attachmentShutdownGraceMs = 3_000
 const outgoingOwnershipPollMs = 10
 const userReconnectGraceMs = 10_000
+const userHistoryReconcileIntervalMs = 10_000
+const userHistoryBatchSize = 200
 
 export type TelegramDeliveryErrorType = "account_unavailable" | "rate_limited" | "forbidden" | "chat_not_found" | "timeout" | "network" | "unknown"
 export type TelegramDeliveryState = "failed" | "uncertain"
@@ -165,6 +167,13 @@ class BotApiClient {
     return telegramMessageId(result.message_id)
   }
 
+  async delete(accountId: string, chatId: string, messageId: string): Promise<void> {
+    await this.call<true>(accountId, "deleteMessage", {
+      chat_id: chatId,
+      message_id: Number(messageId),
+    })
+  }
+
   async forward(
     accountId: string,
     targetChatId: string,
@@ -220,6 +229,10 @@ export class TelegramRuntime {
   private readonly userClients = new Map<string, TelegramClient<sessions.StringSession>>()
   private readonly userDisconnectedSince = new Map<string, number>()
   private readonly userCatchingUp = new Set<string>()
+  private readonly userHistorySyncing = new Set<string>()
+  private readonly userHistoryCatchupRequired = new Set<string>()
+  private readonly userHistoryNextAt = new Map<string, number>()
+  private readonly userHistoryGroupIndex = new Map<string, number>()
   private readonly attachmentTasks = new Set<Promise<void>>()
   private discardLateAttachmentResults = false
   private timer: ReturnType<typeof setInterval> | null = null
@@ -267,6 +280,10 @@ export class TelegramRuntime {
     this.userClients.clear()
     this.userDisconnectedSince.clear()
     this.userCatchingUp.clear()
+    this.userHistorySyncing.clear()
+    this.userHistoryCatchupRequired.clear()
+    this.userHistoryNextAt.clear()
+    this.userHistoryGroupIndex.clear()
     await this.processor.stop()
   }
 
@@ -345,6 +362,22 @@ export class TelegramRuntime {
         ownershipId,
       )
       throw deliveryError
+    }
+  }
+
+  async deleteMessage(accountId: string, chatId: string, messageId: string): Promise<void> {
+    telegramMessageId(messageId)
+    const account = this.admin.getAccount(accountId)
+    if (account.type === "bot") {
+      await this.bot.delete(accountId, chatId, messageId)
+      return
+    }
+    const client = this.userClients.get(accountId)
+    if (!client) throw new TelegramDeliveryError("account_unavailable", "failed")
+    try {
+      await client.deleteMessages(chatId, [Number(messageId)], { revoke: true })
+    } catch (error) {
+      throw networkDeliveryError(error)
     }
   }
 
@@ -439,12 +472,20 @@ export class TelegramRuntime {
       if (!eligibleUserAccounts.has(accountId)) {
         this.userClients.delete(accountId)
         this.userDisconnectedSince.delete(accountId)
+        this.userHistoryNextAt.delete(accountId)
+        this.userHistoryGroupIndex.delete(accountId)
+        this.clearUserHistoryCatchup(accountId)
         void client.disconnect().catch(() => undefined)
         continue
       }
       if (client.connected) {
         const recovered = this.userDisconnectedSince.delete(accountId)
         if (recovered) void this.catchUpUser(accountId, client)
+        if (!this.userHistorySyncing.has(accountId)
+          && Date.now() >= (this.userHistoryNextAt.get(accountId) ?? 0)) {
+          this.userHistoryNextAt.set(accountId, Date.now() + userHistoryReconcileIntervalMs)
+          void this.syncNextUserGroup(accountId, client)
+        }
         continue
       }
       const disconnectedSince = this.userDisconnectedSince.get(accountId) ?? Date.now()
@@ -452,6 +493,8 @@ export class TelegramRuntime {
       if (Date.now() - disconnectedSince < userReconnectGraceMs) continue
       this.userClients.delete(accountId)
       this.userDisconnectedSince.delete(accountId)
+      this.userHistoryNextAt.delete(accountId)
+      this.clearUserHistoryCatchup(accountId)
       void client.disconnect().catch(() => undefined)
     }
     accounts.forEach((account) => {
@@ -552,6 +595,7 @@ export class TelegramRuntime {
       this.userClients.set(accountId, client)
       this.userDisconnectedSince.delete(accountId)
       await this.catchUpUser(accountId, client)
+      this.userHistoryNextAt.set(accountId, 0)
     } catch {
       await client.disconnect().catch(() => undefined)
       this.lastErrorAt = new Date().toISOString()
@@ -565,6 +609,10 @@ export class TelegramRuntime {
     if (this.userCatchingUp.has(accountId) || this.userClients.get(accountId) !== client || !client.connected) return
     this.userCatchingUp.add(accountId)
     try {
+      const cursorGroups = this.database.prepare(
+        "SELECT group_id FROM telegram_user_chat_cursors WHERE account_id=?",
+      ).all(accountId) as Array<{ group_id: string }>
+      cursorGroups.forEach((row) => this.userHistoryCatchupRequired.add(`${accountId}:${row.group_id}`))
       await client.catchUp()
       this.lastUpdateAt = new Date().toISOString()
     } catch {
@@ -575,26 +623,122 @@ export class TelegramRuntime {
     }
   }
 
-  private async handleUserMessage(accountId: string, event: NewMessageEvent): Promise<void> {
+  private async syncNextUserGroup(accountId: string, client: TelegramClient<sessions.StringSession>): Promise<void> {
+    if (this.userHistorySyncing.has(accountId) || this.userClients.get(accountId) !== client || !client.connected) return
+    const groups = this.database.readGroups().filter((group) => (
+      group.enabled && group.accountId === accountId && group.accessMode === "user" && group.telegramChatId
+    ))
+    if (groups.length === 0) return
+    const pendingIndex = groups.findIndex((group) => this.userHistoryCatchupRequired.has(`${accountId}:${group.id}`))
+    const index = pendingIndex >= 0
+      ? pendingIndex
+      : (this.userHistoryGroupIndex.get(accountId) ?? 0) % groups.length
+    const group = groups[index]!
+    this.userHistoryGroupIndex.set(accountId, (index + 1) % groups.length)
+    this.userHistorySyncing.add(accountId)
+    try {
+      const cursor = this.database.prepare(`SELECT telegram_chat_id,last_message_id FROM telegram_user_chat_cursors
+        WHERE account_id=? AND group_id=?`).get(accountId, group.id) as {
+          telegram_chat_id: string; last_message_id: number
+        } | undefined
+      if (!cursor || !chatMatches(cursor.telegram_chat_id, group.telegramChatId!)) {
+        const latest = await client.getMessages(group.telegramChatId!, { limit: 1 })
+        const head = latest.length > 0 ? Number(latest[0]!.id) : 0
+        this.initializeUserCursor(accountId, group, Number.isSafeInteger(head) && head >= 0 ? head : 0)
+        this.userHistoryCatchupRequired.delete(`${accountId}:${group.id}`)
+        return
+      }
+      const messages = await client.getMessages(group.telegramChatId!, {
+        limit: userHistoryBatchSize,
+        offsetId: Number(cursor.last_message_id),
+        reverse: true,
+      })
+      for (const message of messages) {
+        if (!this.running || this.userClients.get(accountId) !== client || !client.connected) break
+        const messageId = Number(message.id)
+        if (!Number.isSafeInteger(messageId) || messageId <= cursor.last_message_id) continue
+        await this.handleUserMessage(accountId, { message } as NewMessageEvent, true)
+      }
+      if (messages.length < userHistoryBatchSize) {
+        this.userHistoryCatchupRequired.delete(`${accountId}:${group.id}`)
+      }
+      this.lastUpdateAt = new Date().toISOString()
+    } catch {
+      this.lastErrorAt = new Date().toISOString()
+      this.lastErrorCode = "user_history_reconcile_failed"
+    } finally {
+      this.userHistorySyncing.delete(accountId)
+    }
+  }
+
+  private initializeUserCursor(accountId: string, group: RuntimeGroup, messageId: number): void {
+    const now = new Date().toISOString()
+    this.database.prepare(`INSERT INTO telegram_user_chat_cursors(
+      account_id,group_id,telegram_chat_id,last_message_id,initialized_at,updated_at
+    ) VALUES(?,?,?,?,?,?) ON CONFLICT(account_id,group_id) DO UPDATE SET
+      telegram_chat_id=excluded.telegram_chat_id,last_message_id=excluded.last_message_id,
+      initialized_at=excluded.initialized_at,updated_at=excluded.updated_at`).run(
+      accountId, group.id, group.telegramChatId!, messageId, now, now,
+    )
+  }
+
+  private advanceUserCursor(accountId: string, group: RuntimeGroup, messageId: number): void {
+    if (!Number.isSafeInteger(messageId) || messageId < 0 || !group.telegramChatId) return
+    const now = new Date().toISOString()
+    this.database.prepare(`INSERT INTO telegram_user_chat_cursors(
+      account_id,group_id,telegram_chat_id,last_message_id,initialized_at,updated_at
+    ) VALUES(?,?,?,?,?,?) ON CONFLICT(account_id,group_id) DO UPDATE SET
+      telegram_chat_id=excluded.telegram_chat_id,
+      last_message_id=CASE
+        WHEN telegram_user_chat_cursors.telegram_chat_id<>excluded.telegram_chat_id THEN excluded.last_message_id
+        WHEN excluded.last_message_id>telegram_user_chat_cursors.last_message_id THEN excluded.last_message_id
+        ELSE telegram_user_chat_cursors.last_message_id END,
+      initialized_at=CASE WHEN telegram_user_chat_cursors.telegram_chat_id<>excluded.telegram_chat_id
+        THEN excluded.initialized_at ELSE telegram_user_chat_cursors.initialized_at END,
+      updated_at=excluded.updated_at`).run(accountId, group.id, group.telegramChatId, messageId, now, now)
+  }
+
+  private clearUserHistoryCatchup(accountId: string): void {
+    for (const key of this.userHistoryCatchupRequired) {
+      if (key.startsWith(`${accountId}:`)) this.userHistoryCatchupRequired.delete(key)
+    }
+  }
+
+  private async handleUserMessage(
+    accountId: string,
+    event: NewMessageEvent,
+    historyReconcile = false,
+  ): Promise<void> {
     const message = event.message
     const chatId = message.chatId?.toString()
     if (!chatId) return
+    const group = this.groupFor(accountId, "user", chatId)
+    if (!group) return
+    const messageId = Number(message.id)
     if (message.out && await this.isApplicationOutput(
       accountId,
       chatId,
       String(message.id),
       message.text ?? "",
       message.replyToMsgId === undefined ? null : String(message.replyToMsgId),
-    )) return
-    const group = this.groupFor(accountId, "user", chatId)
-    if (!group) return
+    )) {
+      if (historyReconcile || !this.userHistoryCatchupRequired.has(`${accountId}:${group.id}`)) {
+        this.advanceUserCursor(accountId, group, messageId)
+      }
+      return
+    }
     const sender = message.sender as {
       username?: string
       bot?: boolean
       firstName?: string
       lastName?: string
     } | undefined
-    if (sender?.bot) return
+    if (sender?.bot) {
+      if (historyReconcile || !this.userHistoryCatchupRequired.has(`${accountId}:${group.id}`)) {
+        this.advanceUserCursor(accountId, group, messageId)
+      }
+      return
+    }
     const replyToMessageId = message.replyToMsgId === undefined ? null : String(message.replyToMsgId)
     const replyTargetIsBot = replyToMessageId !== null && (
       Boolean(this.database.prepare(`SELECT 1 FROM telegram_output_ownership
@@ -632,6 +776,9 @@ export class TelegramRuntime {
       ...(message.date ? { createdAt: new Date(message.date * 1000).toISOString() } : {}),
     })
     if (recorded && descriptors.length > 0) this.prepareAttachments(recorded.id, descriptors)
+    if (historyReconcile || !this.userHistoryCatchupRequired.has(`${accountId}:${group.id}`)) {
+      this.advanceUserCursor(accountId, group, messageId)
+    }
     this.lastUpdateAt = new Date().toISOString()
   }
 

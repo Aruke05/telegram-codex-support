@@ -365,6 +365,7 @@ export class SupportInvestigationService {
         escalationType: baseline.escalationType,
         humanOperation: baseline.humanOperation,
         userUnfreeze: baseline.userUnfreeze,
+        userCredentialReset: baseline.userCredentialReset,
         responsibility: baseline.responsibility,
         interaction: baseline.interaction,
       },

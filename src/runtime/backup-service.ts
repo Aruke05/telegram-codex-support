@@ -63,6 +63,7 @@ const portableTables = [
   "admin_chat_corrections",
   "reply_generation_audits",
   "user_unfreeze_actions",
+  "user_credential_reset_actions",
   "memory_maintenance_runs",
   "model_instances",
   "model_catalog_entries",
@@ -82,6 +83,7 @@ const sensitiveScanTables = [
   "support_message_attachments", "support_replies", "support_reply_payloads", "reply_memory_refs",
   "shadow_answer_results", "shadow_human_answer_links", "shadow_learning_reports", "shadow_comparisons",
   "admin_chat_attachments", "admin_chat_corrections", "reply_generation_audits", "user_unfreeze_actions",
+  "user_credential_reset_actions",
   "memory_maintenance_runs", "knowledge_documents",
   "model_profiles", "model_instances", "runtime_model_bindings", "runtime_settings", "daily_group_shutdown_schedule",
 ] as const
@@ -289,9 +291,19 @@ export class BackupService {
           WHERE status IN ('awaiting_confirmation_delivery','pending_confirmation','executing')`).run(
           new Date().toISOString(), new Date().toISOString(),
         )
+        portable.prepare(`UPDATE user_credential_reset_actions SET
+          status=CASE WHEN status='executing' THEN 'execution_unknown' ELSE 'expired' END,
+          result_code=CASE WHEN status='executing' THEN 'migration_interrupted' ELSE 'migration_expired' END,
+          password_delivery_status=CASE WHEN password_delivery_status='sending' THEN 'unknown' ELSE password_delivery_status END,
+          safe_summary='迁移时终止了未完成的客服账号重置审批',completed_at=?,updated_at=?
+          WHERE status IN ('awaiting_confirmation_delivery','pending_confirmation','executing')`).run(
+          new Date().toISOString(), new Date().toISOString(),
+        )
         portable.prepare("UPDATE support_message_events SET account_id=NULL").run()
         portable.prepare("UPDATE support_message_attachments SET storage_path=''").run()
         portable.prepare("UPDATE admin_chat_attachments SET storage_path=''").run()
+        portable.prepare("DELETE FROM secret_message_deletions").run()
+        portable.prepare("DELETE FROM telegram_user_chat_cursors").run()
         portable.prepare("DELETE FROM telegram_accounts").run()
         portable.prepare("DELETE FROM telegram_offsets").run()
         portable.prepare("DELETE FROM code_sync_runs").run()
@@ -366,6 +378,7 @@ export class BackupService {
     let portableHasAdminChatCorrections = false
     let portableHasReplyGenerationAudits = false
     let portableHasUserUnfreezeActions = false
+    let portableHasUserCredentialResetActions = false
     let portableHasThreadLinks = false
     let portableHasSenderFocus = false
     let portableHasDailyGroupShutdownSchedule = false
@@ -478,6 +491,9 @@ export class BackupService {
         .map((column) => column.name) : []
       portableHasUserUnfreezeActions = ["sys_user_id", "resource_fingerprint", "preflight_checked_at"]
         .every((column) => portableUnfreezeActionColumns.includes(column))
+      portableHasUserCredentialResetActions = Boolean(portableStructure.prepare(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='user_credential_reset_actions'",
+      ).get())
       portableHasThreadLinks = Boolean(portableStructure.prepare(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='support_thread_links'",
       ).get())
@@ -745,6 +761,13 @@ export class BackupService {
             confirmer_message_event_id,confirmer_user_id,confirmer_username,expires_at,execution_started_at,
             completed_at,before_status,after_status,affected_rows,result_code,safe_summary,created_at,updated_at`)
         }
+        if (portableHasUserCredentialResetActions) {
+          copy("user_credential_reset_actions", `id,thread_id,input_revision,group_id,project_id,service_id,
+            server_resource_id,database_resource_id,request_message_event_id,confirmation_reply_id,username,sys_user_id,state_token,
+            resource_fingerprint,reset_password,reset_totp,requester_user_id,preflight_checked_at,status,
+            confirmation_telegram_message_id,confirmer_message_event_id,confirmer_user_id,confirmer_username,
+            expires_at,execution_started_at,completed_at,result_code,password_delivery_status,safe_summary,created_at,updated_at`)
+        }
         if (portableHasShadowLearning) {
           copy("shadow_answer_results", `id,reply_id,thread_id,input_revision,outcome_status,decision,answer,quote_text,
             reason,confidence,code_revision,memory_version_refs_json,simulated_action,output_redacted,error_code,created_at,updated_at`)
@@ -836,7 +859,7 @@ export class BackupService {
     const integrity = portable.prepare("PRAGMA integrity_check").all() as Array<{ integrity_check: string }>
     if (integrity.length !== 1 || integrity[0]?.integrity_check !== "ok") throw new Error("迁移数据库完整性检查失败")
     const schemaVersion = portable.schemaVersion()
-    if (![12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38].includes(schemaVersion)) {
+    if (![12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39].includes(schemaVersion)) {
       throw new Error("迁移数据库版本不兼容")
     }
     const existing = new Set((portable.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>).map((row) => row.name))
@@ -864,6 +887,7 @@ export class BackupService {
       && !(schemaVersion <= 25 && table === "daily_group_shutdown_schedule")
       && !(schemaVersion <= 28 && ["shadow_answer_results", "shadow_human_answer_links", "shadow_learning_reports", "shadow_comparisons"].includes(table))
       && !(schemaVersion <= 37 && table === "user_unfreeze_actions")
+      && !(schemaVersion <= 38 && table === "user_credential_reset_actions")
       && !(modelLineage === "legacy" && portableModelTables.includes(table as (typeof portableModelTables)[number]))
       && !existing.has(table)
     ))) throw new Error("迁移数据库结构不完整")

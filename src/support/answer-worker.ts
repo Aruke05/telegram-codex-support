@@ -29,6 +29,7 @@ import type { SupportThreadStore } from "./thread-store.js"
 import type { TrustedDatabaseQueryRequest } from "./trusted-command-observation.js"
 import { ShadowLearningStore } from "./shadow-learning-store.js"
 import type { UserUnfreezeService } from "./user-unfreeze-service.js"
+import type { UserCredentialResetService } from "./user-credential-reset-service.js"
 
 type CodeSyncPort = {
   readCurrentSnapshot(serviceId: string): ProjectCodeSnapshot
@@ -79,6 +80,7 @@ export type SupportAnswerWorkerDependencies = {
   resourceWorkspace: Pick<ResourceWorkspace, "open">
   resourceBroker?: ResourceBrokerPort
   userUnfreeze?: Pick<UserUnfreezeService, "prepareConfirmation" | "confirmationDelivered" | "confirmationDeliveryFailed">
+  userCredentialReset?: Pick<UserCredentialResetService, "prepareConfirmation" | "confirmationDelivered" | "confirmationDeliveryFailed">
 }
 
 const maximumPendingAnswers = 128
@@ -680,7 +682,9 @@ export class SupportAnswerWorker {
       const redactedQuote = decision.quote === null ? null : this.deps.redactor.redact(decision.quote).text
       const memoryVersionRefs = decision.usedMemoryVersionIds.filter((id) => allowedMemoryIds.has(id))
       const simulatedAction = decision.decision === "reply"
-        ? decision.userUnfreeze ? "user_unfreeze_confirmation" : "reply"
+        ? decision.userUnfreeze
+          ? "user_unfreeze_confirmation"
+          : decision.userCredentialReset ? "user_credential_reset_confirmation" : "reply"
         : decision.decision === "ignore"
           ? "no_action"
           : decision.escalationType === "feature_request"
@@ -754,10 +758,21 @@ export class SupportAnswerWorker {
     )) {
       throw new Error("用户解冻确认文案未明确展示目标或错误声称已经完成")
     }
+    if (decision.userCredentialReset) {
+      const reset = decision.userCredentialReset
+      const requestedLabels = [reset.resetPassword ? "密码" : "", reset.resetTotp ? "谷歌验证" : ""].filter(Boolean)
+      if (!answer.includes(reset.username)
+        || requestedLabels.some((label) => !answer.includes(label))
+        || !/(?:确认|是否|要不要|现在重置|可以重置)/u.test(answer)
+        || /(?:已经|已)(?:完成|处理|重置)|重置成功/u.test(answer)) {
+        throw new Error("客服账号重置确认文案未明确展示目标、范围或错误声称已经完成")
+      }
+    }
     if (!this.current(thread.id, inputRevision)) return this.supersede(replyId)
     const quote = decision.quote && originText.includes(decision.quote) ? decision.quote : null
     const memoryVersionRefs = decision.usedMemoryVersionIds.filter((id) => allowedMemoryIds.has(id))
     if (decision.userUnfreeze && !this.deps.userUnfreeze) throw new Error("用户解冻审批服务未配置")
+    if (decision.userCredentialReset && !this.deps.userCredentialReset) throw new Error("客服账号重置审批服务未配置")
     const unfreezeActionId = decision.userUnfreeze
       ? await this.deps.userUnfreeze!.prepareConfirmation({
           replyId,
@@ -767,8 +782,20 @@ export class SupportAnswerWorker {
           username: decision.userUnfreeze.username,
         })
       : null
+    const credentialResetActionId = decision.userCredentialReset
+      ? await this.deps.userCredentialReset!.prepareConfirmation({
+          replyId,
+          thread,
+          inputRevision,
+          group,
+          username: decision.userCredentialReset.username,
+          resetPassword: decision.userCredentialReset.resetPassword,
+          resetTotp: decision.userCredentialReset.resetTotp,
+        })
+      : null
     if (!this.current(thread.id, inputRevision)) {
       if (unfreezeActionId) this.deps.userUnfreeze!.confirmationDeliveryFailed(unfreezeActionId, false)
+      if (credentialResetActionId) this.deps.userCredentialReset!.confirmationDeliveryFailed(credentialResetActionId, false)
       return this.supersede(replyId)
     }
     const sending = this.deps.replies.claimSending(replyId, {
@@ -782,6 +809,7 @@ export class SupportAnswerWorker {
     })
     if (!sending) {
       if (unfreezeActionId) this.deps.userUnfreeze!.confirmationDeliveryFailed(unfreezeActionId, false)
+      if (credentialResetActionId) this.deps.userCredentialReset!.confirmationDeliveryFailed(credentialResetActionId, false)
       return
     }
     let messageId: string
@@ -801,13 +829,21 @@ export class SupportAnswerWorker {
           error instanceof TelegramDeliveryError && error.state === "uncertain",
         )
       }
+      if (credentialResetActionId) {
+        this.deps.userCredentialReset!.confirmationDeliveryFailed(
+          credentialResetActionId,
+          error instanceof TelegramDeliveryError && error.state === "uncertain",
+        )
+      }
       throw error
     }
     try {
       this.deps.replies.transition(replyId, "replied", { telegramReplyMessageId: messageId })
       if (unfreezeActionId) this.deps.userUnfreeze!.confirmationDelivered(unfreezeActionId, messageId)
+      if (credentialResetActionId) this.deps.userCredentialReset!.confirmationDelivered(credentialResetActionId, messageId)
     } catch (error) {
       if (unfreezeActionId) this.deps.userUnfreeze!.confirmationDeliveryFailed(unfreezeActionId, true)
+      if (credentialResetActionId) this.deps.userCredentialReset!.confirmationDeliveryFailed(credentialResetActionId, true)
       throw error
     }
     if (sending.senderUserId) this.deps.store.setSenderFocusAfterDeliveredReply(

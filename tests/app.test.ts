@@ -81,8 +81,8 @@ describe("GET /health", () => {
     expect(response.json()).toEqual({
       status: "ok",
       service: "telegram-codex-support",
-      version: "2.4.0",
-      schemaVersion: 38,
+      version: "2.5.0",
+      schemaVersion: 39,
     })
     expect(response.body).not.toContain("TOKEN")
   })
