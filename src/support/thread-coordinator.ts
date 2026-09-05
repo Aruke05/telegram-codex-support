@@ -1168,29 +1168,14 @@ export class SupportThreadCoordinator {
   }
 
   private async sendStatusOnlyUpdate(
-    batch: Omit<PendingBatch, "timer">,
-    thread: SupportThread,
-    text: string | null | undefined,
+    _batch: Omit<PendingBatch, "timer">,
+    _thread: SupportThread,
+    _text: string | null | undefined,
     events: SupportMessageEvent[],
   ): Promise<void> {
-    const latestEvent = events.at(-1)!
-    let reason = "仅询问当前排查进度，不改变排查输入"
-    try {
-      if (thread.answerOperationMode !== "learning" && text && this.deps.sendStatusUpdate) {
-        await this.deps.sendStatusUpdate({
-          group: batch.group,
-          service: batch.service,
-          thread,
-          event: latestEvent,
-          text,
-        })
-        reason = "仅询问当前排查进度，已由当班客服回复且不改变排查输入"
-      }
-    } catch {
-      reason = "仅询问当前排查进度，进度回复发送失败但不改变排查输入"
-    } finally {
-      events.forEach((event) => this.deps.store.updateEventRoute(event.id, "routed", reason))
-    }
+    events.forEach((event) => this.deps.store.updateEventRoute(
+      event.id, "routed", "仅询问当前排查进度，不改变排查输入，进度回复已停用",
+    ))
   }
 
   private async routeDecision(

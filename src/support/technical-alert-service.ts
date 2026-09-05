@@ -5,7 +5,6 @@ import type { RuntimeDatabase } from "../runtime/database.js"
 import type { RuntimeGroup } from "../runtime/types.js"
 import type { ConfiguredSecretRedactor } from "../security/dlp.js"
 import {
-  TelegramDeliveryError,
   type TelegramDeliveryErrorType,
   type TelegramOutputOwnership,
 } from "../telegram/runtime.js"
@@ -62,23 +61,14 @@ type CodeSyncAlertInput = {
   additionalReason?: string
 }
 
-const deliverySummaries: Record<TelegramDeliveryErrorType, string> = {
-  account_unavailable: "发送失败：Telegram 账号未配置或连接未就绪",
-  rate_limited: "发送失败：Telegram 限流",
-  forbidden: "发送失败：账号无权向技术告警群发消息",
-  chat_not_found: "发送失败：技术告警群不存在或群 ID 无效",
-  timeout: "发送结果未知：Telegram 请求超时",
-  network: "发送结果未知：Telegram 网络连接中断",
-  unknown: "发送失败：Telegram 返回未知错误",
-}
-
+// 保留调用契约与真实停用状态，所有技术群投递（包括恢复重试）均在此终止。
 export class TechnicalAlertService {
   constructor(
-    private readonly database: RuntimeDatabase,
-    private readonly store: SupportThreadStore,
-    private readonly replies: ReplyService,
+    _database: RuntimeDatabase,
+    _store: SupportThreadStore,
+    _replies: ReplyService,
     _redactor: ConfiguredSecretRedactor,
-    private readonly transport: TransportPort,
+    _transport: TransportPort,
   ) {}
 
   async sendSupportAlert(
@@ -88,9 +78,7 @@ export class TechnicalAlertService {
     operatorAnswer?: string,
     alertKind?: TechnicalAlertKind,
   ): Promise<TechnicalAlertDelivery> {
-    if (alertKind === "escalation") {
-      return this.forwardThread(sourceGroup, replyId, "technical_alert:escalation")
-    }
+    void alertKind
     void sourceGroup
     void replyId
     void reason
@@ -106,7 +94,9 @@ export class TechnicalAlertService {
   ): Promise<TechnicalAlertDelivery> {
     void reason
     void operatorAnswer
-    return this.forwardThread(sourceGroup, replyId, "technical_alert:feature_request")
+    void sourceGroup
+    void replyId
+    return this.suppressed()
   }
 
   async sendCodeSyncFailure(input: CodeSyncAlertInput): Promise<TechnicalAlertDelivery> {
@@ -124,67 +114,7 @@ export class TechnicalAlertService {
     return this.suppressed()
   }
 
-  private async forwardThread(
-    sourceGroup: RuntimeGroup,
-    replyId: string,
-    outputKind: string,
-  ): Promise<TechnicalAlertDelivery> {
-    const record = this.replies.getDetail(replyId)
-    if (record.threadId && this.store.getThread(record.threadId).answerOperationMode === "learning") {
-      return { status: "not_configured", summary: "学习模式禁止 Telegram 输出", errorType: null }
-    }
-    const target = this.database.readGroups().find((group) => (
-      group.enabled && group.purpose === "technical_alert" && group.telegramChatId
-    ))
-    if (!target) return { status: "not_configured", summary: "技术告警群未配置", errorType: null }
-    if (!target.accountId) return { status: "not_configured", summary: "技术告警群账号未配置", errorType: null }
-    if (!sourceGroup.telegramChatId || !this.transport.forwardMessages) {
-      return { status: "failed", summary: "原消息无法转发", errorType: "unknown" }
-    }
-    const targetAccountId = target.accountId
-    const targetChatId = target.telegramChatId!
-    const sourceChatId = sourceGroup.telegramChatId
-    const messageIds = record.threadId
-      ? this.store.listThreadForwardMessageIds(record.threadId)
-      : record.telegramMessageId ? [record.telegramMessageId] : []
-    if (messageIds.length === 0) return { status: "failed", summary: "没有可转发的原消息", errorType: "unknown" }
-
-    try {
-      // Telegram 原生支持一次按顺序转发整组消息。整批调用可以保留相册和上下文顺序，
-      // 也避免逐条发送在中途失败后只把线程前半段交给技术群。
-      const delivered = await this.transport.forwardMessages(
-        targetAccountId,
-        targetChatId,
-        sourceChatId,
-        messageIds,
-        {
-          groupId: target.id,
-          threadId: record.threadId,
-          serviceId: record.serviceId,
-          replyId,
-          kind: outputKind,
-        },
-      )
-      if (delivered.length !== messageIds.length) throw new TelegramDeliveryError("unknown", "uncertain")
-      return { status: "sent", summary: `已转发 ${delivered.length} 条`, errorType: null }
-    } catch (error) {
-      const deliveryError = error instanceof TelegramDeliveryError
-        ? error
-        : new TelegramDeliveryError("unknown", "uncertain")
-      if (deliveryError.state === "uncertain") return {
-        status: "uncertain",
-        summary: "整组原消息转发结果未知",
-        errorType: deliveryError.type,
-      }
-      return {
-        status: "failed",
-        summary: deliverySummaries[deliveryError.type],
-        errorType: deliveryError.type,
-      }
-    }
-  }
-
   private suppressed(): TechnicalAlertDelivery {
-    return { status: "not_configured", summary: "技术群系统消息已停用", errorType: null }
+    return { status: "not_configured", summary: "技术群转发与通知已停用", errorType: null }
   }
 }

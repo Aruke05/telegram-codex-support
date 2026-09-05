@@ -306,9 +306,6 @@ export const classifyThreadRouteResultSchema = z.object({
   if (value.investigationEffect === "status_only" && value.action !== "follow_up") {
     context.addIssue({ code: "custom", path: ["investigationEffect"], message: "只有后续追问可以是不改变排查输入的进度询问" })
   }
-  if (value.investigationEffect === "status_only" && !value.progressReply) {
-    context.addIssue({ code: "custom", path: ["progressReply"], message: "进度询问必须生成当班客服的进度回复" })
-  }
   if (value.investigationEffect !== "status_only" && value.progressReply != null) {
     context.addIssue({ code: "custom", path: ["progressReply"], message: "非进度询问不能生成进度回复" })
   }
@@ -341,9 +338,6 @@ export const threadRouteResultSchema = z.object({
   }
   if (value.investigationEffect === "status_only" && value.action !== "follow_up") {
     context.addIssue({ code: "custom", path: ["investigationEffect"], message: "只有后续追问可以是不改变排查输入的进度询问" })
-  }
-  if (value.investigationEffect === "status_only" && !value.progressReply) {
-    context.addIssue({ code: "custom", path: ["progressReply"], message: "进度询问必须生成当班客服的进度回复" })
   }
   if (value.investigationEffect !== "status_only" && value.progressReply != null) {
     context.addIssue({ code: "custom", path: ["progressReply"], message: "非进度询问不能生成进度回复" })
