@@ -100,6 +100,7 @@ const humanOperationSchema = z.object({
 }).strict()
 
 export const userUnfreezeRequestSchema = z.object({
+  operation: z.enum(["unfreeze", "freeze"]).optional(),
   username: z.string().trim().min(1).max(120).regex(/^[\p{L}\p{N}_.@+\-]+$/u),
 }).strict()
 
@@ -416,8 +417,9 @@ export const answerDecisionJsonSchema = {
       anyOf: [{
         type: "object",
         additionalProperties: false,
-        required: ["username"],
+        required: ["username", "operation"],
         properties: {
+          operation: { type: "string", enum: ["unfreeze", "freeze"] },
           username: { type: "string", minLength: 1, maxLength: 120 },
         },
       }, { type: "null" }],

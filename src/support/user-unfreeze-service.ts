@@ -8,6 +8,7 @@ import type { RuntimeGroup, SupportMessageEvent, SupportThread } from "../runtim
 import type { ConfiguredSecretRedactor } from "../security/dlp.js"
 import { TelegramDeliveryError, type TelegramOutputOwnership } from "../telegram/runtime.js"
 import type { ResourceWorkspace } from "./resource-workspace.js"
+import { boundAccountActionGroup, currentAccountAction, invalidateStaleAccountActions } from "./user-account-action.js"
 
 type TransportPort = {
   sendMessage(
@@ -20,7 +21,10 @@ type TransportPort = {
   ): Promise<string>
 }
 
+type StatusOperation = "unfreeze" | "freeze"
+
 type UserUnfreezeActionRow = {
+  operation: StatusOperation
   id: string
   thread_id: string
   input_revision: number
@@ -71,6 +75,7 @@ export type UserUnfreezeOperationExecutor = (input: {
   username: string
   sysUserId: string
   resourceFingerprint: string
+  operation?: StatusOperation
 }) => Promise<RemoteUnfreezeResult>
 
 export type UserUnfreezePreflightExecutor = (input: {
@@ -81,6 +86,7 @@ export type UserUnfreezePreflightExecutor = (input: {
   databaseResourceId: string
   username: string
   resourceFingerprint: string
+  operation?: StatusOperation
 }) => Promise<RemoteUnfreezeResult>
 
 export type UserUnfreezeConfirmationMatch = {
@@ -98,12 +104,13 @@ export type UserUnfreezeConfirmationInput = {
 
 const confirmationTtlMs = 10 * 60 * 1000
 export const userUnfreezeUpdateSql = "UPDATE sys_user SET status=1 WHERE id=%s AND status=2 AND del_flag=0"
+export const userFreezeUpdateSql = "UPDATE sys_user SET status=2 WHERE id=%s AND status=1 AND del_flag=0"
 const affirmativeReplies = new Set([
-  "嗯", "嗯嗯", "好", "好的", "行", "可以", "可以的", "确认", "确认解冻", "解冻吧", "处理吧",
+  "嗯", "嗯嗯", "好", "好的", "行", "可以", "可以的", "确认", "确认解冻", "解冻吧", "确认冻结", "冻结吧", "处理吧",
   "是", "是的", "对", "对的", "ok", "okay", "yes",
 ])
 const negativeReplies = new Set([
-  "不", "不用", "不用了", "取消", "先不用", "暂时不用", "别解冻", "算了", "算了吧", "no",
+  "不", "不用", "不用了", "取消", "先不用", "暂时不用", "别解冻", "别冻结", "算了", "算了吧", "no",
 ])
 
 function normalizeConfirmation(value: string): string {
@@ -118,8 +125,9 @@ function resourceFingerprint(server: {
   id: string; alias: string; host: string; port: number; username: string; privateKey: string; workdir: string
 }, database: {
   id: string; alias: string; host: string; port: number; database: string; username: string; password: string
-}): string {
+}, group: Pick<RuntimeGroup, "accountId" | "telegramChatId">): string {
   return createHash("sha256").update(JSON.stringify({
+    destination: [group.accountId, group.telegramChatId],
     server: [server.id, server.alias, server.host, server.port, server.username, server.privateKey, server.workdir],
     database: [database.id, database.alias, database.host, database.port, database.database, database.username, database.password],
   })).digest("hex")
@@ -131,45 +139,51 @@ function sourceContainsUsername(source: string, username: string): boolean {
   return new RegExp(`(?<![A-Za-z0-9_.@+\\-])${escaped}(?![A-Za-z0-9_.@+\\-])`, "u").test(source)
 }
 
-function validatedRemoteResult(result: RemoteUnfreezeResult, expectedUserId?: string): RemoteUnfreezeResult {
+function validatedRemoteResult(result: RemoteUnfreezeResult, expectedUserId?: string, operation: StatusOperation = "unfreeze"): RemoteUnfreezeResult {
+  const before = operation === "freeze" ? 1 : 2
+  const after = operation === "freeze" ? 2 : 1
   if (result.resultCode === "eligible") {
-    return result.ok === true && typeof result.sysUserId === "string" && result.beforeStatus === 2
-      && result.afterStatus === 2 && result.affectedRows === 0
+    return result.ok === true && typeof result.sysUserId === "string" && result.beforeStatus === before
+      && result.afterStatus === before && result.affectedRows === 0
       ? result
       : { ok: false, resultCode: "invalid_remote_result" }
   }
-  if (result.resultCode === "unfrozen") {
+  if (result.resultCode === (operation === "freeze" ? "frozen" : "unfrozen")) {
     return result.ok === true && result.sysUserId === expectedUserId
-      && result.beforeStatus === 2 && result.afterStatus === 1 && result.affectedRows === 1
+      && result.beforeStatus === before && result.afterStatus === after && result.affectedRows === 1
       ? result
       : { ok: false, resultCode: "invalid_remote_result" }
   }
-  if (result.resultCode === "already_unfrozen") {
+  if (result.resultCode === (operation === "freeze" ? "already_frozen" : "already_unfrozen")) {
     return result.ok === true && result.sysUserId === expectedUserId
-      && result.beforeStatus === 1 && result.afterStatus === 1
+      && result.beforeStatus === after && result.afterStatus === after
       && (result.affectedRows === undefined || result.affectedRows === 0)
       ? result
       : { ok: false, resultCode: "invalid_remote_result" }
   }
-  return result.ok === false ? result : { ok: false, resultCode: "invalid_remote_result" }
+  return result.ok === false && !["eligible", "frozen", "unfrozen", "already_frozen", "already_unfrozen"].includes(result.resultCode)
+    ? result : { ok: false, resultCode: "invalid_remote_result" }
 }
 
-function actionResultMessage(username: string, resultCode: string): string {
+function actionResultMessage(username: string, resultCode: string, operation: StatusOperation = "unfreeze"): string {
+  const label = operation === "freeze" ? "冻结" : "解冻"
   switch (resultCode) {
+    case "frozen": return `账号 ${username} 已冻结`
+    case "already_frozen": return `账号 ${username} 已经是冻结状态，无需重复操作`
     case "unfrozen": return `账号 ${username} 的冻结状态已经解除了，可以重新尝试登录；如果之前连续输错过密码，原来的十分钟登录限制不会被这次解冻清掉`
     case "already_unfrozen": return `账号 ${username} 现在已经是正常状态，不用再解冻了`
-    case "cancelled": return `好，账号 ${username} 先不解冻`
+    case "cancelled": return `好，账号 ${username} 先不${label}`
     case "not_found": return `没有查到账号 ${username}，这次没有做修改`
-    case "deleted": return `账号 ${username} 已经是删除状态，这次不能解冻`
-    case "invalid_status": return `账号 ${username} 当前不是冻结状态，这次没有做修改`
+    case "deleted": return `账号 ${username} 已经是删除状态，这次不能${label}`
+    case "invalid_status": return `账号 ${username} 当前状态不符合本次操作条件，这次没有做修改`
     case "conflict": return `账号 ${username} 的状态刚刚发生了变化，这次没有做修改，你再发我确认一下`
     case "ssh_failed":
     case "execution_timeout":
     case "invalid_remote_result":
     case "database_error":
     case "execution_unknown":
-      return `账号 ${username} 的解冻结果暂时无法确认，先不要重复操作；需要按这次记录核对清楚后再处理`
-    default: return `账号 ${username} 这次没能解冻成功，没有执行新的修改`
+      return `账号 ${username} 的${label}结果暂时无法确认，先不要重复操作；需要按这次记录核对清楚后再处理`
+    default: return `账号 ${username} 这次没能${label}成功，没有执行新的修改`
   }
 }
 
@@ -209,7 +223,11 @@ export class UserUnfreezeService {
     inputRevision: number
     group: RuntimeGroup
     username: string
+    operation?: StatusOperation
   }): Promise<string> {
+    const operation = input.operation ?? "unfreeze"
+    if (operation !== "unfreeze" && operation !== "freeze") throw new Error("无效账号状态操作")
+    const expectedStatus = operation === "freeze" ? 1 : 2
     const username = input.username.trim()
     if (!validUsername(username)) throw new Error("解冻账号格式不安全")
     if (username.toLocaleLowerCase("en-US") === "admin") throw new Error("受保护账号不允许通过群审批解冻")
@@ -230,7 +248,7 @@ export class UserUnfreezeService {
     if (!database || !server) throw new Error("解冻请求缺少唯一的服务器或数据库绑定")
     const databaseId = database.id
     const serverId = server.id
-    const fingerprint = resourceFingerprint(server, database)
+    const fingerprint = resourceFingerprint(server, database, input.group)
     const event = this.deps.database.prepare(`SELECT event.id FROM support_thread_messages linked
       JOIN support_message_events event ON event.id=linked.message_event_id
       WHERE linked.thread_id=? ORDER BY event.created_at DESC,linked.position DESC LIMIT 1`).get(
@@ -252,9 +270,10 @@ export class UserUnfreezeService {
       databaseResourceId: databaseId,
       username,
       resourceFingerprint: fingerprint,
-    }))
+      operation,
+    }), undefined, operation)
     if (!preflight.ok || preflight.resultCode !== "eligible" || !preflight.sysUserId
-      || preflight.beforeStatus !== 2 || preflight.afterStatus !== 2 || preflight.affectedRows !== 0) {
+      || preflight.beforeStatus !== expectedStatus || preflight.afterStatus !== expectedStatus || preflight.affectedRows !== 0) {
       throw new Error(`服务器侧解冻预检未通过：${preflight.resultCode}`)
     }
     const sysUserId = String(preflight.sysUserId)
@@ -263,7 +282,7 @@ export class UserUnfreezeService {
       const currentThread = this.deps.database.prepare(
         "SELECT revision,status,group_id,service_id FROM support_threads WHERE id=?",
       ).get(input.thread.id) as { revision: number; status: string; group_id: string; service_id: string } | undefined
-      if (!currentThread || Number(currentThread.revision) !== input.inputRevision || currentThread.status === "archived"
+      if (!currentThread || Number(currentThread.revision) !== input.inputRevision || currentThread.status === "closed"
         || currentThread.group_id !== input.group.id || currentThread.service_id !== input.thread.serviceId) {
         throw new Error("解冻请求在预检期间已经发生变化")
       }
@@ -272,7 +291,7 @@ export class UserUnfreezeService {
         input.thread.id, input.inputRevision,
       ) as UserUnfreezeActionRow | undefined
       if (existing) {
-        if (existing.confirmation_reply_id !== input.replyId || existing.username !== username
+        if (existing.operation !== operation || existing.confirmation_reply_id !== input.replyId || existing.username !== username
           || existing.sys_user_id !== sysUserId || existing.resource_fingerprint !== fingerprint) {
           throw new Error("同一问题版本的解冻目标不一致")
         }
@@ -287,10 +306,10 @@ export class UserUnfreezeService {
       const id = randomUUID()
       this.deps.database.prepare(`INSERT INTO user_unfreeze_actions(
         id,thread_id,input_revision,group_id,project_id,service_id,server_resource_id,database_resource_id,request_message_event_id,
-        confirmation_reply_id,username,sys_user_id,resource_fingerprint,preflight_checked_at,status,expires_at,created_at,updated_at
-      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'awaiting_confirmation_delivery',?,?,?)`).run(
+        confirmation_reply_id,username,sys_user_id,resource_fingerprint,preflight_checked_at,operation,status,expires_at,created_at,updated_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'awaiting_confirmation_delivery',?,?,?)`).run(
         id, input.thread.id, input.inputRevision, input.group.id, projectId,
-        input.thread.serviceId, serverId, databaseId, eventId, input.replyId, username, sysUserId, fingerprint, now,
+        input.thread.serviceId, serverId, databaseId, eventId, input.replyId, username, sysUserId, fingerprint, now, operation,
         new Date(Date.now() + confirmationTtlMs).toISOString(), now, now,
       )
       return id
@@ -323,6 +342,7 @@ export class UserUnfreezeService {
     const decision = affirmativeReplies.has(normalized) ? "approve" : negativeReplies.has(normalized) ? "reject" : null
     if (!decision) return null
     const now = input.now ?? new Date().toISOString()
+    invalidateStaleAccountActions(this.deps.database, "user_unfreeze_actions", now)
     this.deps.database.prepare(`UPDATE user_unfreeze_actions SET status='expired',result_code='confirmation_expired',
       safe_summary='确认已过期',completed_at=?,updated_at=?
       WHERE group_id=? AND service_id=? AND status='pending_confirmation' AND expires_at<=?`).run(
@@ -338,6 +358,9 @@ export class UserUnfreezeService {
           WHERE group_id=? AND service_id=? AND status='pending_confirmation' AND expires_at>?
           ORDER BY created_at DESC,id DESC LIMIT 2`).all(input.group.id, input.group.serviceId, now) as Array<{ id: string }>
     if (rows.length !== 1) return null
+    const action = this.readAction(rows[0]!.id)
+    if (action.operation === "freeze" && ["确认解冻", "解冻吧", "别解冻"].includes(normalized)) return null
+    if (action.operation === "unfreeze" && ["确认冻结", "冻结吧", "别冻结"].includes(normalized)) return null
     if (!input.replyToMessageId) {
       const credentialResets = this.deps.database.prepare(`SELECT id FROM user_credential_reset_actions
         WHERE group_id=? AND service_id=? AND status='pending_confirmation' AND expires_at>? LIMIT 1`).all(
@@ -352,6 +375,9 @@ export class UserUnfreezeService {
     match: UserUnfreezeConfirmationMatch,
     event: SupportMessageEvent,
   ): Promise<void> {
+    invalidateStaleAccountActions(this.deps.database, "user_unfreeze_actions")
+    const matchedAction = this.readAction(match.actionId)
+    if (matchedAction.group_id !== event.groupId || !currentAccountAction(this.deps.database, matchedAction)) return
     if (match.decision === "reject") {
       const now = new Date().toISOString()
       const changed = this.deps.database.prepare(`UPDATE user_unfreeze_actions SET status='cancelled',
@@ -376,12 +402,12 @@ export class UserUnfreezeService {
     const action = this.readAction(match.actionId)
     let result: RemoteUnfreezeResult
     try {
-      result = validatedRemoteResult(await this.execute(action), action.sys_user_id)
+      result = validatedRemoteResult(await this.execute(action), action.sys_user_id, action.operation)
     } catch {
       result = { ok: false, resultCode: "execution_unknown" }
     }
     const completedAt = new Date().toISOString()
-    const status = result.resultCode === "unfrozen" ? "succeeded"
+    const status = ["unfrozen", "frozen", "already_frozen"].includes(result.resultCode) ? "succeeded"
       : result.resultCode === "already_unfrozen" ? "already_unfrozen"
         : ["ssh_failed", "execution_timeout", "invalid_remote_result", "database_error", "execution_unknown"]
             .includes(result.resultCode) ? "execution_unknown" : "failed"
@@ -389,7 +415,7 @@ export class UserUnfreezeService {
       affected_rows=?,result_code=?,safe_summary=?,completed_at=?,updated_at=?
       WHERE id=? AND status='executing'`).run(
       status, result.beforeStatus ?? null, result.afterStatus ?? null, result.affectedRows ?? 0,
-      result.resultCode, actionResultMessage(action.username, result.resultCode), completedAt, completedAt, action.id,
+      result.resultCode, actionResultMessage(action.username, result.resultCode, action.operation), completedAt, completedAt, action.id,
     )
     await this.sendResult(action, event, result.resultCode)
   }
@@ -402,7 +428,9 @@ export class UserUnfreezeService {
   }
 
   private async execute(action: UserUnfreezeActionRow): Promise<RemoteUnfreezeResult> {
-    const group = this.deps.database.readGroups().find((candidate) => candidate.id === action.group_id)
+    if (!currentAccountAction(this.deps.database, action)) return { ok: false, resultCode: "request_changed" }
+    if (!this.deps.database.readProjects("WHERE id=? AND enabled=1", [action.project_id])[0]) return { ok: false, resultCode: "binding_changed" }
+    const group = boundAccountActionGroup(this.deps.database, action, resourceFingerprint)
     if (!group?.enabled || !group.telegramChatId || group.projectId !== action.project_id
       || group.serviceId !== action.service_id || !validUsername(action.username)) {
       return { ok: false, resultCode: "binding_changed" }
@@ -423,7 +451,7 @@ export class UserUnfreezeService {
       || !configuredServer || configuredServer.id !== action.server_resource_id) {
       return { ok: false, resultCode: "binding_changed" }
     }
-    if (resourceFingerprint(configuredServer, configuredDatabases[0]!) !== action.resource_fingerprint) {
+    if (resourceFingerprint(configuredServer, configuredDatabases[0]!, group) !== action.resource_fingerprint) {
       return { ok: false, resultCode: "binding_changed" }
     }
     if (this.deps.operationExecutor) {
@@ -436,6 +464,7 @@ export class UserUnfreezeService {
         username: action.username,
         sysUserId: action.sys_user_id,
         resourceFingerprint: action.resource_fingerprint,
+        operation: action.operation,
       })
     }
     const workspace = await this.deps.resourceWorkspace.open(action.service_id, null)
@@ -450,6 +479,7 @@ export class UserUnfreezeService {
         database: database.database,
         username: database.username,
         password: database.password,
+        operation: action.operation,
         targetUsername: action.username,
         targetUserId: action.sys_user_id,
       }), "utf8").toString("base64")
@@ -473,6 +503,7 @@ export class UserUnfreezeService {
         database: database.database,
         username: database.username,
         password: database.password,
+        operation: input.operation ?? "unfreeze",
         targetUsername: input.username,
       }), "utf8").toString("base64")
       return await this.runRemote(workspace.path, manifest.sshConfigPath, server.sshAlias, payload, "preflight")
@@ -494,6 +525,10 @@ export class UserUnfreezeService {
       "try:",
       " import pymysql",
       ` payload=json.loads(base64.b64decode(${JSON.stringify(payload)}).decode(\"utf-8\"))`,
+      " operation=payload.get('operation','unfreeze')",
+      " if operation not in ('unfreeze','freeze'): raise ValueError('invalid operation')",
+      " expected=1 if operation=='freeze' else 2; target=2 if operation=='freeze' else 1",
+      " success='frozen' if operation=='freeze' else 'unfrozen'",
       " connection=pymysql.connect(host=payload['host'],port=int(payload['port']),user=payload['username'],password=payload['password'],database=payload['database'],charset='utf8mb4',connect_timeout=8,read_timeout=20,write_timeout=20,autocommit=False,cursorclass=pymysql.cursors.DictCursor)",
       " with connection.cursor() as cursor:",
       mode === "execute"
@@ -507,20 +542,20 @@ export class UserUnfreezeService {
       "   before=int(row['status']) if row['status'] is not None else None",
       "   if str(row.get('username') or '')!=payload['targetUsername']: result={'ok':False,'resultCode':'target_mismatch','beforeStatus':before}",
       "   elif str(row.get('username') or '').lower()=='admin' or str(row.get('user_type') or '')=='CG_YH': result={'ok':False,'resultCode':'protected_user','beforeStatus':before}",
-      "   elif int(row['del_flag'] or 0)!=0: result={'ok':False,'resultCode':'deleted','beforeStatus':before}",
-      "   elif before==1: result={'ok':True,'resultCode':'already_unfrozen','sysUserId':str(row['id']),'beforeStatus':1,'afterStatus':1,'affectedRows':0}",
-      "   elif before!=2: result={'ok':False,'resultCode':'invalid_status','beforeStatus':before}",
-      "   elif " + JSON.stringify(mode) + "=='preflight': result={'ok':True,'resultCode':'eligible','sysUserId':str(row['id']),'beforeStatus':2,'afterStatus':2,'affectedRows':0}",
+      "   elif row['del_flag'] is None or int(row['del_flag'])!=0: result={'ok':False,'resultCode':'deleted','beforeStatus':before}",
+      "   elif before==target: result={'ok':True,'resultCode':'already_'+success,'sysUserId':str(row['id']),'beforeStatus':before,'afterStatus':before,'affectedRows':0}",
+      "   elif before!=expected: result={'ok':False,'resultCode':'invalid_status','beforeStatus':before}",
+      "   elif " + JSON.stringify(mode) + "=='preflight': result={'ok':True,'resultCode':'eligible','sysUserId':str(row['id']),'beforeStatus':before,'afterStatus':before,'affectedRows':0}",
       "   else:",
-      `    cursor.execute(${JSON.stringify(userUnfreezeUpdateSql)},(row['id'],))`,
+      `    cursor.execute(${JSON.stringify(userFreezeUpdateSql)} if operation=='freeze' else ${JSON.stringify(userUnfreezeUpdateSql)},(row['id'],))`,
       "    affected=int(cursor.rowcount)",
       "    if affected!=1: result={'ok':False,'resultCode':'conflict','beforeStatus':before,'affectedRows':affected}",
       "    else:",
       "     cursor.execute('SELECT status FROM sys_user WHERE id=%s',(row['id'],))",
       "     checked=cursor.fetchone()",
       "     after=int(checked['status']) if checked and checked['status'] is not None else None",
-      "     result={'ok':after==1,'resultCode':'unfrozen' if after==1 else 'verification_failed','sysUserId':str(row['id']),'beforeStatus':before,'afterStatus':after,'affectedRows':affected}",
-      " if result.get('resultCode') in ('unfrozen',): connection.commit()",
+      "     result={'ok':after==target,'resultCode':success if after==target else 'verification_failed','sysUserId':str(row['id']),'beforeStatus':before,'afterStatus':after,'affectedRows':affected}",
+      " if result.get('resultCode') in ('unfrozen','frozen'): connection.commit()",
       " else: connection.rollback()",
       " print(json.dumps(result,ensure_ascii=False))",
       "except Exception as error:",
@@ -575,10 +610,10 @@ export class UserUnfreezeService {
     event: SupportMessageEvent,
     resultCode: string,
   ): Promise<void> {
-    const group = this.deps.database.readGroups().find((candidate) => candidate.id === action.group_id)
+    const group = boundAccountActionGroup(this.deps.database, action, resourceFingerprint)
     const service = this.deps.database.readProjectServices("WHERE id=?", [action.service_id])[0]
     if (!group?.enabled || !group.telegramChatId || !service) return
-    const answer = actionResultMessage(action.username, resultCode)
+    const answer = actionResultMessage(action.username, resultCode, action.operation)
     const outbound = this.deps.redactor.assertSafeOutbound(answer)
     if (!outbound.allowed || outbound.safeText !== answer) throw new Error("解冻结果未通过发送前安全校验")
     const reply = this.deps.replies.createPending({

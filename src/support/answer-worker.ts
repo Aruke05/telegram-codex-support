@@ -683,7 +683,7 @@ export class SupportAnswerWorker {
       const memoryVersionRefs = decision.usedMemoryVersionIds.filter((id) => allowedMemoryIds.has(id))
       const simulatedAction = decision.decision === "reply"
         ? decision.userUnfreeze
-          ? "user_unfreeze_confirmation"
+          ? decision.userUnfreeze.operation === "freeze" ? "user_freeze_confirmation" : "user_unfreeze_confirmation"
           : decision.userCredentialReset ? "user_credential_reset_confirmation" : "reply"
         : decision.decision === "ignore"
           ? "no_action"
@@ -753,10 +753,11 @@ export class SupportAnswerWorker {
     }
     if (decision.userUnfreeze && (
       !answer.includes(decision.userUnfreeze.username)
-      || !/(?:确认|是否|要不要|现在解冻|可以解冻)/u.test(answer)
-      || /(?:已经|已)(?:完成|处理|解冻)|解冻成功/u.test(answer)
+      || !(decision.userUnfreeze.operation === "freeze" ? answer.includes("冻结") && !answer.includes("解冻") : answer.includes("解冻"))
+      || !/(?:确认|是否|要不要|现在解冻|可以解冻|现在冻结|可以冻结)/u.test(answer)
+      || /(?:已经|已)(?:完成|处理|解冻|冻结)|(?:解冻|冻结)成功/u.test(answer)
     )) {
-      throw new Error("用户解冻确认文案未明确展示目标或错误声称已经完成")
+      throw new Error("账号状态操作确认文案未明确展示目标、方向或错误声称已经完成")
     }
     if (decision.userCredentialReset) {
       const reset = decision.userCredentialReset
@@ -771,7 +772,7 @@ export class SupportAnswerWorker {
     if (!this.current(thread.id, inputRevision)) return this.supersede(replyId)
     const quote = decision.quote && originText.includes(decision.quote) ? decision.quote : null
     const memoryVersionRefs = decision.usedMemoryVersionIds.filter((id) => allowedMemoryIds.has(id))
-    if (decision.userUnfreeze && !this.deps.userUnfreeze) throw new Error("用户解冻审批服务未配置")
+    if (decision.userUnfreeze && !this.deps.userUnfreeze) throw new Error("账号状态操作审批服务未配置")
     if (decision.userCredentialReset && !this.deps.userCredentialReset) throw new Error("客服账号重置审批服务未配置")
     const unfreezeActionId = decision.userUnfreeze
       ? await this.deps.userUnfreeze!.prepareConfirmation({
@@ -780,6 +781,7 @@ export class SupportAnswerWorker {
           inputRevision,
           group,
           username: decision.userUnfreeze.username,
+          operation: decision.userUnfreeze.operation ?? "unfreeze",
         })
       : null
     const credentialResetActionId = decision.userCredentialReset

@@ -240,7 +240,7 @@ export class SupportThreadCoordinator {
     if (unfreezeConfirmation) {
       if (recorded.created) {
         const handling = this.deps.userUnfreeze!.handleConfirmation(unfreezeConfirmation, recorded.event)
-        this.deps.store.updateEventRoute(recorded.event.id, "routed", `用户解冻${unfreezeConfirmation.decision === "approve" ? "确认" : "取消"}`)
+        this.deps.store.updateEventRoute(recorded.event.id, "routed", `账号状态操作${unfreezeConfirmation.decision === "approve" ? "确认" : "取消"}`)
         this.track(handling)
       }
       return recorded.event

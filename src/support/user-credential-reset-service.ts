@@ -8,6 +8,7 @@ import type { RuntimeGroup, SupportMessageEvent, SupportThread } from "../runtim
 import type { ConfiguredSecretRedactor } from "../security/dlp.js"
 import { TelegramDeliveryError, type TelegramOutputOwnership } from "../telegram/runtime.js"
 import type { ResourceWorkspace } from "./resource-workspace.js"
+import { boundAccountActionGroup, currentAccountAction, invalidateStaleAccountActions } from "./user-account-action.js"
 
 type TransportPort = {
   sendMessage(
@@ -204,8 +205,9 @@ function resourceFingerprint(server: {
   id: string; alias: string; host: string; port: number; username: string; privateKey: string; workdir: string
 }, database: {
   id: string; alias: string; engine: string; host: string; port: number; database: string; username: string; password: string
-}): string {
+}, group: Pick<RuntimeGroup, "accountId" | "telegramChatId">): string {
   return createHash("sha256").update(JSON.stringify([
+    group.accountId, group.telegramChatId,
     server.id, server.alias, server.host, server.port, server.username, server.privateKey, server.workdir,
     database.id, database.alias, database.engine, database.host, database.port,
     database.database, database.username, database.password,
@@ -322,7 +324,7 @@ export class UserCredentialResetService {
       : servers.length === 1 ? servers[0] : undefined
     const database = databases.length === 1 ? databases[0] : undefined
     if (!server || !database) throw new Error("客服账号重置缺少唯一服务器或数据库绑定")
-    const fingerprint = resourceFingerprint(server, database)
+    const fingerprint = resourceFingerprint(server, database, input.group)
     const event = this.deps.database.prepare(`SELECT event.id,event.sender_user_id FROM support_thread_messages linked
       JOIN support_message_events event ON event.id=linked.message_event_id
       WHERE linked.thread_id=? ORDER BY event.created_at DESC,linked.position DESC LIMIT 1`).get(
@@ -352,7 +354,7 @@ export class UserCredentialResetService {
       const current = this.deps.database.prepare(
         "SELECT revision,status,group_id,service_id FROM support_threads WHERE id=?",
       ).get(input.thread.id) as { revision: number; status: string; group_id: string; service_id: string } | undefined
-      if (!current || Number(current.revision) !== input.inputRevision || current.status === "archived"
+      if (!current || Number(current.revision) !== input.inputRevision || current.status === "closed"
         || current.group_id !== input.group.id || current.service_id !== input.thread.serviceId) {
         throw new Error("客服账号重置请求在预检期间已经变化")
       }
@@ -421,6 +423,7 @@ export class UserCredentialResetService {
     const decision = affirmativeReplies.has(normalized) ? "approve" : negativeReplies.has(normalized) ? "reject" : null
     if (!decision) return null
     const now = input.now ?? new Date().toISOString()
+    invalidateStaleAccountActions(this.deps.database, "user_credential_reset_actions", now)
     this.deps.database.prepare(`UPDATE user_credential_reset_actions SET status='expired',result_code='confirmation_expired',
       safe_summary='确认已过期',completed_at=?,updated_at=?
       WHERE group_id=? AND service_id=? AND status='pending_confirmation' AND expires_at<=?`).run(
@@ -446,6 +449,9 @@ export class UserCredentialResetService {
   }
 
   async handleConfirmation(match: UserCredentialResetConfirmationMatch, event: SupportMessageEvent): Promise<void> {
+    invalidateStaleAccountActions(this.deps.database, "user_credential_reset_actions")
+    const matchedAction = this.readAction(match.actionId)
+    if (matchedAction.group_id !== event.groupId || !currentAccountAction(this.deps.database, matchedAction)) return
     if (match.decision === "reject") {
       const now = new Date().toISOString()
       const changed = this.deps.database.prepare(`UPDATE user_credential_reset_actions SET status='cancelled',
@@ -473,10 +479,16 @@ export class UserCredentialResetService {
     } catch {
       result = { ok: false, resultCode: "execution_unknown" }
     }
-    let resultCode = result.ok && result.resultCode === "reset" ? "reset" : result.resultCode
+    const remoteFailures = new Set([
+      "not_found", "protected_user", "conflict", "binding_changed", "request_changed", "ambiguous",
+      "target_mismatch", "deleted", "invalid_reset_material", "verification_failed", "database_error",
+      "resource_binding_unavailable", "execution_unknown", "ssh_failed", "execution_timeout", "invalid_remote_result",
+    ])
+    let resultCode = result.ok === true && result.resultCode === "reset" ? "reset"
+      : result.ok === false && remoteFailures.has(result.resultCode) ? result.resultCode : "execution_unknown"
     if (resultCode === "reset" && (result.sysUserId !== action.sys_user_id
-      || Boolean(result.passwordReset) !== Boolean(action.reset_password)
-      || Boolean(result.totpReset) !== Boolean(action.reset_totp))) {
+      || result.passwordReset !== Boolean(action.reset_password)
+      || result.totpReset !== Boolean(action.reset_totp))) {
       resultCode = "execution_unknown"
     }
     let passwordDeliveryStatus: string = action.reset_password ? "unknown" : "not_required"
@@ -523,9 +535,14 @@ export class UserCredentialResetService {
     action: CredentialResetActionRow,
     material: ResetMaterial,
   ): Promise<RemoteCredentialResetResult> {
-    const group = this.deps.database.readGroups().find((candidate) => candidate.id === action.group_id)
+    if (!currentAccountAction(this.deps.database, action)) return { ok: false, resultCode: "request_changed" }
+    if (!this.deps.database.readProjects("WHERE id=? AND enabled=1", [action.project_id])[0]) return { ok: false, resultCode: "binding_changed" }
+    const group = boundAccountActionGroup(this.deps.database, action, resourceFingerprint)
     if (!group?.enabled || group.projectId !== action.project_id || group.serviceId !== action.service_id
       || !validUsername(action.username)) return { ok: false, resultCode: "binding_changed" }
+    if (!this.deps.database.readProjectServices("WHERE id=? AND project_id=? AND enabled=1", [action.service_id, action.project_id])[0]) {
+      return { ok: false, resultCode: "binding_changed" }
+    }
     const servers = this.deps.database.readServerResources(
       "WHERE service_id=? AND enabled=1 ORDER BY created_at,id", [action.service_id],
     )
@@ -538,7 +555,7 @@ export class UserCredentialResetService {
     const database = databases.length === 1 ? databases[0] : undefined
     if (!server || !database || server.id !== action.server_resource_id
       || database.id !== action.database_resource_id
-      || resourceFingerprint(server, database) !== action.resource_fingerprint) {
+      || resourceFingerprint(server, database, group) !== action.resource_fingerprint) {
       return { ok: false, resultCode: "binding_changed" }
     }
     return this.executeRemote({
@@ -598,7 +615,7 @@ export class UserCredentialResetService {
       "  elif len(rows)>1: result={'ok':False,'resultCode':'ambiguous'}",
       "  else:",
       "   row=rows[0]; username=str(row.get('username') or ''); user_type=str(row.get('user_type') or '')",
-      "   status=int(row['status']) if row.get('status') is not None else None; deleted=int(row['del_flag'] or 0)",
+      "   status=int(row['status']) if row.get('status') is not None else None; deleted=int(row['del_flag']) if row['del_flag'] is not None else None",
       "   if username!=payload['username']: result={'ok':False,'resultCode':'target_mismatch'}",
       "   elif username.lower()=='admin' or user_type!='KF_YH': result={'ok':False,'resultCode':'protected_user'}",
       "   elif deleted!=0: result={'ok':False,'resultCode':'deleted'}",
@@ -666,7 +683,7 @@ export class UserCredentialResetService {
 
   private async deliverTemporaryPassword(action: CredentialResetActionRow, temporaryPassword: string): Promise<string> {
     if (!/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z0-9]).{12,64}$/u.test(temporaryPassword)) return "unknown"
-    const group = this.deps.database.readGroups().find((candidate) => candidate.id === action.group_id)
+    const group = boundAccountActionGroup(this.deps.database, action, resourceFingerprint)
     if (!group?.accountId || !group.telegramChatId) return "failed"
     const text = `账号 ${action.username} 的临时密码：${temporaryPassword}\n登录后请立即在右上角修改密码。为减少泄露，这条消息会在 3 分钟后删除。`
     try {
@@ -688,7 +705,7 @@ export class UserCredentialResetService {
   }
 
   private async sendGroupResult(action: CredentialResetActionRow, event: SupportMessageEvent, resultCode: string): Promise<void> {
-    const group = this.deps.database.readGroups().find((candidate) => candidate.id === action.group_id)
+    const group = boundAccountActionGroup(this.deps.database, action, resourceFingerprint)
     const service = this.deps.database.readProjectServices("WHERE id=?", [action.service_id])[0]
     if (!group?.enabled || !group.telegramChatId || !service) return
     const answer = resultMessage(action, resultCode)

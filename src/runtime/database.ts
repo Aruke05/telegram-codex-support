@@ -138,6 +138,7 @@ CREATE TABLE IF NOT EXISTS user_unfreeze_actions (
   sys_user_id TEXT NOT NULL CHECK(length(trim(sys_user_id)) BETWEEN 1 AND 80),
   resource_fingerprint TEXT NOT NULL CHECK(length(resource_fingerprint)=64),
   preflight_checked_at TEXT NOT NULL,
+  operation TEXT NOT NULL DEFAULT 'unfreeze' CHECK(operation IN ('unfreeze','freeze')),
   status TEXT NOT NULL CHECK(status IN (
     'awaiting_confirmation_delivery','pending_confirmation','executing','succeeded',
     'already_unfrozen','cancelled','expired','superseded','failed','delivery_unknown','execution_unknown'
@@ -167,6 +168,9 @@ BEFORE UPDATE OF thread_id,input_revision,group_id,project_id,service_id,server_
   request_message_event_id,confirmation_reply_id,username,sys_user_id,resource_fingerprint,preflight_checked_at
   ON user_unfreeze_actions
 BEGIN SELECT RAISE(ABORT, 'user unfreeze target is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS user_status_operation_immutable
+BEFORE UPDATE OF operation ON user_unfreeze_actions
+BEGIN SELECT RAISE(ABORT, 'user status operation is immutable'); END;
 `
 
 const userCredentialResetSchema = `
@@ -3671,6 +3675,24 @@ function migrateToV38(connection: DatabaseSync): void {
   }
 }
 
+function migrateV39ToV40(connection: DatabaseSync): void {
+  connection.exec("BEGIN IMMEDIATE")
+  try {
+    const columns = connection.prepare("PRAGMA table_info(user_unfreeze_actions)").all() as SqlRow[]
+    if (!columns.some((column) => column.name === "operation")) {
+      connection.exec("ALTER TABLE user_unfreeze_actions ADD COLUMN operation TEXT NOT NULL DEFAULT 'unfreeze' CHECK(operation IN ('unfreeze','freeze'))")
+    }
+    connection.exec(`CREATE TRIGGER IF NOT EXISTS user_status_operation_immutable
+      BEFORE UPDATE OF operation ON user_unfreeze_actions
+      BEGIN SELECT RAISE(ABORT, 'user status operation is immutable'); END;
+      UPDATE metadata SET value='40' WHERE key='schema_version';`)
+    connection.exec("COMMIT")
+  } catch (error) {
+    try { connection.exec("ROLLBACK") } catch { /* 事务已结束。 */ }
+    throw error
+  }
+}
+
 function migrateV38ToV39(connection: DatabaseSync): void {
   connection.exec("BEGIN IMMEDIATE")
   try {
@@ -3780,6 +3802,7 @@ export class RuntimeDatabase {
       if (current === 31) { migrateV31ToV32(connection); current = 32 }
       if ([32, 33, 34, 35, 36, 37].includes(current)) { migrateToV38(connection); current = 38 }
       if (current === 38) { migrateV38ToV39(connection); current = 39 }
+      if (current === 39) { migrateV39ToV40(connection); current = 40 }
       const allowNewerLocalSchema = process.env.AI_SUPPORT_ALLOW_NEWER_DATABASE_SCHEMA === "1"
       if (current !== DATABASE_SCHEMA_VERSION && !(allowNewerLocalSchema && current > DATABASE_SCHEMA_VERSION)) {
         connection.close()
@@ -3861,6 +3884,7 @@ export class RuntimeDatabase {
       if (current === 31) { migrateV31ToV32(connection); current = 32 }
       if ([32, 33, 34, 35, 36, 37].includes(current)) { migrateToV38(connection); current = 38 }
       if (current === 38) { migrateV38ToV39(connection); current = 39 }
+      if (current === 39) { migrateV39ToV40(connection); current = 40 }
       const allowNewerLocalSchema = process.env.AI_SUPPORT_ALLOW_NEWER_DATABASE_SCHEMA === "1"
       if (current !== DATABASE_SCHEMA_VERSION && !(allowNewerLocalSchema && current > DATABASE_SCHEMA_VERSION)) {
         connection.close()
