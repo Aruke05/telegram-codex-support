@@ -8,6 +8,7 @@ import type { RuntimeGroup, SupportMessageEvent, SupportThread } from "../runtim
 import type { ConfiguredSecretRedactor } from "../security/dlp.js"
 import { TelegramDeliveryError, type TelegramOutputOwnership } from "../telegram/runtime.js"
 import type { ResourceWorkspace } from "./resource-workspace.js"
+import { userCreationProgram } from "./user-creation-program.js"
 import { boundAccountActionGroup, currentAccountAction, invalidateStaleAccountActions } from "./user-account-action.js"
 
 type TransportPort = {
@@ -22,7 +23,12 @@ type TransportPort = {
   deleteMessage(accountId: string, chatId: string, messageId: string): Promise<void>
 }
 
+export type CreatableUserType = "YY_YH" | "KF_YH" | "CW_YH"
+export const creatableUserLabels: Record<CreatableUserType, string> = { YY_YH: "运营", KF_YH: "客服", CW_YH: "财务" }
+
 type CredentialResetActionRow = {
+  create_user_type: CreatableUserType | null
+  whitelist_source_username: string | null
   id: string
   thread_id: string
   input_revision: number
@@ -71,7 +77,7 @@ export type RemoteCredentialResetResult = {
 }
 
 export type CredentialResetExecutor = (input: {
-  mode: "inspect" | "reset"
+  mode: "inspect" | "reset" | "inspect_create" | "create"
   serviceId: string
   serverResourceId: string
   databaseResourceId: string
@@ -79,6 +85,8 @@ export type CredentialResetExecutor = (input: {
   sysUserId?: string
   stateToken?: string
   operationId?: string
+  createUserType?: CreatableUserType
+  whitelistSourceUsername?: string
   resetPassword: boolean
   resetTotp: boolean
   passwordHash?: string
@@ -101,11 +109,11 @@ export type UserCredentialResetConfirmationMatch = {
 const confirmationTtlMs = 10 * 60 * 1000
 const secretDeleteDelayMs = 3 * 60 * 1000
 const affirmativeReplies = new Set([
-  "嗯", "嗯嗯", "好", "好的", "行", "可以", "可以的", "确认", "确认重置", "重置吧", "处理吧",
+  "嗯", "嗯嗯", "好", "好的", "行", "可以", "可以的", "确认", "确认重置", "重置吧", "确认创建", "创建吧", "确认开通", "开通吧", "处理吧",
   "是", "是的", "对", "对的", "ok", "okay", "yes",
 ])
 const negativeReplies = new Set([
-  "不", "不用", "不用了", "取消", "先不用", "暂时不用", "别重置", "算了", "算了吧", "no",
+  "不", "不用", "不用了", "取消", "先不用", "暂时不用", "别重置", "别创建", "别开通", "算了", "算了吧", "no",
 ])
 const passwordLower = "abcdefghijkmnopqrstuvwxyz"
 const passwordUpper = "ABCDEFGHJKLMNPQRSTUVWXYZ"
@@ -220,6 +228,15 @@ function operationLabel(resetPassword: boolean, resetTotp: boolean): string {
 }
 
 function resultMessage(action: CredentialResetActionRow, resultCode: string): string {
+  if (action.create_user_type) {
+    const type = creatableUserLabels[action.create_user_type]
+    if (resultCode === "created") return `${type}账号 ${action.username} 已创建，临时密码已发在群里；首次登录请修改密码并按页面提示绑定谷歌验证`
+    if (resultCode === "created_password_delivery_failed") return `${type}账号 ${action.username} 已创建，但临时密码未确认送达，先不要重复创建`
+    if (resultCode === "cancelled") return `好，先不创建账号 ${action.username}`
+    if (resultCode === "already_exists") return `账号 ${action.username} 已存在，这次没有创建或修改`
+    if (resultCode === "conflict" || resultCode === "invalid_whitelist_source" || resultCode === "invalid_creation_role") return `账号 ${action.username} 的创建条件已变化，这次没有创建，请重新发起`
+    return `账号 ${action.username} 的创建结果暂时无法确认，先不要重复操作`
+  }
   const label = operationLabel(Boolean(action.reset_password), Boolean(action.reset_totp))
   switch (resultCode) {
     case "reset":
@@ -299,6 +316,14 @@ export class UserCredentialResetService {
     this.deletionTimer = null
   }
 
+  async prepareCreationConfirmation(input: {
+    replyId: string; thread: SupportThread; inputRevision: number; group: RuntimeGroup
+    username: string; userType: CreatableUserType; whitelistSourceUsername: string
+  }): Promise<string> {
+    return this.prepareConfirmation({ ...input, resetPassword: true, resetTotp: true,
+      creation: { userType: input.userType, whitelistSourceUsername: input.whitelistSourceUsername } })
+  }
+
   async prepareConfirmation(input: {
     replyId: string
     thread: SupportThread
@@ -307,8 +332,13 @@ export class UserCredentialResetService {
     username: string
     resetPassword: boolean
     resetTotp: boolean
+    creation?: { userType: CreatableUserType; whitelistSourceUsername: string }
   }): Promise<string> {
-    const username = input.username.trim()
+    const creation = input.creation
+    const username = creation ? input.username.trim().toLowerCase() : input.username.trim()
+    if (creation && (username.length > 80 || !Object.hasOwn(creatableUserLabels, creation.userType)
+      || !validUsername(creation.whitelistSourceUsername) || !input.resetPassword || !input.resetTotp
+      || creation.whitelistSourceUsername.toLowerCase() === username)) throw new Error("账号创建参数不安全")
     if (!validUsername(username) || (!input.resetPassword && !input.resetTotp)) throw new Error("客服账号重置参数不安全")
     if (username.toLocaleLowerCase("en-US") === "admin") throw new Error("受保护账号不允许通过群审批重置")
     if (!input.group.projectId || input.group.serviceId !== input.thread.serviceId) throw new Error("客服账号重置群绑定不一致")
@@ -336,18 +366,23 @@ export class UserCredentialResetService {
     const sources = this.deps.database.prepare(`SELECT event.safe_text FROM support_thread_messages linked
       JOIN support_message_events event ON event.id=linked.message_event_id
       WHERE linked.thread_id=? ORDER BY linked.position,event.created_at`).all(input.thread.id) as Array<{ safe_text: string }>
-    if (!sources.some((source) => sourceContainsUsername(source.safe_text, username))) {
+    if (!sources.some((source) => sourceContainsUsername(creation ? source.safe_text.toLowerCase() : source.safe_text, username))) {
       throw new Error("客服账号重置目标没有出现在用户原始消息中")
     }
+    if (creation && !sources.some(source => sourceContainsUsername(source.safe_text, creation.whitelistSourceUsername))) {
+      throw new Error("白名单来源账号没有出现在原始消息中")
+    }
     const preflight = await this.executeRemote({
-      mode: "inspect", serviceId: input.thread.serviceId, serverResourceId: server.id,
+      mode: creation ? "inspect_create" : "inspect", serviceId: input.thread.serviceId, serverResourceId: server.id,
       databaseResourceId: database.id,
       username, resetPassword: input.resetPassword, resetTotp: input.resetTotp,
+      ...(creation ? {createUserType: creation.userType, whitelistSourceUsername: creation.whitelistSourceUsername} : {}),
     })
     if (!preflight.ok || preflight.resultCode !== "eligible" || !preflight.sysUserId || !preflight.stateToken
-      || preflight.userType !== "KF_YH" || preflight.delFlag !== 0) {
+      || preflight.userType !== (creation?.userType ?? "KF_YH") || preflight.delFlag !== 0) {
       throw new Error(`服务器侧客服账号重置预检未通过：${preflight.resultCode}`)
     }
+    if (creation && (preflight.sysUserId !== username || preflight.status !== 1)) throw new Error("创建预检目标不一致")
     const sysUserId = preflight.sysUserId
     const stateToken = preflight.stateToken
     return this.deps.database.transaction(() => {
@@ -367,7 +402,9 @@ export class UserCredentialResetService {
       const existing = this.deps.database.prepare(`SELECT * FROM user_credential_reset_actions
         WHERE thread_id=? AND input_revision=?`).get(input.thread.id, input.inputRevision) as CredentialResetActionRow | undefined
       if (existing) {
-        if (existing.username !== username || existing.sys_user_id !== sysUserId
+        if (existing.confirmation_reply_id !== input.replyId || existing.create_user_type !== (creation?.userType ?? null)
+          || existing.whitelist_source_username !== (creation?.whitelistSourceUsername ?? null)
+          || existing.username !== username || existing.sys_user_id !== sysUserId
           || existing.state_token !== stateToken || existing.reset_password !== Number(input.resetPassword)
           || existing.reset_totp !== Number(input.resetTotp) || existing.requester_user_id !== requesterUserId
           || existing.server_resource_id !== server.id || existing.database_resource_id !== database.id
@@ -380,11 +417,11 @@ export class UserCredentialResetService {
       this.deps.database.prepare(`INSERT INTO user_credential_reset_actions(
         id,thread_id,input_revision,group_id,project_id,service_id,server_resource_id,database_resource_id,request_message_event_id,
         confirmation_reply_id,username,sys_user_id,state_token,resource_fingerprint,reset_password,reset_totp,
-        requester_user_id,preflight_checked_at,status,expires_at,created_at,updated_at
-      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'awaiting_confirmation_delivery',?,?,?)`).run(
+        requester_user_id,preflight_checked_at,create_user_type,whitelist_source_username,status,expires_at,created_at,updated_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'awaiting_confirmation_delivery',?,?,?)`).run(
         id, input.thread.id, input.inputRevision, input.group.id, projectId, input.thread.serviceId,
         server.id, database.id, requestEventId, input.replyId, username, sysUserId, stateToken, fingerprint,
-        Number(input.resetPassword), Number(input.resetTotp), requesterUserId, now,
+        Number(input.resetPassword), Number(input.resetTotp), requesterUserId, now, creation?.userType ?? null, creation?.whitelistSourceUsername ?? null,
         new Date(Date.now() + confirmationTtlMs).toISOString(), now, now,
       )
       return id
@@ -435,7 +472,8 @@ export class UserCredentialResetService {
           AND confirmation_telegram_message_id=? LIMIT 2`).all(
         input.group.id, input.group.serviceId, now, input.replyToMessageId,
       ) as Array<{ id: string }>
-      return row.length === 1 ? { actionId: row[0]!.id, decision } : null
+      if (row.length !== 1 || !this.confirmationMatchesOperation(row[0]!.id, normalized)) return null
+      return { actionId: row[0]!.id, decision }
     }
     const resets = this.deps.database.prepare(`SELECT id FROM user_credential_reset_actions
       WHERE group_id=? AND service_id=? AND status='pending_confirmation' AND expires_at>? LIMIT 2`).all(
@@ -445,7 +483,14 @@ export class UserCredentialResetService {
       WHERE group_id=? AND service_id=? AND status='pending_confirmation' AND expires_at>? LIMIT 2`).all(
       input.group.id, input.group.serviceId, now,
     ) as Array<{ id: string }>
-    return resets.length === 1 && unfreezes.length === 0 ? { actionId: resets[0]!.id, decision } : null
+    return resets.length === 1 && unfreezes.length === 0 && this.confirmationMatchesOperation(resets[0]!.id, normalized) ? { actionId: resets[0]!.id, decision } : null
+  }
+
+  private confirmationMatchesOperation(id: string, text: string): boolean {
+    const action = this.readAction(id)
+    return action.create_user_type
+      ? !["确认重置", "重置吧", "别重置"].includes(text)
+      : !["确认创建", "创建吧", "确认开通", "开通吧", "别创建", "别开通"].includes(text)
   }
 
   async handleConfirmation(match: UserCredentialResetConfirmationMatch, event: SupportMessageEvent): Promise<void> {
@@ -481,27 +526,29 @@ export class UserCredentialResetService {
     }
     const remoteFailures = new Set([
       "not_found", "protected_user", "conflict", "binding_changed", "request_changed", "ambiguous",
-      "target_mismatch", "deleted", "invalid_reset_material", "verification_failed", "database_error",
+      "already_exists", "invalid_whitelist_source", "invalid_creation_role", "target_mismatch", "deleted", "invalid_reset_material", "verification_failed", "database_error",
       "resource_binding_unavailable", "execution_unknown", "ssh_failed", "execution_timeout", "invalid_remote_result",
     ])
-    let resultCode = result.ok === true && result.resultCode === "reset" ? "reset"
+    const successCode = action.create_user_type ? "created" : "reset"
+    let resultCode = result.ok === true && result.resultCode === successCode ? successCode
       : result.ok === false && remoteFailures.has(result.resultCode) ? result.resultCode : "execution_unknown"
-    if (resultCode === "reset" && (result.sysUserId !== action.sys_user_id
+    if (resultCode === successCode && (result.sysUserId !== action.sys_user_id
+      || (action.create_user_type !== null && result.userType !== action.create_user_type)
       || result.passwordReset !== Boolean(action.reset_password)
       || result.totpReset !== Boolean(action.reset_totp))) {
       resultCode = "execution_unknown"
     }
     let passwordDeliveryStatus: string = action.reset_password ? "unknown" : "not_required"
-    if (resultCode === "reset" && action.reset_password) {
+    if (resultCode === successCode && action.reset_password) {
       if (!material?.temporaryPassword) {
         resultCode = "execution_unknown"
       } else {
         passwordDeliveryStatus = await this.deliverTemporaryPassword(action, material.temporaryPassword)
-        if (passwordDeliveryStatus !== "sent") resultCode = "reset_password_delivery_failed"
+        if (passwordDeliveryStatus !== "sent") resultCode = action.create_user_type ? "created_password_delivery_failed" : "reset_password_delivery_failed"
       }
     }
     const completed = new Date().toISOString()
-    const succeeded = resultCode === "reset" || resultCode === "reset_password_delivery_failed"
+    const succeeded = ["created", "created_password_delivery_failed", "reset", "reset_password_delivery_failed"].includes(resultCode)
     this.deps.database.prepare(`UPDATE user_credential_reset_actions SET status=?,result_code=?,password_delivery_status=?,
       safe_summary=?,completed_at=?,updated_at=? WHERE id=? AND status='executing'`).run(
       succeeded ? "succeeded" : ["execution_unknown", "ssh_failed", "execution_timeout"].includes(resultCode)
@@ -559,9 +606,10 @@ export class UserCredentialResetService {
       return { ok: false, resultCode: "binding_changed" }
     }
     return this.executeRemote({
-      mode: "reset", serviceId: action.service_id, serverResourceId: action.server_resource_id,
+      mode: action.create_user_type ? "create" : "reset", serviceId: action.service_id, serverResourceId: action.server_resource_id,
       databaseResourceId: action.database_resource_id,
       username: action.username, sysUserId: action.sys_user_id, stateToken: action.state_token,
+      ...(action.create_user_type && action.whitelist_source_username ? {createUserType: action.create_user_type, whitelistSourceUsername: action.whitelist_source_username} : {}),
       operationId: action.id, resetPassword: Boolean(action.reset_password), resetTotp: Boolean(action.reset_totp),
       ...(material.passwordHash ? { passwordHash: material.passwordHash } : {}),
       ...(material.passwordSalt ? { passwordSalt: material.passwordSalt } : {}),
@@ -585,14 +633,14 @@ export class UserCredentialResetService {
         databaseUsername: database.username,
         databasePassword: database.password,
       }), "utf8").toString("base64")
-      return await this.runRemote(workspace.path, manifest.sshConfigPath, server.sshAlias, payload)
+      return await this.runRemote(workspace.path, manifest.sshConfigPath, server.sshAlias, payload, input.mode === "create" || input.mode === "inspect_create")
     } finally {
       await workspace.cleanup()
     }
   }
 
-  private runRemote(cwd: string, sshConfigPath: string, sshAlias: string, payload: string): Promise<RemoteCredentialResetResult> {
-    const program = [
+  private runRemote(cwd: string, sshConfigPath: string, sshAlias: string, payload: string, creation = false): Promise<RemoteCredentialResetResult> {
+    const program = creation ? userCreationProgram(payload) : [
       "import base64,hashlib,json,re,sys",
       "connection=None",
       "try:",

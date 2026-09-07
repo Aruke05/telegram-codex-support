@@ -80,7 +80,7 @@ export type SupportAnswerWorkerDependencies = {
   resourceWorkspace: Pick<ResourceWorkspace, "open">
   resourceBroker?: ResourceBrokerPort
   userUnfreeze?: Pick<UserUnfreezeService, "prepareConfirmation" | "confirmationDelivered" | "confirmationDeliveryFailed">
-  userCredentialReset?: Pick<UserCredentialResetService, "prepareConfirmation" | "confirmationDelivered" | "confirmationDeliveryFailed">
+  userCredentialReset?: Pick<UserCredentialResetService, "prepareCreationConfirmation" | "prepareConfirmation" | "confirmationDelivered" | "confirmationDeliveryFailed">
 }
 
 const maximumPendingAnswers = 128
@@ -684,7 +684,7 @@ export class SupportAnswerWorker {
       const simulatedAction = decision.decision === "reply"
         ? decision.userUnfreeze
           ? decision.userUnfreeze.operation === "freeze" ? "user_freeze_confirmation" : "user_unfreeze_confirmation"
-          : decision.userCredentialReset ? "user_credential_reset_confirmation" : "reply"
+          : decision.userCreate ? "user_create_confirmation" : decision.userCredentialReset ? "user_credential_reset_confirmation" : "reply"
         : decision.decision === "ignore"
           ? "no_action"
           : decision.escalationType === "feature_request"
@@ -759,6 +759,16 @@ export class SupportAnswerWorker {
     )) {
       throw new Error("账号状态操作确认文案未明确展示目标、方向或错误声称已经完成")
     }
+    if (decision.userCreate) {
+      const create = decision.userCreate
+      const label = { YY_YH: "运营", KF_YH: "客服", CW_YH: "财务" }[create.userType]
+      if (!answer.toLowerCase().includes(create.username.toLowerCase()) || !answer.includes(label)
+        || !answer.includes(create.whitelistSourceUsername) || !/(?:IP|白名单)/iu.test(answer)
+        || !/(?:创建|开通|新增)/u.test(answer) || !/(?:确认|是否|要不要)/u.test(answer)
+        || /(?:已经|已)(?:完成|创建|开通)|(?:创建|开通)成功/u.test(answer)) {
+        throw new Error("账号创建确认必须明确账号、类型、白名单来源且不能声称已完成")
+      }
+    }
     if (decision.userCredentialReset) {
       const reset = decision.userCredentialReset
       const requestedLabels = [reset.resetPassword ? "密码" : "", reset.resetTotp ? "谷歌验证" : ""].filter(Boolean)
@@ -773,7 +783,7 @@ export class SupportAnswerWorker {
     const quote = decision.quote && originText.includes(decision.quote) ? decision.quote : null
     const memoryVersionRefs = decision.usedMemoryVersionIds.filter((id) => allowedMemoryIds.has(id))
     if (decision.userUnfreeze && !this.deps.userUnfreeze) throw new Error("账号状态操作审批服务未配置")
-    if (decision.userCredentialReset && !this.deps.userCredentialReset) throw new Error("客服账号重置审批服务未配置")
+    if ((decision.userCredentialReset || decision.userCreate) && !this.deps.userCredentialReset) throw new Error("客服账号重置审批服务未配置")
     const unfreezeActionId = decision.userUnfreeze
       ? await this.deps.userUnfreeze!.prepareConfirmation({
           replyId,
@@ -784,7 +794,11 @@ export class SupportAnswerWorker {
           operation: decision.userUnfreeze.operation ?? "unfreeze",
         })
       : null
-    const credentialResetActionId = decision.userCredentialReset
+    const credentialResetActionId = decision.userCreate
+      ? await this.deps.userCredentialReset!.prepareCreationConfirmation({
+          replyId, thread, inputRevision, group, ...decision.userCreate,
+        })
+      : decision.userCredentialReset
       ? await this.deps.userCredentialReset!.prepareConfirmation({
           replyId,
           thread,

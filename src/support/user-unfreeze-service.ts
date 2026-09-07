@@ -277,7 +277,7 @@ export class UserUnfreezeService {
       throw new Error(`服务器侧解冻预检未通过：${preflight.resultCode}`)
     }
     const sysUserId = String(preflight.sysUserId)
-    if (!/^[1-9]\d{0,79}$/u.test(sysUserId)) throw new Error("服务器侧解冻预检返回了无效用户 ID")
+    if (!/^[A-Za-z0-9_.@+\-]{1,80}$/u.test(sysUserId)) throw new Error("服务器侧解冻预检返回了无效用户 ID")
     return this.deps.database.transaction(() => {
       const currentThread = this.deps.database.prepare(
         "SELECT revision,status,group_id,service_id FROM support_threads WHERE id=?",

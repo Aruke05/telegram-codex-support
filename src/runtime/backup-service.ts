@@ -380,6 +380,7 @@ export class BackupService {
     let portableHasUserUnfreezeActions = false
     let portableHasUserStatusOperation = false
     let portableHasUserCredentialResetActions = false
+    let portableHasUserCreation = false
     let portableHasThreadLinks = false
     let portableHasSenderFocus = false
     let portableHasDailyGroupShutdownSchedule = false
@@ -496,6 +497,8 @@ export class BackupService {
       portableHasUserCredentialResetActions = Boolean(portableStructure.prepare(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='user_credential_reset_actions'",
       ).get())
+      portableHasUserCreation = portableHasUserCredentialResetActions && (portableStructure.prepare(
+        "PRAGMA table_info(user_credential_reset_actions)").all() as Array<{name:string}>).some(column=>column.name==="create_user_type")
       portableHasThreadLinks = Boolean(portableStructure.prepare(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='support_thread_links'",
       ).get())
@@ -766,11 +769,13 @@ export class BackupService {
             columns + (portableHasUserStatusOperation ? ",operation" : ",'unfreeze'"))
         }
         if (portableHasUserCredentialResetActions) {
-          copy("user_credential_reset_actions", `id,thread_id,input_revision,group_id,project_id,service_id,
+          const columns = `id,thread_id,input_revision,group_id,project_id,service_id,
             server_resource_id,database_resource_id,request_message_event_id,confirmation_reply_id,username,sys_user_id,state_token,
             resource_fingerprint,reset_password,reset_totp,requester_user_id,preflight_checked_at,status,
             confirmation_telegram_message_id,confirmer_message_event_id,confirmer_user_id,confirmer_username,
-            expires_at,execution_started_at,completed_at,result_code,password_delivery_status,safe_summary,created_at,updated_at`)
+            expires_at,execution_started_at,completed_at,result_code,password_delivery_status,safe_summary,created_at,updated_at`
+          copy("user_credential_reset_actions", columns + ",create_user_type,whitelist_source_username",
+            columns + (portableHasUserCreation ? ",create_user_type,whitelist_source_username" : ",NULL,NULL"))
         }
         if (portableHasShadowLearning) {
           copy("shadow_answer_results", `id,reply_id,thread_id,input_revision,outcome_status,decision,answer,quote_text,
@@ -863,7 +868,7 @@ export class BackupService {
     const integrity = portable.prepare("PRAGMA integrity_check").all() as Array<{ integrity_check: string }>
     if (integrity.length !== 1 || integrity[0]?.integrity_check !== "ok") throw new Error("迁移数据库完整性检查失败")
     const schemaVersion = portable.schemaVersion()
-    if (![12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40].includes(schemaVersion)) {
+    if (![12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41].includes(schemaVersion)) {
       throw new Error("迁移数据库版本不兼容")
     }
     const existing = new Set((portable.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>).map((row) => row.name))

@@ -366,6 +366,7 @@ export class SupportInvestigationService {
         humanOperation: baseline.humanOperation,
         userUnfreeze: baseline.userUnfreeze,
         userCredentialReset: baseline.userCredentialReset,
+        userCreate: baseline.userCreate,
         responsibility: baseline.responsibility,
         interaction: baseline.interaction,
       },

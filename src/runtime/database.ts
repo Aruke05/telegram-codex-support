@@ -193,6 +193,8 @@ CREATE TABLE IF NOT EXISTS user_credential_reset_actions (
   reset_totp INTEGER NOT NULL CHECK(reset_totp IN (0,1)),
   requester_user_id TEXT NOT NULL CHECK(length(requester_user_id) BETWEEN 1 AND 80),
   preflight_checked_at TEXT NOT NULL,
+  create_user_type TEXT CHECK(create_user_type IS NULL OR create_user_type IN ('YY_YH','KF_YH','CW_YH')),
+  whitelist_source_username TEXT,
   status TEXT NOT NULL CHECK(status IN (
     'awaiting_confirmation_delivery','pending_confirmation','executing','succeeded',
     'cancelled','expired','superseded','failed','delivery_unknown','execution_unknown'
@@ -212,6 +214,8 @@ CREATE TABLE IF NOT EXISTS user_credential_reset_actions (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   CHECK(reset_password=1 OR reset_totp=1),
+  CHECK((create_user_type IS NULL AND whitelist_source_username IS NULL) OR
+    (create_user_type IS NOT NULL AND length(trim(whitelist_source_username)) BETWEEN 1 AND 120 AND reset_password=1 AND reset_totp=1)),
   UNIQUE(thread_id,input_revision)
 );
 CREATE INDEX IF NOT EXISTS user_credential_reset_pending_idx
@@ -224,6 +228,16 @@ BEFORE UPDATE OF thread_id,input_revision,group_id,project_id,service_id,server_
   reset_password,reset_totp,requester_user_id,preflight_checked_at
   ON user_credential_reset_actions
 BEGIN SELECT RAISE(ABORT, 'user credential reset target is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS user_creation_immutable_target
+BEFORE UPDATE OF create_user_type,whitelist_source_username ON user_credential_reset_actions
+BEGIN SELECT RAISE(ABORT, 'user creation target is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS user_creation_valid_insert
+BEFORE INSERT ON user_credential_reset_actions
+WHEN (NEW.create_user_type IS NULL AND NEW.whitelist_source_username IS NOT NULL)
+  OR (NEW.create_user_type IS NOT NULL AND (NEW.whitelist_source_username IS NULL
+    OR length(trim(NEW.whitelist_source_username)) NOT BETWEEN 1 AND 120 OR NEW.reset_password<>1 OR NEW.reset_totp<>1))
+BEGIN SELECT RAISE(ABORT, 'invalid user creation scope'); END;
 
 CREATE TABLE IF NOT EXISTS secret_message_deletions (
   id TEXT PRIMARY KEY,
@@ -3675,6 +3689,33 @@ function migrateToV38(connection: DatabaseSync): void {
   }
 }
 
+function migrateV40ToV41(connection: DatabaseSync): void {
+  connection.exec("BEGIN IMMEDIATE")
+  try {
+    const columns = connection.prepare("PRAGMA table_info(user_credential_reset_actions)").all() as SqlRow[]
+    if (!columns.some(column => column.name === "create_user_type")) {
+      connection.exec("ALTER TABLE user_credential_reset_actions ADD COLUMN create_user_type TEXT CHECK(create_user_type IS NULL OR create_user_type IN ('YY_YH','KF_YH','CW_YH'))")
+    }
+    if (!columns.some(column => column.name === "whitelist_source_username")) {
+      connection.exec("ALTER TABLE user_credential_reset_actions ADD COLUMN whitelist_source_username TEXT")
+    }
+    connection.exec(`CREATE TRIGGER IF NOT EXISTS user_creation_immutable_target
+      BEFORE UPDATE OF create_user_type,whitelist_source_username ON user_credential_reset_actions
+      BEGIN SELECT RAISE(ABORT, 'user creation target is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS user_creation_valid_insert
+BEFORE INSERT ON user_credential_reset_actions
+WHEN (NEW.create_user_type IS NULL AND NEW.whitelist_source_username IS NOT NULL)
+  OR (NEW.create_user_type IS NOT NULL AND (NEW.whitelist_source_username IS NULL
+    OR length(trim(NEW.whitelist_source_username)) NOT BETWEEN 1 AND 120 OR NEW.reset_password<>1 OR NEW.reset_totp<>1))
+BEGIN SELECT RAISE(ABORT, 'invalid user creation scope'); END;
+      UPDATE metadata SET value='41' WHERE key='schema_version';`)
+    connection.exec("COMMIT")
+  } catch (error) {
+    try { connection.exec("ROLLBACK") } catch { /* 事务已结束。 */ }
+    throw error
+  }
+}
+
 function migrateV39ToV40(connection: DatabaseSync): void {
   connection.exec("BEGIN IMMEDIATE")
   try {
@@ -3803,6 +3844,7 @@ export class RuntimeDatabase {
       if ([32, 33, 34, 35, 36, 37].includes(current)) { migrateToV38(connection); current = 38 }
       if (current === 38) { migrateV38ToV39(connection); current = 39 }
       if (current === 39) { migrateV39ToV40(connection); current = 40 }
+      if (current === 40) { migrateV40ToV41(connection); current = 41 }
       const allowNewerLocalSchema = process.env.AI_SUPPORT_ALLOW_NEWER_DATABASE_SCHEMA === "1"
       if (current !== DATABASE_SCHEMA_VERSION && !(allowNewerLocalSchema && current > DATABASE_SCHEMA_VERSION)) {
         connection.close()
@@ -3885,6 +3927,7 @@ export class RuntimeDatabase {
       if ([32, 33, 34, 35, 36, 37].includes(current)) { migrateToV38(connection); current = 38 }
       if (current === 38) { migrateV38ToV39(connection); current = 39 }
       if (current === 39) { migrateV39ToV40(connection); current = 40 }
+      if (current === 40) { migrateV40ToV41(connection); current = 41 }
       const allowNewerLocalSchema = process.env.AI_SUPPORT_ALLOW_NEWER_DATABASE_SCHEMA === "1"
       if (current !== DATABASE_SCHEMA_VERSION && !(allowNewerLocalSchema && current > DATABASE_SCHEMA_VERSION)) {
         connection.close()

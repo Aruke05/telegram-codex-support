@@ -112,12 +112,19 @@ export const userCredentialResetRequestSchema = z.object({
   message: "密码和谷歌验证至少选择一项重置",
 })
 
+export const userCreateRequestSchema = z.object({
+  username: z.string().trim().min(1).max(80).regex(/^[A-Za-z0-9_.@+\-]+$/u),
+  userType: z.enum(["YY_YH", "KF_YH", "CW_YH"]),
+  whitelistSourceUsername: z.string().trim().min(1).max(120).regex(/^[A-Za-z0-9_.@+\-]+$/u),
+}).strict()
+
 export const answerDecisionSchema = z.object({
   decision: z.enum(["reply", "ignore", "escalate"]),
   escalationType: z.enum(["none", "code_defect", "technical_change", "feature_request", "service_handoff", "human_operation"]),
   humanOperation: humanOperationSchema.nullable().optional(),
   userUnfreeze: userUnfreezeRequestSchema.nullable().optional(),
   userCredentialReset: userCredentialResetRequestSchema.nullable().optional(),
+  userCreate: userCreateRequestSchema.nullable().optional(),
   answer: z.string().max(12000),
   quote: z.string().max(1000).nullable(),
   reason: z.string().trim().min(1).max(1000),
@@ -163,6 +170,10 @@ export const answerDecisionSchema = z.object({
       path: ["userCredentialReset"],
       message: "客服账号重置确认只能单独随普通回复提出",
     })
+  }
+  if (value.userCreate && (value.decision !== "reply" || value.escalationType !== "none"
+    || value.humanOperation || value.userUnfreeze || value.userCredentialReset)) {
+    context.addIssue({ code: "custom", path: ["userCreate"], message: "账号创建必须单独随普通回复提出并等待确认" })
   }
   if (value.decision !== "ignore" && value.evidencePacket?.requiredAnswerPoints.length === 0) {
     context.addIssue({
@@ -393,7 +404,7 @@ const evidencePacketJsonSchema = {
 export const answerDecisionJsonSchema = {
   type: "object",
   additionalProperties: false,
-  required: ["decision", "escalationType", "humanOperation", "userUnfreeze", "userCredentialReset", "answer", "quote", "reason", "confidence", "usedMemoryVersionIds", "answerClaims", "responsibility", "interaction", "investigation", "evidencePacket"],
+  required: ["decision", "escalationType", "humanOperation", "userUnfreeze", "userCredentialReset", "userCreate", "answer", "quote", "reason", "confidence", "usedMemoryVersionIds", "answerClaims", "responsibility", "interaction", "investigation", "evidencePacket"],
   properties: {
     decision: { type: "string", enum: ["reply", "ignore", "escalate"] },
     escalationType: { type: "string", enum: ["none", "code_defect", "technical_change", "feature_request", "service_handoff", "human_operation"] },
@@ -421,6 +432,17 @@ export const answerDecisionJsonSchema = {
         properties: {
           operation: { type: "string", enum: ["unfreeze", "freeze"] },
           username: { type: "string", minLength: 1, maxLength: 120 },
+        },
+      }, { type: "null" }],
+    },
+    userCreate: {
+      anyOf: [{
+        type: "object", additionalProperties: false,
+        required: ["username", "userType", "whitelistSourceUsername"],
+        properties: {
+          username: { type: "string", minLength: 1, maxLength: 80 },
+          userType: { type: "string", enum: ["YY_YH", "KF_YH", "CW_YH"] },
+          whitelistSourceUsername: { type: "string", minLength: 1, maxLength: 120 },
         },
       }, { type: "null" }],
     },
