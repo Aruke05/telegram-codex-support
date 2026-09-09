@@ -1,7 +1,5 @@
 import type {
-  AnswerClaim,
   AnswerDecision,
-  ComposedReply,
   EvidencePacket,
   InvestigationStep,
   InvestigationTrace,
@@ -78,7 +76,7 @@ export type SupportInvestigationResult = {
 }
 
 export type SupportReplyPipelineAudit = {
-  version: "evidence-compose-review-v1"
+  version: "evidence-compose-review-v1" | "investigate-answer-v2"
   mode: "legacy" | "multi_stage"
   evidencePacket: EvidencePacket | null
   baselineAnswer: string
@@ -295,7 +293,7 @@ export class SupportInvestigationService {
           codeRoots: resourceWorkspace.codeLibraryRoots ?? [],
         }),
       }, allowedMemoryIds)
-      const pipeline = await this.runReplyPipeline(decisionInput, decision, allowedMemoryIds, signal)
+      const pipeline = this.finalizeReply(decision)
       decision = pipeline.decision
       pipelineAudit = pipeline.audit
       await this.publishProgress(input, snapshot, decision.investigation)
@@ -333,220 +331,22 @@ export class SupportInvestigationService {
     return { service, snapshot, decision, allowedMemoryIds, pipelineAudit }
   }
 
-  private async runReplyPipeline(
-    request: SupportDecisionInput,
-    baseline: AnswerDecision,
-    allowedMemoryIds: Set<string>,
-    signal: AbortSignal,
-  ): Promise<{ decision: AnswerDecision; audit: SupportReplyPipelineAudit }> {
-    const legacyAudit = (fallbackReason: string | null): SupportReplyPipelineAudit => ({
-      version: "evidence-compose-review-v1",
-      mode: "legacy",
-      evidencePacket: baseline.evidencePacket ?? null,
-      baselineAnswer: baseline.answer,
-      firstCandidateAnswer: null,
-      revisedCandidateAnswer: null,
-      reviews: [],
-      finalSource: "baseline",
-      fallbackReason,
-    })
-    if (baseline.decision === "ignore") return { decision: baseline, audit: legacyAudit("ignore 不生成对外回复") }
-    if (!baseline.evidencePacket || !this.deps.agent.composeReply || !this.deps.agent.reviewReply) {
-      return { decision: baseline, audit: legacyAudit("调查模型或运行适配器尚未提供多阶段交接") }
-    }
-    if (baseline.evidencePacket.communication.intent !== "copyable_message") {
-      return { decision: baseline, audit: legacyAudit("当前诉求不需要独立沟通成稿，保留调查模型基线") }
-    }
-    const packet = this.trustEvidencePacket(baseline.evidencePacket, baseline.investigation)
-    const baseReviewInput = {
-      request,
-      decision: {
-        decision: baseline.decision,
-        escalationType: baseline.escalationType,
-        humanOperation: baseline.humanOperation,
-        userUnfreeze: baseline.userUnfreeze,
-        userCredentialReset: baseline.userCredentialReset,
-        userCreate: baseline.userCreate,
-        responsibility: baseline.responsibility,
-        interaction: baseline.interaction,
-      },
-      evidencePacket: packet,
-      baseline: {
-        answer: baseline.answer,
-        quote: baseline.quote,
-        answerClaims: baseline.answerClaims,
-        usedMemoryVersionIds: baseline.usedMemoryVersionIds,
-      },
-    } as const
-    let first: ComposedReply | null = null
-    let revised: ComposedReply | null = null
-    const reviews: ReplyReview[] = []
-    try {
-      first = this.safeComposedReply(
-        await this.deps.agent.composeReply({
-          request: baseReviewInput.request,
-          decision: baseReviewInput.decision,
-          evidencePacket: packet,
-        }, signal),
-        packet,
-        allowedMemoryIds,
-        request.latestMessage ?? request.question,
-      )
-      const firstReview = this.redactReview(await this.deps.agent.reviewReply({
-        ...baseReviewInput,
-        candidate: first,
-        attempt: 1,
-      }, signal))
-      reviews.push(firstReview)
-      if (firstReview.outcome === "approve") {
-        return this.pipelineResult(baseline, packet, first, null, reviews, "first_candidate", null)
-      }
-      if (firstReview.outcome === "prefer_baseline") {
-        return this.pipelineResult(baseline, packet, first, null, reviews, "baseline", firstReview.reason)
-      }
-      revised = this.safeComposedReply(
-        await this.deps.agent.composeReply({
-          request: baseReviewInput.request,
-          decision: baseReviewInput.decision,
-          evidencePacket: packet,
-          revisionFeedback: firstReview.issues,
-        }, signal),
-        packet,
-        allowedMemoryIds,
-        request.latestMessage ?? request.question,
-      )
-      const secondReview = this.redactReview(await this.deps.agent.reviewReply({
-        ...baseReviewInput,
-        candidate: revised,
-        attempt: 2,
-      }, signal))
-      reviews.push(secondReview)
-      if (secondReview.outcome === "approve") {
-        return this.pipelineResult(baseline, packet, first, revised, reviews, "revised_candidate", null)
-      }
-      return this.pipelineResult(baseline, packet, first, revised, reviews, "baseline", secondReview.reason)
-    } catch (error) {
-      if (signal.aborted) throw error
-      const reason = error instanceof Error
-        ? `多阶段回复未完成，保留调查模型基线：${error.name}`
-        : "多阶段回复未完成，保留调查模型基线"
-      return this.pipelineResult(baseline, packet, first, revised, reviews, "baseline", reason)
-    }
-  }
-
-  private pipelineResult(
-    baseline: AnswerDecision,
-    packet: EvidencePacket,
-    first: ComposedReply | null,
-    revised: ComposedReply | null,
-    reviews: ReplyReview[],
-    finalSource: SupportReplyPipelineAudit["finalSource"],
-    fallbackReason: string | null,
-  ): { decision: AnswerDecision; audit: SupportReplyPipelineAudit } {
-    const selected = finalSource === "first_candidate" ? first : finalSource === "revised_candidate" ? revised : null
-    const decision = selected ? this.applyComposedReply(baseline, selected, packet) : baseline
+  private finalizeReply(decision: AnswerDecision): { decision: AnswerDecision; audit: SupportReplyPipelineAudit } {
+    // Preserve the existing audit storage shape; legacy denotes the direct-answer path.
+    // Investigation and final composition now share one model execution, including copyable replies.
     return {
       decision,
       audit: {
-        version: "evidence-compose-review-v1",
-        mode: "multi_stage",
-        evidencePacket: packet,
-        baselineAnswer: baseline.answer,
-        firstCandidateAnswer: first?.answer ?? null,
-        revisedCandidateAnswer: revised?.answer ?? null,
-        reviews,
-        finalSource,
-        fallbackReason,
+        version: "investigate-answer-v2",
+        mode: "legacy",
+        evidencePacket: decision.evidencePacket ?? null,
+        baselineAnswer: decision.answer,
+        firstCandidateAnswer: null,
+        revisedCandidateAnswer: null,
+        reviews: [],
+        finalSource: "baseline",
+        fallbackReason: null,
       },
-    }
-  }
-
-  private applyComposedReply(baseline: AnswerDecision, composed: ComposedReply, packet: EvidencePacket): AnswerDecision {
-    const facts = new Map(packet.facts.map((fact) => [fact.id, fact]))
-    const claims: AnswerClaim[] = composed.claims.map((claim) => {
-      const fact = facts.get(claim.factId)
-      if (!fact || !fact.outboundSafe) throw new Error("回复引用了不存在或不可出站的证据事实")
-      return {
-        statement: claim.statement,
-        provenance: fact.provenance,
-        evidenceSource: fact.evidenceSource,
-        evidence: fact.evidence,
-      }
-    })
-    return {
-      ...baseline,
-      answer: composed.answer,
-      quote: composed.quote,
-      answerClaims: claims,
-      usedMemoryVersionIds: [...new Set([
-        ...baseline.usedMemoryVersionIds,
-        ...composed.usedMemoryVersionIds,
-      ])],
-      evidencePacket: packet,
-    }
-  }
-
-  private safeComposedReply(
-    reply: ComposedReply,
-    packet: EvidencePacket,
-    allowedMemoryIds: Set<string>,
-    latestMessage: string,
-  ): ComposedReply {
-    const outbound = this.deps.redactor.assertSafeOutbound(reply.answer)
-    if (!outbound.allowed || !outbound.safeText.trim() || garbled(outbound.safeText)) {
-      throw new SupportModelOutputRejectedError(["组合回复为空、乱码或触发敏感信息出站拦截"])
-    }
-    if (reply.quote && !latestMessage.includes(reply.quote)) throw new Error("组合回复引用片段不属于本轮最新消息")
-    const safeQuote = reply.quote ? this.deps.redactor.assertSafeOutbound(reply.quote).safeText.slice(0, 1000) : null
-    if (reply.quote && safeQuote !== reply.quote) throw new Error("组合回复引用片段触发脱敏后无法逐字引用")
-    const knownFacts = new Map(packet.facts.map((fact) => [fact.id, fact]))
-    const claims = reply.claims.map((claim) => {
-      const fact = knownFacts.get(claim.factId)
-      if (!fact?.outboundSafe) throw new Error("组合回复引用了不可用事实")
-      const statement = this.deps.redactor.assertSafeOutbound(claim.statement).safeText.slice(0, 1000)
-      if (!outbound.safeText.includes(statement)) throw new Error("组合回复事实声明未出现在最终正文")
-      return { factId: claim.factId, statement }
-    })
-    return {
-      answer: outbound.safeText.slice(0, 12000),
-      quote: safeQuote,
-      claims,
-      usedMemoryVersionIds: reply.usedMemoryVersionIds.filter((id) => allowedMemoryIds.has(id)),
-    }
-  }
-
-  private trustEvidencePacket(packet: EvidencePacket, trace: InvestigationTrace): EvidencePacket {
-    const availableSources = new Set(trace.steps
-      .filter((step) => step.status === "confirmed")
-      .map((step) => step.source))
-    availableSources.add("inference")
-    const redact = (value: string, maximum: number) => this.deps.redactor.redact(value).text.slice(0, maximum)
-    return {
-      ...packet,
-      communication: {
-        ...packet.communication,
-        recipient: packet.communication.recipient ? redact(packet.communication.recipient, 120) : null,
-        desiredOutcome: redact(packet.communication.desiredOutcome, 500),
-      },
-      facts: packet.facts
-        .filter((fact) => availableSources.has(fact.evidenceSource))
-        .map((fact) => ({
-          ...fact,
-          statement: redact(fact.statement, 1000),
-          evidence: redact(fact.evidence, 1000),
-        })),
-      requiredAnswerPoints: packet.requiredAnswerPoints.map((item) => redact(item, 500)),
-      unknowns: packet.unknowns.map((item) => redact(item, 500)),
-      handlingNotes: packet.handlingNotes.map((item) => redact(item, 500)),
-    }
-  }
-
-  private redactReview(review: ReplyReview): ReplyReview {
-    const redact = (value: string, maximum: number) => this.deps.redactor.redact(value).text.slice(0, maximum)
-    return {
-      ...review,
-      issues: review.issues.map((issue) => redact(issue, 500)),
-      reason: redact(review.reason, 1000),
     }
   }
 

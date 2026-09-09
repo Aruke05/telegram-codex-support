@@ -377,34 +377,10 @@ const evidenceFactJsonSchema = {
   },
 } as const
 
-const evidencePacketJsonSchema = {
-  type: "object",
-  additionalProperties: false,
-  required: ["version", "communication", "facts", "requiredAnswerPoints", "unknowns", "handlingNotes", "reviewLevel"],
-  properties: {
-    version: { type: "string", enum: ["1"] },
-    communication: {
-      type: "object",
-      additionalProperties: false,
-      required: ["intent", "recipient", "desiredOutcome"],
-      properties: {
-        intent: { type: "string", enum: ["direct_answer", "copyable_message", "minimal_clarification", "handoff", "ignore"] },
-        recipient: { anyOf: [{ type: "string", minLength: 1, maxLength: 120 }, { type: "null" }] },
-        desiredOutcome: { type: "string", minLength: 1, maxLength: 500 },
-      },
-    },
-    facts: { type: "array", maxItems: 24, items: evidenceFactJsonSchema },
-    requiredAnswerPoints: { type: "array", maxItems: 12, items: { type: "string", minLength: 1, maxLength: 500 } },
-    unknowns: { type: "array", maxItems: 12, items: { type: "string", minLength: 1, maxLength: 500 } },
-    handlingNotes: { type: "array", maxItems: 12, items: { type: "string", minLength: 1, maxLength: 500 } },
-    reviewLevel: { type: "string", enum: ["standard", "strict"] },
-  },
-} as const
-
 export const answerDecisionJsonSchema = {
   type: "object",
   additionalProperties: false,
-  required: ["decision", "escalationType", "humanOperation", "userUnfreeze", "userCredentialReset", "userCreate", "answer", "quote", "reason", "confidence", "usedMemoryVersionIds", "answerClaims", "responsibility", "interaction", "investigation", "evidencePacket"],
+  required: ["decision", "escalationType", "humanOperation", "userUnfreeze", "userCredentialReset", "userCreate", "answer", "quote", "reason", "confidence", "usedMemoryVersionIds", "answerClaims", "responsibility", "interaction", "investigation"],
   properties: {
     decision: { type: "string", enum: ["reply", "ignore", "escalate"] },
     escalationType: { type: "string", enum: ["none", "code_defect", "technical_change", "feature_request", "service_handoff", "human_operation"] },
@@ -534,7 +510,6 @@ export const answerDecisionJsonSchema = {
         },
       },
     },
-    evidencePacket: evidencePacketJsonSchema,
   },
 } as const
 
