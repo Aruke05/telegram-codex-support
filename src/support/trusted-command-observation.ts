@@ -88,7 +88,7 @@ function tokenizeShell(command: string): string[] | null {
 function unwrapShell(command: string): string[] | null {
   const outer = tokenizeShell(command)
   if (!outer) return null
-  if (["bash", "zsh", "sh", "/bin/bash", "/bin/zsh", "/bin/sh"].includes(outer[0] ?? "")) {
+  if (["bash", "zsh", "sh", "/bin/bash", "/bin/zsh", "/bin/sh", "/usr/bin/bash", "/usr/bin/zsh", "/usr/bin/sh"].includes(outer[0] ?? "")) {
     if (outer.length !== 3 || outer[1] !== "-lc") return null
     return tokenizeShell(outer[2]!)
   }
